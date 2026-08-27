@@ -70,6 +70,30 @@ div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 .ll-pill-clean { background: rgba(46, 125, 50, 0.14); color: #2e7d32; }
 .ll-pill-review { background: rgba(230, 145, 15, 0.16); color: #a15c00; }
 .ll-pill-mapping { background: rgba(2, 119, 189, 0.14); color: #01579b; }
+
+/* A quiet left-accent bar reads as "flagged" without turning the page into
+   a wall of solid colour -- native st.error/st.warning boxes are a full
+   saturated fill, which is what read as blocky. This is one thin bar of
+   colour, a near-white tint behind it, and body-colour text. */
+.ll-status {
+    padding: 0.55rem 0.9rem;
+    border-left: 3px solid;
+    font-size: 0.95rem;
+    margin-bottom: 0.6rem;
+}
+.ll-status-pass { border-color: #2e7d32; background: rgba(46, 125, 50, 0.05); }
+.ll-status-fail { border-color: #b3261e; background: rgba(179, 38, 30, 0.05); }
+
+.ll-finding {
+    padding: 0.3rem 0.7rem;
+    border-left: 3px solid;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    margin-bottom: 0.2rem;
+}
+.ll-finding-issue { border-color: #b3261e; background: rgba(179, 38, 30, 0.045); }
+.ll-finding-flag { border-color: #a15c00; background: rgba(161, 92, 0, 0.045); }
+.ll-finding-claim { color: #6b6b6b; font-size: 0.82rem; }
 </style>
 """
 
@@ -196,15 +220,19 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     )
     st.caption(" · ".join(meta))
 
-    with st.container(border=True):
-        if passed:
-            st.success("✓ **Reconciled to carrier**")
-        else:
-            st.error(
-                f"✗ **Not reconciled** — {len(data_issues)} data "
-                f"issue{'s' if len(data_issues) != 1 else ''}"
-            )
+    if passed:
+        st.markdown(
+            '<div class="ll-status ll-status-pass">✓ <b>Reconciled to carrier</b></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="ll-status ll-status-fail">✗ <b>Not reconciled</b> — '
+            f'{len(data_issues)} data issue{"s" if len(data_issues) != 1 else ""}</div>',
+            unsafe_allow_html=True,
+        )
 
+    with st.container():
         extracted_count = len(document.claims)
         printed_count = document.printed_claim_count
         count_line = (
@@ -232,6 +260,26 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     counts[1].metric("Underwriting Flags", len(flags))
 
 
+def _finding_list_html(findings: list, css_class: str) -> str:
+    """One block of markup for a whole bucket of findings, not one Streamlit
+    widget per row. A 44-claim document can easily carry a dozen findings,
+    and a dozen native st.error/st.warning components is both the "wall of
+    solid colour" look and a dozen extra widgets Streamlit has to mount on
+    every rerun. A single markdown block is one element either way."""
+    import html as _html
+
+    lines = []
+    for finding in findings:
+        message = _html.escape(finding.message)
+        claim = (
+            f' <span class="ll-finding-claim">· Claim {_html.escape(finding.claim_number)}</span>'
+            if finding.claim_number
+            else ""
+        )
+        lines.append(f'<div class="ll-finding {css_class}">{message}{claim}</div>')
+    return "\n".join(lines)
+
+
 def _findings_table(result: ExtractionResult) -> None:
     """Plain language first, for the person deciding what to do next. The
     rule id, expected/actual and delta that made the finding are real and
@@ -246,15 +294,11 @@ def _findings_table(result: ExtractionResult) -> None:
 
     if data_issues:
         st.markdown(f"**Data Quality Issues ({len(data_issues)})**")
-        for finding in data_issues:
-            where = f" · Claim {finding.claim_number}" if finding.claim_number else ""
-            st.error(finding.message + where)
+        st.markdown(_finding_list_html(data_issues, "ll-finding-issue"), unsafe_allow_html=True)
 
     if flags:
         st.markdown(f"**Underwriting Flags ({len(flags)})**")
-        for finding in flags:
-            where = f" · Claim {finding.claim_number}" if finding.claim_number else ""
-            st.warning(finding.message + where)
+        st.markdown(_finding_list_html(flags, "ll-finding-flag"), unsafe_allow_html=True)
 
     with st.expander("Technical details"):
         icons = {Severity.ERROR: "🔴", Severity.WARN: "🟠", Severity.INFO: "🔵"}
