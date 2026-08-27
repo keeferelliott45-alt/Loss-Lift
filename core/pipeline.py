@@ -416,7 +416,12 @@ def run_pipeline(
     classification = classify_pdf(ingested.path)
 
     digital_pages = classification.digital_pages
-    extraction = extract_digital.extract_pdf(ingested.path, pages=digital_pages or None)
+    # `pages=None` means "extract every page" (spec: no filter). Passing the
+    # empty list through `or None` when a document is fully scanned would
+    # silently mean the opposite of what was intended -- pdfplumber would
+    # eagerly parse every heavy scanned page for a document that has nothing
+    # digital on it at all. An explicit empty list correctly extracts none.
+    extraction = extract_digital.extract_pdf(ingested.path, pages=digital_pages)
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []

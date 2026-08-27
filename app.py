@@ -140,21 +140,62 @@ def _status_of(result: ExtractionResult) -> str:
 # --------------------------------------------------------------------------
 
 
+# Financial-identity rules (R-01..R-07) are the only ones the engine ever
+# marks ERROR -- they are arithmetic that must tie or a required field that
+# must exist, never a judgement call. Everything from R-08 on is the engine's
+# opinion that a human should look at something, not a claim that the numbers
+# are wrong. Conflating the two -- "Reconciled" while showing 13 exceptions --
+# is exactly the confusion a green badge is supposed to prevent.
+_DUPLICATE_RULES = {"R-11", "R-12"}
+_EXTRACTION_RULES = {"R-15"}
+
+_CATEGORY_LABELS = {
+    "financial": "Financial discrepancy",
+    "duplicate": "Duplicate claim",
+    "extraction": "Unreadable data",
+    "business": "Business-rule review",
+    "info": "Informational",
+}
+
+
+def _category_of(finding) -> str:
+    if finding.severity is Severity.ERROR:
+        return "financial"
+    if finding.rule_id in _DUPLICATE_RULES:
+        return "duplicate"
+    if finding.rule_id in _EXTRACTION_RULES:
+        return "extraction"
+    if finding.severity is Severity.INFO:
+        return "info"
+    return "business"
+
+
 def _badge(result: ExtractionResult) -> None:
-    """The green/amber badge — the emotional core of the screen."""
+    """Two separate facts, never merged into one word.
+
+    Financial reconciliation PASS means the arithmetic ties and every
+    required field is present -- nothing more. It says nothing about whether
+    a date looks odd or a claim number repeats; those are real findings, just
+    not evidence the numbers are wrong.
+    """
     document, reconciliation = result.document, result.reconciliation
-    clean = reconciliation.status is DocumentStatus.CLEAN
+    passed = reconciliation.status is DocumentStatus.CLEAN
+    review_items = [f for f in reconciliation.findings if f.severity is not Severity.ERROR]
 
     left, middle, right, far = st.columns([2.2, 1, 1, 1.2])
     with left:
-        if clean:
-            st.success("**Reconciled** — every check passed.")
+        if passed:
+            st.success("**Financial reconciliation: PASS**")
         else:
             errors = len(reconciliation.errors)
-            st.warning(
-                f"**Needs review** — {errors} check{'s' if errors != 1 else ''} "
-                f"did not tie."
+            st.error(
+                f"**Financial reconciliation: FAIL** — {errors} "
+                f"discrepanc{'y' if errors == 1 else 'ies'}"
             )
+        if review_items:
+            st.warning(f"**{len(review_items)} item(s) require review**")
+        else:
+            st.caption("No data-quality items to review.")
     middle.metric(
         "Valuation date",
         document.valuation_date.isoformat() if document.valuation_date else "missing",
@@ -164,16 +205,33 @@ def _badge(result: ExtractionResult) -> None:
     far.metric("Total incurred", f"{total:,.2f}")
 
 
+def _exception_summary(findings: list) -> None:
+    """"13 items require review: 1 duplicate claim, 8 business-rule
+    warnings, ..." -- the count breakdown up front, so a person can decide
+    whether to open the table at all before they read a single row."""
+    from collections import Counter
+
+    by_category = Counter(_category_of(f) for f in findings)
+    parts = [
+        f"{count} {_CATEGORY_LABELS[category].lower()}{'s' if count != 1 else ''}"
+        for category, count in sorted(by_category.items(), key=lambda kv: -kv[1])
+    ]
+    st.caption(f"{len(findings)} total: " + ", ".join(parts))
+
+
 def _findings_table(result: ExtractionResult) -> None:
     findings = result.reconciliation.findings
     if not findings:
         st.caption("No exceptions. Every check passed.")
         return
 
+    _exception_summary(findings)
+
     icons = {Severity.ERROR: "🔴", Severity.WARN: "🟠", Severity.INFO: "🔵"}
     rows = [
         {
             "": icons[finding.severity],
+            "Category": _CATEGORY_LABELS[_category_of(finding)],
             "Rule": finding.rule_id,
             "Claim": finding.claim_number or "—",
             "Field": _FIELD_LABELS.get(finding.field or "", finding.field or "—"),
@@ -215,19 +273,19 @@ def _document_facts(result: ExtractionResult) -> None:
     left, right = st.columns(2)
     left.markdown(
         f"""
-**Carrier** {document.carrier or "not found"}
-**Named insured** {document.named_insured or "not found"}
-**Policy number** {document.policy_number or "not found"}
-**Policy period** {document.policy_period_start or "?"} to {document.policy_period_end or "?"}
+**Carrier:** {document.carrier or "not found"}  
+**Named insured:** {document.named_insured or "not found"}  
+**Policy number:** {document.policy_number or "not found"}  
+**Policy period:** {document.policy_period_start or "?"} to {document.policy_period_end or "?"}
 """
     )
     right.markdown(
         f"""
-**Pages** {document.page_count} ({document.extraction_method.value})
-**Numbers read as** {"European (1.234,56)" if document.locale_hint == "eu" else "US (1,234.56)"}{"" if document.locale_confident else " — assumed"}
-**Dates read as** {document.date_order or "unknown"}{"" if document.date_order_confident else " — assumed"}
-**Carrier profile** {document.profile_name or "none saved yet"}
-**Recoveries printed as** {document.recovery_convention_label}
+**Pages:** {document.page_count} ({document.extraction_method.value})  
+**Numbers read as:** {"European (1.234,56)" if document.locale_hint == "eu" else "US (1,234.56)"}{"" if document.locale_confident else " — assumed"}  
+**Dates read as:** {document.date_order or "unknown"}{"" if document.date_order_confident else " — assumed"}  
+**Carrier profile:** {document.profile_name or "none saved yet"}  
+**Recoveries printed as:** {document.recovery_convention_label}
 """
     )
 
@@ -237,6 +295,13 @@ def _profile_library() -> None:
     if not profiles:
         return
     with st.expander(f"Saved carrier formats ({len(profiles)})"):
+        st.caption(
+            "Once you map a carrier's columns, LossLift remembers the "
+            "format. The next document with a matching layout skips the "
+            "mapping screen and goes straight to review -- this list is "
+            "what it has learned so far. Nothing here is claim data, only "
+            "column labels and formatting rules."
+        )
         st.dataframe(
             [
                 {
@@ -266,14 +331,18 @@ def screen_queue() -> None:
         "memory for this session and deleted after you export."
     )
 
+    state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
         "Choose PDF files",
         type=["pdf"],
         accept_multiple_files=True,
         label_visibility="collapsed",
-        key="uploader",
+        key=f"uploader-{state['uploader_generation']}",
     )
     if uploads and st.button("Add to queue", type="primary"):
+        # _extract_uploads ends in st.rerun(), which halts this function via
+        # an exception -- any code after that call here would never run.
+        # The generation bump has to happen inside it, before the rerun.
         _extract_uploads(uploads)
 
     for message in state["rejected"]:
@@ -320,6 +389,9 @@ def _extract_uploads(uploads: list[Any]) -> None:
     progress.empty()
     if added:
         state["last_added"] = added
+        # A fresh uploader key so already-processed files disappear from the
+        # tray instead of sitting there ready to be re-added by accident.
+        state["uploader_generation"] = state.get("uploader_generation", 0) + 1
     st.rerun()
 
 
@@ -432,7 +504,7 @@ def _queue_row(document_id: str) -> None:
         )
         if action.button("Open", key=f"open-{document_id}"):
             _open(document_id)
-            st.rerun()
+            st.rerun(scope="app")
         st.markdown('<div class="ll-row"></div>', unsafe_allow_html=True)
 
 
@@ -448,11 +520,11 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
         if select_all.button(f"Select all {len(visible_ids)} shown"):
             for did in visible_ids:
                 st.session_state[f"select-{did}"] = True
-            st.rerun()
+            st.rerun(scope="app")
         if clear_all.button("Clear selection"):
             for did in visible_ids:
                 st.session_state[f"select-{did}"] = False
-            st.rerun()
+            st.rerun(scope="app")
 
     with right:
         with st.expander(
@@ -524,7 +596,15 @@ def screen_workspace(document_id: str) -> None:
     if top_left.button("← Back to queue"):
         _close()
         st.rerun()
-    top_right.markdown(f"### {result.document.source_filename}")
+    with top_right:
+        st.markdown(
+            f"## 📄 {result.document.source_filename}"
+        )
+        st.caption(
+            f"{result.document.carrier or 'Carrier unknown'}"
+            + (f" · {result.document.named_insured}" if result.document.named_insured else "")
+        )
+    st.divider()
 
     if result.needs_mapping:
         screen_mapping(document_id, result)
@@ -633,6 +713,12 @@ def _apply_mapping(
 
 
 def screen_review(document_id: str, result: ExtractionResult) -> None:
+    if result.mapping.source == "profile":
+        st.info(
+            f"Mapped automatically from a saved **{result.document.carrier or 'carrier'}** "
+            f"format — no mapping step was needed for this document. Saved "
+            f"formats are shown at the bottom of the queue."
+        )
     _badge(result)
     _document_facts(result)
     _document_notes(result)
