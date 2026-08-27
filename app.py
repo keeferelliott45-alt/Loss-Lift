@@ -40,7 +40,7 @@ from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
     MONEY_FIELDS,
-    DocumentStatus,
+    ClaimStatus,
     Severity,
 )
 
@@ -73,11 +73,16 @@ div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 </style>
 """
 
-_STATUS_PILL = {
-    "mapping": ('<span class="ll-pill ll-pill-mapping">Needs mapping</span>'),
-    "needs_review": ('<span class="ll-pill ll-pill-review">Needs review</span>'),
-    "clean": ('<span class="ll-pill ll-pill-clean">Reconciled</span>'),
-}
+def _status_pill(result: ExtractionResult) -> str:
+    """User-facing status: Ready / Review N issue(s) / Needs mapping --
+    never the internal rule/status vocabulary."""
+    if result.needs_mapping:
+        return '<span class="ll-pill ll-pill-mapping">Needs mapping</span>'
+    data_issues, _flags = _split_findings(result.reconciliation.findings)
+    if not data_issues:
+        return '<span class="ll-pill ll-pill-clean">✓ Ready</span>'
+    label = f"Review {len(data_issues)} issue{'s' if len(data_issues) != 1 else ''}"
+    return f'<span class="ll-pill ll-pill-review">{label}</span>'
 
 
 # --------------------------------------------------------------------------
@@ -127,12 +132,13 @@ def _close() -> None:
 
 def _status_of(result: ExtractionResult) -> str:
     """"mapping" | "needs_review" | "clean" — purely a fact about the data,
-    never about which tab the user happens to have open."""
+    never about which tab the user happens to have open. Uses the same
+    Data Quality Issue gate as the reconciliation card so the queue pill and
+    the open document never disagree about whether it is reconciled."""
     if result.needs_mapping:
         return "mapping"
-    if result.reconciliation.status is DocumentStatus.CLEAN:
-        return "clean"
-    return "needs_review"
+    data_issues, _flags = _split_findings(result.reconciliation.findings)
+    return "needs_review" if data_issues else "clean"
 
 
 # --------------------------------------------------------------------------
@@ -140,109 +146,133 @@ def _status_of(result: ExtractionResult) -> str:
 # --------------------------------------------------------------------------
 
 
-# Financial-identity rules (R-01..R-07) are the only ones the engine ever
-# marks ERROR -- they are arithmetic that must tie or a required field that
-# must exist, never a judgement call. Everything from R-08 on is the engine's
-# opinion that a human should look at something, not a claim that the numbers
-# are wrong. Conflating the two -- "Reconciled" while showing 13 exceptions --
-# is exactly the confusion a green badge is supposed to prevent.
-_DUPLICATE_RULES = {"R-11", "R-12"}
-_EXTRACTION_RULES = {"R-15"}
-
-_CATEGORY_LABELS = {
-    "financial": "Financial discrepancy",
-    "duplicate": "Duplicate claim",
-    "extraction": "Unreadable data",
-    "business": "Business-rule review",
-    "info": "Informational",
+# Two buckets, not a severity ladder. Data Quality Issues determine whether
+# the document can be called reconciled; Underwriting Flags are observations
+# about otherwise-valid data and never block that call. A few rules the
+# engine marks WARN move into the blocking bucket anyway: an unreadable or
+# ambiguous value, or a duplicate the extractor produced, is evidence the
+# document could not be read cleanly, not a business condition worth an
+# underwriter's judgement -- which is what "flag" means here.
+_DATA_QUALITY_RULES = {
+    "R-01", "R-02", "R-03", "R-04", "R-05", "R-06", "R-07",  # arithmetic + required fields
+    "R-11", "R-12",  # duplicates caused by extraction
+    "R-15",          # unreadable / ambiguous -- the document, not the claim
 }
 
 
-def _category_of(finding) -> str:
-    if finding.severity is Severity.ERROR:
-        return "financial"
-    if finding.rule_id in _DUPLICATE_RULES:
-        return "duplicate"
-    if finding.rule_id in _EXTRACTION_RULES:
-        return "extraction"
-    if finding.severity is Severity.INFO:
-        return "info"
-    return "business"
+def _is_data_issue(finding) -> bool:
+    return finding.rule_id in _DATA_QUALITY_RULES
 
 
-def _badge(result: ExtractionResult) -> None:
-    """Two separate facts, never merged into one word.
+def _split_findings(findings: list) -> tuple[list, list]:
+    data_issues = [f for f in findings if _is_data_issue(f)]
+    flags = [f for f in findings if not _is_data_issue(f)]
+    return data_issues, flags
 
-    Financial reconciliation PASS means the arithmetic ties and every
-    required field is present -- nothing more. It says nothing about whether
-    a date looks odd or a claim number repeats; those are real findings, just
-    not evidence the numbers are wrong.
+
+def _reconciliation_card(result: ExtractionResult) -> None:
+    """The account/document header and the reconciliation card.
+
+    "Reconciled to carrier" means the document's own printed totals and row
+    count match what was extracted, and every value needed to compute that
+    could be read. It says nothing about whether a claim looks unusual --
+    that is what the flags below are for, and they never affect this line.
     """
-    document, reconciliation = result.document, result.reconciliation
-    passed = reconciliation.status is DocumentStatus.CLEAN
-    review_items = [f for f in reconciliation.findings if f.severity is not Severity.ERROR]
+    document = result.document
+    data_issues, flags = _split_findings(result.reconciliation.findings)
+    passed = not data_issues
 
-    left, middle, right, far = st.columns([2.2, 1, 1, 1.2])
-    with left:
-        if passed:
-            st.success("**Financial reconciliation: PASS**")
-        else:
-            errors = len(reconciliation.errors)
-            st.error(
-                f"**Financial reconciliation: FAIL** — {errors} "
-                f"discrepanc{'y' if errors == 1 else 'ies'}"
-            )
-        if review_items:
-            st.warning(f"**{len(review_items)} item(s) require review**")
-        else:
-            st.caption("No data-quality items to review.")
-    middle.metric(
-        "Valuation date",
-        document.valuation_date.isoformat() if document.valuation_date else "missing",
+    st.markdown(
+        f"#### {document.carrier or 'Carrier unknown'}"
+        + (f" — {document.named_insured}" if document.named_insured else "")
     )
-    right.metric("Claims", len(document.claims))
-    total = document.column_total("incurred_total")
-    far.metric("Total incurred", f"{total:,.2f}")
+    meta = []
+    if document.line_of_business:
+        meta.append(document.line_of_business.value)
+    if document.policy_number:
+        meta.append(f"Policy: {document.policy_number}")
+    meta.append(
+        f"Valuation: {document.valuation_date.isoformat() if document.valuation_date else 'missing'}"
+    )
+    st.caption(" · ".join(meta))
 
+    with st.container(border=True):
+        if passed:
+            st.success("✓ **Reconciled to carrier**")
+        else:
+            st.error(
+                f"✗ **Not reconciled** — {len(data_issues)} data "
+                f"issue{'s' if len(data_issues) != 1 else ''}"
+            )
 
-def _exception_summary(findings: list) -> None:
-    """"13 items require review: 1 duplicate claim, 8 business-rule
-    warnings, ..." -- the count breakdown up front, so a person can decide
-    whether to open the table at all before they read a single row."""
-    from collections import Counter
+        extracted_count = len(document.claims)
+        printed_count = document.printed_claim_count
+        count_line = (
+            f"{extracted_count} / {printed_count} claims captured"
+            if printed_count is not None
+            else f"{extracted_count} claims captured"
+        )
+        st.write(count_line)
 
-    by_category = Counter(_category_of(f) for f in findings)
-    parts = [
-        f"{count} {_CATEGORY_LABELS[category].lower()}{'s' if count != 1 else ''}"
-        for category, count in sorted(by_category.items(), key=lambda kv: -kv[1])
-    ]
-    st.caption(f"{len(findings)} total: " + ", ".join(parts))
+        printed_incurred = document.printed_totals.get("incurred_total")
+        extracted_incurred = document.column_total("incurred_total")
+        cols = st.columns(3)
+        cols[0].metric(
+            "Carrier total incurred",
+            f"{printed_incurred:,.2f}" if printed_incurred is not None else "not printed",
+        )
+        cols[1].metric("LossLift total incurred", f"{extracted_incurred:,.2f}")
+        if printed_incurred is not None:
+            cols[2].metric("Difference", f"{extracted_incurred - printed_incurred:,.2f}")
+        else:
+            cols[2].metric("Difference", "—")
+
+    counts = st.columns(2)
+    counts[0].metric("Data Issues", len(data_issues))
+    counts[1].metric("Underwriting Flags", len(flags))
 
 
 def _findings_table(result: ExtractionResult) -> None:
+    """Plain language first, for the person deciding what to do next. The
+    rule id, expected/actual and delta that made the finding are real and
+    kept, just moved under one shared "Technical details" expander rather
+    than sitting in the primary view of every row."""
     findings = result.reconciliation.findings
     if not findings:
         st.caption("No exceptions. Every check passed.")
         return
 
-    _exception_summary(findings)
+    data_issues, flags = _split_findings(findings)
 
-    icons = {Severity.ERROR: "🔴", Severity.WARN: "🟠", Severity.INFO: "🔵"}
-    rows = [
-        {
-            "": icons[finding.severity],
-            "Category": _CATEGORY_LABELS[_category_of(finding)],
-            "Rule": finding.rule_id,
-            "Claim": finding.claim_number or "—",
-            "Field": _FIELD_LABELS.get(finding.field or "", finding.field or "—"),
-            "What happened": finding.message,
-            "Expected": _money(finding.expected),
-            "Actual": _money(finding.actual),
-            "Difference": _money(finding.delta),
-        }
-        for finding in findings
-    ]
-    st.dataframe(rows, hide_index=True, width="stretch")
+    if data_issues:
+        st.markdown(f"**Data Quality Issues ({len(data_issues)})**")
+        for finding in data_issues:
+            where = f" · Claim {finding.claim_number}" if finding.claim_number else ""
+            st.error(finding.message + where)
+
+    if flags:
+        st.markdown(f"**Underwriting Flags ({len(flags)})**")
+        for finding in flags:
+            where = f" · Claim {finding.claim_number}" if finding.claim_number else ""
+            st.warning(finding.message + where)
+
+    with st.expander("Technical details"):
+        icons = {Severity.ERROR: "🔴", Severity.WARN: "🟠", Severity.INFO: "🔵"}
+        rows = [
+            {
+                "": icons[finding.severity],
+                "Bucket": "Data issue" if _is_data_issue(finding) else "Flag",
+                "Rule": finding.rule_id,
+                "Claim": finding.claim_number or "—",
+                "Field": _FIELD_LABELS.get(finding.field or "", finding.field or "—"),
+                "What happened": finding.message,
+                "Expected": _money(finding.expected),
+                "Actual": _money(finding.actual),
+                "Difference": _money(finding.delta),
+            }
+            for finding in findings
+        ]
+        st.dataframe(rows, hide_index=True, width="stretch")
 
 
 def _money(value: Any) -> str:
@@ -483,7 +513,6 @@ def _queue_toolbar_and_list() -> None:
 def _queue_row(document_id: str) -> None:
     result = _result(document_id)
     document = result.document
-    status = _status_of(result)
 
     with st.container():
         check, name, status_col, claims, incurred, valuation, action = st.columns(
@@ -496,7 +525,7 @@ def _queue_row(document_id: str) -> None:
             f"{document.carrier or 'Carrier unknown'}</span>",
             unsafe_allow_html=True,
         )
-        status_col.markdown(_STATUS_PILL[status], unsafe_allow_html=True)
+        status_col.markdown(_status_pill(result), unsafe_allow_html=True)
         claims.write(str(len(document.claims)))
         incurred.write(f"{document.column_total('incurred_total'):,.2f}")
         valuation.write(
@@ -712,6 +741,64 @@ def _apply_mapping(
     st.rerun()
 
 
+def _loss_snapshot(document) -> None:
+    """The aggregate risk picture -- what an underwriter opens the document
+    for. Every number here is a Decimal sum or count over already-parsed
+    claims; nothing is estimated and no LLM is involved (spec section 2)."""
+    claims = document.claims
+    if not claims:
+        return
+
+    open_count = sum(
+        1 for c in claims if c.claim_status in (ClaimStatus.OPEN, ClaimStatus.REOPENED)
+    )
+    closed_count = sum(1 for c in claims if c.claim_status is ClaimStatus.CLOSED)
+    incurred_claims = [c for c in claims if c.incurred_total is not None]
+    largest = max(incurred_claims, key=lambda c: c.incurred_total, default=None)
+
+    st.markdown("**Loss snapshot**")
+    row1 = st.columns(4)
+    row1[0].metric("Claims", len(claims))
+    row1[1].metric("Open", open_count)
+    row1[2].metric("Closed", closed_count)
+    row1[3].metric(
+        "Largest loss", f"{largest.incurred_total:,.2f}" if largest else "—"
+    )
+    row2 = st.columns(4)
+    row2[0].metric("Total paid", f"{document.column_total('paid_total'):,.2f}")
+    row2[1].metric("Outstanding reserve", f"{document.column_total('reserve_total'):,.2f}")
+    row2[2].metric("Recoveries", f"{document.column_total('recovery_total'):,.2f}")
+    row2[3].metric("Total incurred", f"{document.column_total('incurred_total'):,.2f}")
+
+    threshold = st.number_input(
+        "Large loss threshold",
+        min_value=0, value=25000, step=5000,
+        key=f"threshold-{document.document_id}",
+    )
+    large = sorted(
+        (c for c in incurred_claims if c.incurred_total >= threshold),
+        key=lambda c: c.incurred_total, reverse=True,
+    )
+    if large:
+        st.caption(f"{len(large)} claim(s) at or above {threshold:,.0f}")
+        st.dataframe(
+            [
+                {
+                    "Claim #": c.claim_number,
+                    "Status": c.claim_status.value,
+                    "Loss date": c.date_of_loss.isoformat() if c.date_of_loss else "—",
+                    "Paid": _money(c.paid_total),
+                    "Reserve": _money(c.reserve_total),
+                    "Incurred": _money(c.incurred_total),
+                }
+                for c in large
+            ],
+            hide_index=True, width="stretch",
+        )
+    else:
+        st.caption(f"No claims at or above {threshold:,.0f}.")
+
+
 def screen_review(document_id: str, result: ExtractionResult) -> None:
     if result.mapping.source == "profile":
         st.info(
@@ -719,9 +806,13 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
             f"format — no mapping step was needed for this document. Saved "
             f"formats are shown at the bottom of the queue."
         )
-    _badge(result)
-    _document_facts(result)
-    _document_notes(result)
+    _reconciliation_card(result)
+
+    with st.expander("Extraction details"):
+        _document_facts(result)
+        _document_notes(result)
+
+    _loss_snapshot(result.document)
 
     findings = result.reconciliation.findings
     with st.expander(
@@ -784,7 +875,7 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
 
 
 def screen_export(document_id: str, result: ExtractionResult) -> None:
-    _badge(result)
+    _reconciliation_card(result)
 
     left, right = st.columns(2)
     template = left.selectbox(
