@@ -428,6 +428,11 @@ _STATUS_CANON = {
 def expected_rows(fixture: Fixture) -> list[dict[str, str]]:
     rows = []
     for claim in fixture.claims:
+        # A row with no claim number is never expected to survive extraction
+        # (core.pipeline.build_claim drops it), so it has no place in the
+        # expected output either.
+        if not str(claim.get("claim_number", "")).strip():
+            continue
         row = {}
         for field_name in expected_fields(fixture):
             value = claim.get(field_name)

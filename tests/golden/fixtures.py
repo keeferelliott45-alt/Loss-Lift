@@ -65,6 +65,14 @@ class Fixture:
     needs_mapping: bool = False
     #: Claim numbers whose printed arithmetic is deliberately wrong.
     deliberate_r01_errors: tuple[str, ...] = ()
+    #: True for a fixture whose entire purpose is to be hard: genuinely
+    #: unresolvable ambiguity, real currency conflicts, or a field that
+    #: cannot be read at all. These are excluded from the blanket "every
+    #: digital fixture must hit the accuracy threshold and tie" checks --
+    #: not because the pipeline is allowed to get them wrong, but because
+    #: "wrong" is not well-defined for a document built to be indeterminate.
+    #: Each one gets its own exact-findings assertions instead.
+    is_stress: bool = False
     print_totals: bool = True
     print_claim_count: bool = True
     total_label: str = "TOTALS"
@@ -688,6 +696,347 @@ QA_DIRTY = Fixture(
 )
 
 
+
+# --------------------------------------------------------------------------
+# Stress fixtures — harder combinations for deliberate torture-testing
+# --------------------------------------------------------------------------
+
+_STRESS_WC_COLUMNS = (
+    Column("Claim No", "claim_number", width=68),
+    Column("DOL", "date_of_loss", width=56),
+    Column("Rptd", "date_reported", width=56),
+    Column("Stat", "claim_status", width=36),
+    Column("Claimant", "claimant_name", width=82),
+    Column("Suit", "litigation_flag", width=32),
+    Column("Paid Indem", "paid_indemnity", align="right", width=58),
+    Column("Paid Med", "paid_medical", align="right", width=58),
+    Column("Paid Total", "paid_total", align="right", width=62),
+    Column("Res Indem", "reserve_indemnity", align="right", width=58),
+    Column("Res Med", "reserve_medical", align="right", width=56),
+    Column("Res Total", "reserve_total", align="right", width=60),
+    Column("Recovery", "recovery_total", align="right", width=58),
+    Column("Incurred", "incurred_total", align="right", width=68),
+)
+
+
+def _stress_wc_claims() -> tuple[dict[str, Any], ...]:
+    rows = []
+    for index in range(1, 41):
+        status = ("OPEN", "CLOSED", "REOPENED")[index % 3]
+        rows.append(
+            _totalled(
+                f"WC-STR-{index:04d}",
+                date(2024, 1 + (index % 12), 1 + (index * 7) % 27),
+                date(2024, 1 + (index % 12), 2 + (index * 7) % 26),
+                status,
+                indemnity=D(str(400 + index * 83)) + D("0.25"),
+                medical=D(str(150 + index * 41)) + D("0.75"),
+                res_indemnity=(D(str(2000 + index * 213)) if status != "CLOSED" else D("0.00")),
+                res_medical=(D(str(900 + index * 97)) if status != "CLOSED" else D("0.00")),
+                recovery=(D(str(index * 40)) if index % 5 == 0 else None),
+                claimant=f"Claimant {index:03d}",
+                litigation=(True if index % 9 == 0 else (False if index % 4 == 0 else None)),
+            )
+        )
+    # Planted findings, appended after the generated body so the loop above
+    # stays a clean baseline. Each one exercises exactly one warn-level rule.
+    # R-11: an exact duplicate of a row already on the same rendered page
+    # (rows_per_page=9 puts rows 37-44 on page 5 together with these four
+    # appended rows). Same claim number *and* same values, the way a genuine
+    # copy-paste duplicate looks on a real report -- a duplicate with
+    # different amounts under the same number would be its own defect
+    # (silently overwriting one claim's data), which is a different bug than
+    # the one R-11 exists to catch.
+    rows.append(dict(rows[37]))  # a second copy of WC-STR-0038
+    rows.append(  # R-13: two orders of magnitude above the column median
+        _totalled("WC-STR-9001", date(2024, 6, 1), date(2024, 6, 2), "OPEN",
+                  indemnity=D("410000.00"), medical=D("0.00"),
+                  res_indemnity=D("50000.00"), res_medical=D("0.00"))
+    )
+    rows.append(  # R-08: closed but still carrying a reserve balance
+        _totalled("WC-STR-9002", date(2024, 7, 10), date(2024, 7, 11), "CLOSED",
+                  indemnity=D("1200.00"), medical=D("400.00"),
+                  res_indemnity=D("5000.00"), res_medical=D("1500.00"))
+    )
+    rows.append(  # R-14: net paid negative after a recovery, legitimate
+        _totalled("WC-STR-9003", date(2024, 8, 20), date(2024, 8, 21), "CLOSED",
+                  indemnity=D("-1800.00"), medical=D("0.00"),
+                  recovery=None, res_indemnity=D("0.00"), res_medical=D("0.00"))
+    )
+    return tuple(rows)
+
+
+STRESS_MEGA_WC = Fixture(
+    name="stress_mega_wc",
+    description=(
+        "44 claims across 5 pages: same-page duplicate (R-11), a 2-order-of-"
+        "magnitude outlier (R-13), closed-with-reserve (R-08), a legitimate "
+        "negative paid after recovery (R-14), and several report-before-loss "
+        "orderings from the date arithmetic (R-10) -- all WARN/INFO, so the "
+        "badge should still read Reconciled despite a busy Exceptions panel"
+    ),
+    carrier="Continental Benefit Mutual",
+    named_insured="Ferrous Metal Works Inc",
+    policy_number="WC-990214-24",
+    policy_period=(date(2024, 1, 1), date(2025, 1, 1)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="WC",
+    columns=_STRESS_WC_COLUMNS,
+    rows_per_page=9,
+    font_size=6.5,
+    claims=_stress_wc_claims(),
+)
+
+
+_MIXED_CCY_COLUMNS = (
+    Column("Claim Number", "claim_number", width=78),
+    Column("Date of Loss", "date_of_loss", width=64),
+    Column("Status", "claim_status", width=48),
+    Column("Currency", "currency_label", width=48),
+    Column("Paid", "paid_total", align="right", width=76),
+    Column("Recovery", "recovery_total", align="right", width=72),
+    Column("Incurred", "incurred_total", align="right", width=80),
+)
+
+
+def _mixed_currency_claims() -> tuple[dict[str, Any], ...]:
+    def usd_row(number, dol, status, paid, recovery=None, incurred=None):
+        return _totalled(
+            number, dol, dol, status,
+            indemnity=paid, expense=None, recovery=recovery,
+            currency_label="USD",
+            paid_total_display=f"${paid:,.2f}",
+            recovery_total_display=(f"${recovery:,.2f}" if recovery else ""),
+            incurred_total_display=f"${incurred:,.2f}",
+            incurred_total=incurred,
+        )
+
+    def eur_row(number, dol, status, paid, recovery=None, incurred=None):
+        def eu(value):
+            return f"{value:,.2f}".translate(str.maketrans({",": ".", ".": ","}))
+
+        return _totalled(
+            number, dol, dol, status,
+            indemnity=paid, expense=None, recovery=recovery,
+            currency_label="EUR",
+            paid_total_display=f"{eu(paid)} €",
+            recovery_total_display=(f"{eu(recovery)} €" if recovery else ""),
+            incurred_total_display=f"{eu(incurred)} €",
+            incurred_total=incurred,
+        )
+
+    return (
+        usd_row("US-001", date(2024, 2, 10), "CLOSED", D("4200.00"), None, D("4200.00")),
+        eur_row("EU-101", date(2024, 3, 5), "OPEN", D("3100.50"), None, D("3100.50")),
+        usd_row("US-002", date(2024, 4, 18), "CLOSED", D("900.00"), D("2500.00"), D("-1600.00")),
+        eur_row("EU-102", date(2024, 5, 22), "CLOSED", D("7600.00"), D("500.00"), D("7100.00")),
+        usd_row("US-003", date(2024, 7, 9), "OPEN", D("15400.75"), None, D("15400.75")),
+    )
+
+
+STRESS_MIXED_CURRENCY = Fixture(
+    is_stress=True,
+    name="stress_true_mixed_currency",
+    description=(
+        "Genuinely two currencies on real rows (not a default-vs-symbol false "
+        "positive) — R-16 should actually fire — plus a recovery that "
+        "legitimately exceeds paid on one USD row and one EUR row"
+    ),
+    carrier="Meridian International Underwriters",
+    named_insured="Halcyon Freight Group",
+    policy_number="INTL-550218-24",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    columns=_MIXED_CCY_COLUMNS,
+    currency_symbol="€",  # forces the TrueType embed; rows still print their
+                          # own literal text via the *_display overrides
+    print_totals=False,  # a footer sum across two currencies means nothing
+    claims=_mixed_currency_claims(),
+)
+
+
+_AMBIGUOUS_COLUMNS = (
+    Column("Claim Number", "claim_number", width=80),
+    Column("Loss Date", "date_of_loss", width=64),
+    Column("Reported", "date_reported", width=64),
+    Column("Paid", "paid_total", align="right", width=70),
+    Column("Reserve", "reserve_total", align="right", width=70),
+    Column("Incurred", "incurred_total", align="right", width=76),
+)
+
+
+def _ambiguous_row(number: str, dol_text: str, reported_text: str,
+                   paid_text: str, reserve_text: str, incurred_text: str) -> dict:
+    """A row with no canonical value: every field's shape is undecidable, and
+    a correct parser must return null with a reason for every one of them —
+    never a guessed number."""
+    return {
+        "claim_number": number,
+        "date_of_loss": None, "date_of_loss_display": dol_text,
+        "date_reported": None, "date_reported_display": reported_text,
+        "claim_status": None,
+        "claimant_name": None, "loss_description": None, "cause_of_loss": None,
+        "paid_indemnity": None, "paid_medical": None, "paid_expense": None,
+        "paid_total": None, "paid_total_display": paid_text,
+        "reserve_indemnity": None, "reserve_medical": None, "reserve_expense": None,
+        "reserve_total": None, "reserve_total_display": reserve_text,
+        "recovery_total": None,
+        "incurred_total": None, "incurred_total_display": incurred_text,
+        "litigation_flag": None,
+    }
+
+
+STRESS_TRUE_AMBIGUITY = Fixture(
+    is_stress=True,
+    name="stress_true_ambiguity",
+    description=(
+        "Every amount is a lone-comma whole-dollar figure ('12,345') and "
+        "every date has both components <=12 ('03/04/2024') — genuinely "
+        "undecidable with zero disambiguating evidence anywhere in the "
+        "document. A correct system returns null with a reason for nearly "
+        "every field rather than defaulting to US/mdy and guessing wrong"
+    ),
+    carrier="Undecided Mutual Assurance",
+    named_insured="Ambiguity Testing Corp",
+    policy_number="AMB-000001-24",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    # Even the valuation date is written in the ambiguous shape, so it too
+    # must come back null — R-06 should fire for real, not as a false alarm.
+    valuation_date=date(2024, 6, 5),
+    line_of_business="GL",
+    columns=_AMBIGUOUS_COLUMNS,
+    print_totals=False,
+    print_claim_count=False,
+    claims=(
+        _ambiguous_row("AMB-001", "03/04/2024", "04/05/2024",
+                       "12,345", "8,901", "21,246"),
+        _ambiguous_row("AMB-002", "06/07/2024", "07/08/2024",
+                       "3,450", "1,200", "4,650"),
+        _ambiguous_row("AMB-003", "09/10/2024", "10/11/2024",
+                       "22,100", "5,600", "27,700"),
+    ),
+)
+
+
+_DIRTY_COLUMNS = (
+    Column("Claim #", "claim_number", width=76),
+    Column("Loss Date", "date_of_loss", width=66),
+    Column("Status", "claim_status", width=52),
+    Column("Paid Total", "paid_total", align="right", width=78),
+    Column("Recovery", "recovery_total", align="right", width=70),
+    Column("Incurred Total", "incurred_total", align="right", width=84),
+)
+
+
+DIRTY_AVALANCHE = Fixture(
+    is_stress=True,
+    name="stress_dirty_avalanche",
+    description=(
+        "A realistic messy export: N/A recovery, an invalid calendar date, a "
+        "blank claim number (row dropped), a same-page duplicate, and one "
+        "amount rendered as unreadable text so the printed footer total and "
+        "claim count both genuinely fail to tie (real R-04 and R-05, not a "
+        "parser bug)"
+    ),
+    carrier="Pinebrook Casualty Exchange",
+    named_insured="Rustbelt Manufacturing Co",
+    policy_number="PC-661820-24",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    claim_count_label="Total Claims:",
+    deliberate_r01_errors=("DRT-006",),
+    columns=_DIRTY_COLUMNS,
+    claims=(
+        _totalled("DRT-001", date(2024, 2, 1), date(2024, 2, 3), "Open",
+                  indemnity=D("2200.00"), expense=D("300.00")),
+        # N/A recovery: no subrogation pursued, not a zero.
+        _totalled("DRT-002", date(2024, 3, 12), date(2024, 3, 14), "Closed",
+                  indemnity=D("980.00"), expense=D("120.00"),
+                  recovery_total_display="N/A"),
+        # Invalid calendar date -- date_of_loss required by R-07. The
+        # printed text is invalid on its face, so a correct parser returns
+        # null; the canonical value must say the same or the harness would
+        # wrongly score a correct null as a miss.
+        _totalled("DRT-003", date(2024, 4, 1), date(2024, 4, 2), "Open",
+                  indemnity=D("1500.00"), expense=D("200.00"),
+                  date_of_loss=None, date_of_loss_display="02/30/2024"),
+        # Blank claim number: dropped during extraction, not counted.
+        _totalled("", date(2024, 5, 1), date(2024, 5, 2), "Open",
+                  indemnity=D("700.00"), expense=D("50.00")),
+        # Same-page duplicate of DRT-001.
+        _totalled("DRT-001", date(2024, 2, 1), date(2024, 2, 3), "Open",
+                  indemnity=D("2200.00"), expense=D("300.00")),
+        # Real arithmetic defect: R-01 must still catch this among the noise.
+        _totalled("DRT-006", date(2024, 8, 1), date(2024, 8, 3), "Open",
+                  indemnity=D("4000.00"), expense=D("600.00"),
+                  incurred_total=D("9000.00")),
+        # A real amount the extractor cannot read at all -- footer total and
+        # claim-count totals are computed from the canonical value below, so
+        # this genuinely undercounts both R-04 and R-05.
+        _totalled("DRT-007", date(2024, 9, 5), date(2024, 9, 6), "Open",
+                  indemnity=D("450.00"), expense=D("0.00"),
+                  paid_total_display="TBD - pending adjuster"),
+    ),
+)
+
+
+_OBSCURE_EU_COLUMNS = (
+    Column("Ref#", "claim_number", width=64),
+    Column("Occ Date", "date_of_loss", width=64),
+    Column("Adv Date", "date_reported", width=64),
+    Column("Claim Stat", "claim_status", width=52),
+    Column("Party", "claimant_name", width=90),
+    Column("Amt Paid", "paid_total", align="right", width=68),
+    Column("Res Amt", "reserve_total", align="right", width=68),
+    Column("Recov (Cr)", "recovery_total", align="right", width=70),
+    Column("Net Loss", "incurred_total", align="right", width=72),
+)
+
+
+STRESS_OBSCURE_EU_CREDIT = Fixture(
+    name="stress_obscure_headers_eu_credit",
+    description=(
+        "5 of 9 column labels the vocabulary cannot place (claim number, both "
+        "dates, claimant, net loss), EUR amounts, dd/mm/yyyy dates, "
+        "recoveries printed as credits, and three pages -- the mapping "
+        "screen, EU parsing, the credit-sign inference and repeated headers "
+        "all have to work together at once"
+    ),
+    carrier="Nordic Assurance Partners",
+    named_insured="Baltic Cold Chain Logistics",
+    policy_number="NAP/2024/03318",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    columns=_OBSCURE_EU_COLUMNS,
+    number_format="eu",
+    date_format="dmy",
+    currency="EUR",
+    locale_hint="eu",
+    currency_symbol="€",
+    currency_position="suffix",
+    recovery_as_credit=True,
+    needs_mapping=True,
+    rows_per_page=4,
+    claims=tuple(
+        _totalled(
+            f"NAP-{index:03d}",
+            date(2024, 1 + (index % 12), 1 + (index * 5) % 27),
+            date(2024, 1 + (index % 12), 2 + (index * 5) % 26),
+            ("Open", "Closed", "Reopened")[index % 3],
+            indemnity=D(str(600 + index * 211)) + D("0.50"),
+            expense=D(str(90 + index * 33)) + D("0.25"),
+            res_indemnity=(D(str(3000 + index * 405)) if index % 3 != 1 else None),
+            recovery=(D(str(index * 60)) if index % 3 == 0 else None),
+            claimant=f"Party {index:02d}",
+        )
+        for index in range(1, 10)
+    ),
+)
+
+
 ALL_FIXTURES: tuple[Fixture, ...] = (
     US_BASIC,
     EU_FORMAT,
@@ -702,6 +1051,11 @@ ALL_FIXTURES: tuple[Fixture, ...] = (
     QA_MAINFRAME_CREDIT,
     QA_EUROPEAN_CREDIT,
     QA_DIRTY,
+    STRESS_MEGA_WC,
+    STRESS_MIXED_CURRENCY,
+    STRESS_TRUE_AMBIGUITY,
+    DIRTY_AVALANCHE,
+    STRESS_OBSCURE_EU_CREDIT,
     UNKNOWN_FORMAT,
     SCANNED,
 )
@@ -709,11 +1063,19 @@ ALL_FIXTURES: tuple[Fixture, ...] = (
 BY_NAME: dict[str, Fixture] = {fixture.name: fixture for fixture in ALL_FIXTURES}
 
 #: Fixtures with a real text layer whose columns the vocabulary can place —
-#: the digital accuracy target applies to these.
+#: the digital accuracy target applies to these. Deliberately adversarial
+#: fixtures (is_stress) are excluded: their whole point is a field, a rule
+#: tie, or a convention that cannot resolve, so "must hit 99.5%" is not a
+#: standard that applies to them.
 DIGITAL_FIXTURES: tuple[Fixture, ...] = tuple(
     fixture
     for fixture in ALL_FIXTURES
-    if not fixture.scanned and not fixture.needs_mapping
+    if not fixture.scanned and not fixture.needs_mapping and not fixture.is_stress
+)
+
+#: The adversarial fixtures, for their own dedicated exact-findings tests.
+STRESS_FIXTURES: tuple[Fixture, ...] = tuple(
+    fixture for fixture in ALL_FIXTURES if fixture.is_stress
 )
 
 

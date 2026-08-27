@@ -1,0 +1,25 @@
+{
+  "name": "stress_true_ambiguity",
+  "description": "Every amount is a lone-comma whole-dollar figure ('12,345') and every date has both components <=12 ('03/04/2024') \u2014 genuinely undecidable with zero disambiguating evidence anywhere in the document. A correct system returns null with a reason for nearly every field rather than defaulting to US/mdy and guessing wrong",
+  "carrier": "Undecided Mutual Assurance",
+  "named_insured": "Ambiguity Testing Corp",
+  "policy_number": "AMB-000001-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-06-05",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 3,
+  "printed_claim_count": null,
+  "printed_totals": {},
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "paid_total",
+    "reserve_total",
+    "incurred_total"
+  ]
+}

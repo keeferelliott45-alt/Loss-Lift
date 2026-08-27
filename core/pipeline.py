@@ -361,22 +361,26 @@ def resolve_date_order(
 ) -> tuple[DateOrderInference, DateOrderInference]:
     """Settle the day/month order for the table, and for the header block.
 
-    The table's own dates decide first. Failing that, the document's number
-    convention does — a report that writes ``5.700,50`` writes ``12.03.2023``
-    day-first. The header block is consulted last and separately, because it
-    is often templated in a different style from the table: a European report
-    can print ``Valuation Date: 06/30/2024`` above dates written the other way
-    round, and letting that settle the table would move every loss date.
+    The table and the header are resolved **independently** and never fall
+    back on each other. A European report can print
+    ``Valuation Date: 06/30/2024`` above dates written the other way round, so
+    letting the header settle the table would move every loss date — that is
+    the whole reason this function exists rather than one document-wide
+    inference. The same reasoning runs in the other direction, and matters
+    more than it looks: if a claims table is genuinely ambiguous throughout
+    (no row's day exceeds 12, and the numeric locale gives no evidence
+    either), the header's own resolved order must **not** be borrowed to
+    parse the table just because it happens to be available — a policy period
+    ending on the 31st proves the header's convention for the header, not for
+    a table that offers no evidence of its own. Borrowing it would parse
+    every ambiguous claim date silently, exactly the guess spec section 4
+    forbids. A table with no evidence of its own stays ``source="default"``,
+    so :attr:`DateOrderInference.for_parsing` returns ``None`` and every date
+    in it comes back null with ``AMBIGUOUS_DATE_ORDER`` — correct, if less
+    convenient.
     """
     table_order = infer_date_order(_table_date_tokens(tables, mapping), locale)
     header_order = infer_date_order(_metadata_date_tokens(metadata), locale)
-
-    if table_order.source == "evidence":
-        return table_order, header_order
-    if table_order.source == "locale":
-        return table_order, header_order
-    if header_order.source == "evidence":
-        return header_order, header_order
     return table_order, header_order
 
 

@@ -1,0 +1,28 @@
+{
+  "name": "stress_dirty_avalanche",
+  "description": "A realistic messy export: N/A recovery, an invalid calendar date, a blank claim number (row dropped), a same-page duplicate, and one amount rendered as unreadable text so the printed footer total and claim count both genuinely fail to tie (real R-04 and R-05, not a parser bug)",
+  "carrier": "Pinebrook Casualty Exchange",
+  "named_insured": "Rustbelt Manufacturing Co",
+  "policy_number": "PC-661820-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 7,
+  "printed_claim_count": 7,
+  "printed_totals": {
+    "paid_total": "13600.00",
+    "incurred_total": "18000.00"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "claim_status",
+    "paid_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}
