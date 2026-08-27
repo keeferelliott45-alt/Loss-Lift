@@ -44,6 +44,17 @@ class Fixture:
     claims: tuple[dict[str, Any], ...]
     number_format: str = "us"
     date_format: str = "mdy"
+    #: Printed after the carrier on the letterhead: "STATE AUTO - LOSS REPORT".
+    report_title: str | None = None
+    #: Currency symbol printed on every amount, and which side it sits.
+    currency_symbol: str | None = None
+    currency_position: str = "prefix"
+    #: The carrier prints recoveries as credits ("250.00-") even though the
+    #: amount recovered is positive. R-01 has to work this out for itself.
+    recovery_as_credit: bool = False
+    #: How the footer states the row count.
+    claim_count_label: str = "Total Claims:"
+    claim_count_in_totals_row: bool = False
     currency: str = "USD"
     locale_hint: str = "us"
     style: str = "positioned"
@@ -551,6 +562,132 @@ UNKNOWN_FORMAT = Fixture(
 )
 
 
+
+# --------------------------------------------------------------------------
+# Carrier layouts that broke the pipeline in QA (bug report, fixtures 1-4)
+#
+# Each of these reproduces a document that produced a false finding or lost
+# every row, so the defect stays fixed.
+# --------------------------------------------------------------------------
+
+_SIMPLE_RESERVE_COLUMNS = (
+    Column("Claim #", "claim_number", width=76),
+    Column("Loss Date", "date_of_loss", width=66),
+    Column("Status", "claim_status", width=52),
+    Column("Paid Total", "paid_total", align="right", width=80),
+    Column("Reserve Total", "reserve_total", align="right", width=84),
+    Column("Incurred Total", "incurred_total", align="right", width=86),
+)
+
+_SIMPLE_RECOVERY_COLUMNS = (
+    Column("Claim Ref", "claim_number", width=76),
+    Column("Loss Date", "date_of_loss", width=66),
+    Column("Status", "claim_status", width=52),
+    Column("Paid Total", "paid_total", align="right", width=80),
+    Column("Recovery Total", "recovery_total", align="right", width=84),
+    Column("Incurred Total", "incurred_total", align="right", width=86),
+)
+
+
+QA_TRAVELERS = Fixture(
+    name="qa_travelers_clean",
+    description="Currency-prefixed amounts, count stated as 'Claims: N' in the footer",
+    carrier="TRAVELERS INSURANCE",
+    report_title="LOSS RUN REPORT",
+    named_insured="Acme Logistics LLC",
+    policy_number="TR-4471902-23",
+    policy_period=(date(2023, 1, 1), date(2024, 1, 1)),
+    valuation_date=date(2024, 6, 30),
+    line_of_business="AUTO",
+    columns=_SIMPLE_RESERVE_COLUMNS,
+    currency_symbol="$",
+    claim_count_label="Claims:",
+    claim_count_in_totals_row=True,
+    claims=(
+        _totalled("CA-88392", date(2023, 5, 12), date(2023, 5, 12), "CLOSED",
+                  indemnity=D("13750.50")),
+        _totalled("CA-90112", date(2023, 8, 20), date(2023, 8, 20), "OPEN",
+                  indemnity=D("3600.00"), res_indemnity=D("5000.00")),
+    ),
+)
+
+
+QA_MAINFRAME_CREDIT = Fixture(
+    name="qa_mainframe_credit",
+    description="Recoveries printed as credits (250.00-) with -0- zeros; 'Claim Ref' header",
+    carrier="STATE AUTO",
+    report_title="HISTORICAL LOSS REPORT",
+    named_insured="Acme Logistics LLC",
+    policy_number="SA-7719340",
+    policy_period=(date(2023, 1, 1), date(2024, 1, 1)),
+    valuation_date=date(2024, 6, 30),
+    line_of_business="AUTO",
+    columns=_SIMPLE_RECOVERY_COLUMNS,
+    recovery_as_credit=True,
+    claim_count_label="Claims:",
+    claim_count_in_totals_row=True,
+    claims=(
+        _totalled("SA-101", date(2023, 3, 15), date(2023, 3, 15), "CLOSED",
+                  indemnity=D("1250.50"), recovery=D("0.00")),
+        _totalled("SA-102", date(2023, 6, 20), date(2023, 6, 20), "OPEN",
+                  indemnity=D("500.00"), recovery=D("250.00")),
+    ),
+)
+
+
+QA_EUROPEAN_CREDIT = Fixture(
+    name="qa_european_credit",
+    description="EUR amounts, dd.mm.yyyy dates and credit recoveries in one document",
+    carrier="ALLIANZ GLOBAL",
+    report_title="LOSS RUN STATEMENT",
+    named_insured="Acme Logistics LLC",
+    policy_number="AZ-88213",
+    policy_period=(date(2023, 1, 1), date(2024, 1, 1)),
+    valuation_date=date(2024, 6, 30),
+    line_of_business="GL",
+    columns=_SIMPLE_RECOVERY_COLUMNS,
+    number_format="eu",
+    # The claim dates are written day-first with dots while the header block
+    # above them is written month-first with slashes, which is what the real
+    # document does.
+    date_format="dmy_dots",
+    currency="EUR",
+    locale_hint="eu",
+    currency_symbol="€",
+    currency_position="suffix",
+    recovery_as_credit=True,
+    claim_count_label="Claims:",
+    claim_count_in_totals_row=True,
+    claims=(
+        _totalled("EU-901", date(2023, 3, 12), date(2023, 3, 12), "CLOSED",
+                  indemnity=D("5700.50"), recovery=D("200.00")),
+    ),
+)
+
+
+QA_DIRTY = Fixture(
+    name="qa_dirty_errors",
+    description="Three real defects at once: broken arithmetic, closed-with-reserve, loss before inception",
+    carrier="TEST CARRIER",
+    report_title="INTENTIONAL ERROR REPORT",
+    named_insured="Acme Logistics LLC",
+    policy_number="TC-901244",
+    policy_period=(date(2023, 1, 1), date(2024, 1, 1)),
+    valuation_date=date(2024, 6, 30),
+    line_of_business="GL",
+    columns=_SIMPLE_RESERVE_COLUMNS,
+    currency_symbol="$",
+    claim_count_label="Claims:",
+    claim_count_in_totals_row=True,
+    deliberate_r01_errors=("ERR-001",),
+    claims=(
+        _totalled("ERR-001", date(2021, 11, 15), date(2021, 11, 20), "CLOSED",
+                  indemnity=D("50000.00"), res_indemnity=D("10000.00"),
+                  incurred_total=D("55000.00")),
+    ),
+)
+
+
 ALL_FIXTURES: tuple[Fixture, ...] = (
     US_BASIC,
     EU_FORMAT,
@@ -561,6 +698,10 @@ ALL_FIXTURES: tuple[Fixture, ...] = (
     RULED_TABLE,
     ARITHMETIC_ERROR,
     NULLS_NOT_ZEROS,
+    QA_TRAVELERS,
+    QA_MAINFRAME_CREDIT,
+    QA_EUROPEAN_CREDIT,
+    QA_DIRTY,
     UNKNOWN_FORMAT,
     SCANNED,
 )

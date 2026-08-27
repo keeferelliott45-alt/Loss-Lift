@@ -152,6 +152,7 @@ def _document_facts(result: ExtractionResult) -> None:
 **Numbers read as** {"European (1.234,56)" if document.locale_hint == "eu" else "US (1,234.56)"}{"" if document.locale_confident else " — assumed"}
 **Dates read as** {document.date_order or "unknown"}{"" if document.date_order_confident else " — assumed"}
 **Carrier profile** {document.profile_name or "none saved yet"}
+**Recoveries printed as** {document.recovery_convention_label}
 """
     )
 

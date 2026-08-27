@@ -308,6 +308,7 @@ def _write_source_sheet(
         ("Number format proven", "yes" if document.locale_confident else "no — assumed"),
         ("Date order", document.date_order or "unknown"),
         ("Date order proven", "yes" if document.date_order_confident else "no — assumed"),
+        ("Recoveries printed as", document.recovery_convention_label),
         ("Pages", document.page_count),
         ("Extraction method", document.extraction_method.value),
         ("Scanned pages", ", ".join(str(p) for p in document.scanned_pages) or "none"),

@@ -342,13 +342,17 @@ def _extract_positioned_table(
         and not looks_like_header([text for text, _, _ in split_cells(line, char_width)])
     ]
 
-    # Column boundaries come from the data rows: the header may be narrower
-    # than its column, and total rows often overflow their first cell.
-    bounds = column_bounds(data_lines, char_width)
-    if len(bounds) != len(header_cells):
-        bounds = _bounds_from_header(header_cells)
-
-    headers = assign_to_columns(
+    # Two ways to find the columns, each with its own failure mode: whitespace
+    # gutters miss a column that is blank in every data row, and header gaps
+    # merge labels that sit close together — which right-aligned money headers
+    # routinely do. Rather than trust either, take whichever one reads the
+    # header row into more recognisable columns, since identifying the columns
+    # is the whole job.
+    # Assign the header's individual words, not the gap-split cells: splitting
+    # first is what merged "Paid Total Recovery Total Incurred Total" into one
+    # label, and re-using that merged blob would defeat the comparison below.
+    header_line = next(
+        (line for line in lines if line.index == header_index),
         Line(
             words=tuple(
                 Word(text=text, x0=x0, x1=x1, top=0.0, bottom=1.0)
@@ -356,8 +360,23 @@ def _extract_positioned_table(
             ),
             index=header_index,
         ),
-        bounds,
     )
+
+    best: tuple[int, int, list[tuple[float, float]], list[str]] | None = None
+    for candidate in (
+        column_bounds(data_lines, char_width),
+        _bounds_from_header(header_cells),
+    ):
+        if len(candidate) < 2:
+            continue
+        labels = assign_to_columns(header_line, candidate)
+        score = (header_score(labels), len(candidate))
+        if best is None or score > best[0]:
+            best = (score, len(candidate), list(candidate), labels)
+
+    if best is None:
+        return None
+    bounds, headers = best[2], best[3]
 
     rows: list[RawRow] = []
     total_rows: list[RawRow] = []
@@ -413,11 +432,18 @@ class DocumentMetadata:
     printed_claim_count: int | None = None
 
 
+#: Carriers phrase the valuation date many ways. "Report date" and "run date"
+#: are deliberately absent: they say when the report was printed, which is
+#: often not the date the values are stated as of. Reading one as the other
+#: would put a wrong valuation date on a priced submission without anyone
+#: noticing, and R-06 flagging a missing date is the safer failure.
 _VALUATION_PATTERNS = (
-    r"valuation\s*date\s*[:\-]?\s*(.+)",
-    r"valued\s*(?:as\s*of|through)\s*[:\-]?\s*(.+)",
-    r"evaluation\s*date\s*[:\-]?\s*(.+)",
+    r"valuation\s*(?:date|dt)\s*[:\-]?\s*(.+)",
+    r"val\s*date\s*[:\-]?\s*(.+)",
+    r"valued\s*(?:as\s*of|through|thru)\s*[:\-]?\s*(.+)",
+    r"evaluat(?:ion|ed)\s*(?:date|as\s*of)?\s*[:\-]?\s*(.+)",
     r"as\s*of\s*date\s*[:\-]?\s*(.+)",
+    r"(?:data|values?)\s*as\s*of\s*[:\-]?\s*(.+)",
     r"loss(?:es)?\s*valued\s*[:\-]?\s*(.+)",
 )
 
@@ -428,6 +454,10 @@ _PERIOD_PATTERN = re.compile(
 
 _COUNT_PATTERNS = (
     r"(?:total|number\s*of|count\s*of)\s*(?:claims?|records?|rows?)\s*[:\-]?\s*(\d[\d,]*)",
+    r"claims?\s*count\s*[:\-]?\s*(\d[\d,]*)",
+    # Footer rows commonly read just "Claims: 2". The plural and the colon are
+    # both required so a "Claim #: 12345" identifier is never read as a count.
+    r"\bclaims\s*[:]\s*(\d[\d,]*)",
     r"(\d[\d,]*)\s*(?:claims?|records?)\s*(?:shown|listed|reported|total)",
 )
 

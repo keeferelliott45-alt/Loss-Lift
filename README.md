@@ -8,7 +8,7 @@ Small commercial brokers and MGAs re-key claims tables out of carrier PDFs by ha
 
 ## Status
 
-All six milestones built and tested. 400 tests pass.
+All six milestones built and tested. 453 tests pass.
 
 Not yet validated against real carrier documents — see [Before this ships](#before-this-ships).
 
@@ -57,6 +57,10 @@ different:
 | `unknown_format.pdf` | Headers the vocabulary cannot place, so the mapping screen appears. Map them once and re-upload: it maps itself. |
 | `ruled_table.pdf` | A ruled grid, which takes the other extraction path. |
 | `scanned.pdf` | No text layer. Needs a Gemini key, or it reports the pages it skipped. |
+| `qa_travelers_clean.pdf` | Currency-prefixed amounts, footer count written `Claims: 2`. |
+| `qa_mainframe_credit.pdf` | Recoveries printed as credits (`250.00-`) next to `-0-` zeros. |
+| `qa_european_credit.pdf` | EUR amounts and `dd.mm.yyyy` dates under a US-formatted header. |
+| `qa_dirty_errors.pdf` | Three genuine defects at once: R-01, R-08 and R-09. |
 
 A quick tour: upload `arithmetic_error.pdf`, look at the amber badge and the
 exception underneath it, change that row's total incurred from `41400.00` to
@@ -92,6 +96,15 @@ human, rather than guessing.
 unparseable field carries a reason code, and the golden-file harness counts
 nulls-silently-read-as-zero as a separate, must-be-zero metric.
 
+**Conventions are inferred, never assumed.** Three document-level questions
+have no universal answer: are numbers written `1,234.56` or `1.234,56`, is
+`03/04` March or April, and does the recovery column hold the amount recovered
+or a credit? Each is settled from the document's own evidence — the numbers,
+the dates, and whether the rows' arithmetic works — and each is reported as
+proven or assumed. Taking the absolute value of every recovery would make the
+credit case pass too, and would also erase a genuine recovery reversal and
+quietly repair a document that is actually wrong.
+
 **Column mappings are learned per carrier.** The fingerprint hashes the
 carrier name, the column labels, and which header-block labels the template
 prints — never their values. A second document from the same carrier
@@ -117,23 +130,14 @@ python -m tests.golden.report
 ```
 
 ```
-fixture                                money             other      rows
-------------------------------------------------------------------------
-us_basic                     100.00% (18/18)   100.00% (36/36)       6/6
-eu_format                    100.00% (18/18)   100.00% (36/36)       6/6
-wc_medical                   100.00% (46/46)   100.00% (30/30)       6/6
-accounting_negatives         100.00% (17/17)   100.00% (36/36)       6/6
-mainframe_trailing_minus     100.00% (42/42)   100.00% (24/24)       6/6
-multipage_repeat_header      100.00% (40/40)   100.00% (84/84)     14/14
-ruled_table                  100.00% (18/18)   100.00% (36/36)       6/6
-arithmetic_error             100.00% (11/11)   100.00% (24/24)       4/4
-nulls_not_zeros              100.00% (11/11)   100.00% (24/24)       4/4
-------------------------------------------------------------------------
-ALL                          100.00% (221/221) 100.00% (330/330)   58/58
+ALL                          100.00% (238/238) 100.00% (348/348)   64/64
 
 nulls silently read as zero: 0
 money threshold (99.5%): PASS
 ```
+
+Thirteen digital fixtures, including four that reproduce carrier layouts which
+produced false findings in QA.
 
 **Read this number with care.** It is measured against synthetic fixtures this
 repository generates. They span the formats the spec calls for — US and EU
@@ -147,7 +151,7 @@ number can be trusted.
 ## Testing
 
 ```bash
-pytest                              # 400 tests
+pytest                              # 453 tests
 python -m tests.golden.report       # accuracy table
 ```
 

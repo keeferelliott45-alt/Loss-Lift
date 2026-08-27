@@ -40,22 +40,38 @@ HEADER_BLOCK_HEIGHT = 96.0
 # --------------------------------------------------------------------------
 
 
-def format_money(value: Decimal, style: str) -> str:
-    if style == "trailing_minus" and value == 0:
+def format_money(
+    value: Decimal, style: str, negative_style: str | None = None
+) -> str:
+    """Render an amount in a carrier's convention.
+
+    ``style`` picks the separators (and, by default, the negative style);
+    ``negative_style`` overrides just the negatives, which is how a European
+    report writes a credit as ``200,00-``.
+    """
+    if negative_style is None:
+        negative_style = {
+            "paren": "paren", "trailing_minus": "trailing"
+        }.get(style, "leading")
+    separators = "eu" if style == "eu" else "us"
+
+    if negative_style == "trailing" and value == 0:
         return "-0-"
     magnitude = f"{abs(value):,.2f}"
-    if style == "eu":
+    if separators == "eu":
         magnitude = magnitude.translate(str.maketrans({",": ".", ".": ","}))
     if value >= 0:
         return magnitude
-    if style == "paren":
+    if negative_style == "paren":
         return f"({magnitude})"
-    if style == "trailing_minus":
+    if negative_style == "trailing":
         return f"{magnitude}-"
     return f"-{magnitude}"
 
 
 def format_date(value: date, style: str) -> str:
+    if style == "dmy_dots":
+        return value.strftime("%d.%m.%Y")
     if style == "dmy":
         return value.strftime("%d/%m/%Y")
     if style == "iso":
@@ -63,6 +79,26 @@ def format_date(value: date, style: str) -> str:
     if style == "spelled":
         return value.strftime("%d-%b-%Y")
     return value.strftime("%m/%d/%Y")
+
+
+def _with_symbol(text: str, fixture: Fixture) -> str:
+    if not fixture.currency_symbol or not text:
+        return text
+    if fixture.currency_position == "suffix":
+        return f"{text} {fixture.currency_symbol}"
+    return f"{fixture.currency_symbol}{text}"
+
+
+def money_cell(value: Decimal, fixture: Fixture, field_name: str = "") -> str:
+    """Render an amount the way this carrier prints it.
+
+    A carrier that states recoveries as credits prints the recovery column
+    with a trailing minus and, in the documents this mirrors, without the
+    currency symbol the other money columns carry.
+    """
+    if fixture.recovery_as_credit and field_name == "recovery_total":
+        return format_money(-abs(value), fixture.number_format, "trailing")
+    return _with_symbol(format_money(value, fixture.number_format), fixture)
 
 
 def cell_text(fixture: Fixture, claim: dict[str, Any], column: Column) -> str:
@@ -77,7 +113,7 @@ def cell_text(fixture: Fixture, claim: dict[str, Any], column: Column) -> str:
     if value is None:
         return ""
     if isinstance(value, Decimal):
-        return format_money(value, fixture.number_format)
+        return money_cell(value, fixture, column.field)
     if isinstance(value, date):
         return format_date(value, fixture.date_format)
     if isinstance(value, bool):
@@ -90,7 +126,54 @@ def cell_text(fixture: Fixture, claim: dict[str, Any], column: Column) -> str:
 # --------------------------------------------------------------------------
 
 
-def _width(text: str, font: str, size: float) -> float:
+#: PyMuPDF's base-14 fonts are Latin-1 and have no euro sign — it silently
+#: renders as a middle dot, which would make this generator produce a document
+#: no parser could read and blame the parser for it. When a fixture prints a
+#: non-ASCII symbol, a TrueType face is embedded instead.
+_TTF_REGULAR = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
+_TTF_BOLD = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+)
+
+_FONT_CACHE: dict[str, "pymupdf.Font"] = {}
+
+
+def _first_existing(paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def font_files(fixture: Fixture) -> tuple[str | None, str | None]:
+    """The regular and bold faces this fixture needs, or ``(None, None)``."""
+    symbol = fixture.currency_symbol or ""
+    if all(ord(char) < 128 for char in symbol):
+        return None, None
+    regular = _first_existing(_TTF_REGULAR)
+    if regular is None:
+        raise RuntimeError(
+            f"{fixture.name} prints {symbol!r}, which the built-in fonts cannot "
+            f"encode, and no TrueType face was found to embed."
+        )
+    return regular, _first_existing(_TTF_BOLD) or regular
+
+
+def _loaded(path: str) -> "pymupdf.Font":
+    if path not in _FONT_CACHE:
+        _FONT_CACHE[path] = pymupdf.Font(fontfile=path)
+    return _FONT_CACHE[path]
+
+
+def _width(text: str, font: str, size: float, fontfile: str | None = None) -> float:
+    if fontfile:
+        return _loaded(fontfile).text_length(text, fontsize=size)
     return pymupdf.get_text_length(text, fontname=font, fontsize=size)
 
 
@@ -104,12 +187,16 @@ def plan_layout(fixture: Fixture) -> tuple[float, list[float], list[float]]:
     available = page_width - 2 * MARGIN - COLUMN_GAP * (len(fixture.columns) - 1)
 
     rows = list(fixture.claims)
+    regular, _ = font_files(fixture)
     for size in (fixture.font_size, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5):
         widths: list[float] = []
         for column in fixture.columns:
-            longest = _width(column.label, fixture.font, size)
+            longest = _width(column.label, fixture.font, size, regular)
             for claim in rows:
-                longest = max(longest, _width(cell_text(fixture, claim, column), fixture.font, size))
+                longest = max(
+                    longest,
+                    _width(cell_text(fixture, claim, column), fixture.font, size, regular),
+                )
             if column.field in fixture.money_fields:
                 total = sum(
                     (claim[column.field] for claim in rows if claim.get(column.field) is not None),
@@ -117,7 +204,10 @@ def plan_layout(fixture: Fixture) -> tuple[float, list[float], list[float]]:
                 )
                 longest = max(
                     longest,
-                    _width(format_money(total, fixture.number_format), fixture.font, size),
+                    _width(
+                        money_cell(total, fixture, column.field),
+                        fixture.font, size, regular,
+                    ),
                 )
             widths.append(longest + 2 * CELL_PAD)
         if sum(widths) <= available:
@@ -130,8 +220,18 @@ def plan_layout(fixture: Fixture) -> tuple[float, list[float], list[float]]:
     raise RuntimeError(f"{fixture.name}: columns do not fit even at 4.5pt")
 
 
-def _draw(page, text: str, x: float, y: float, font: str, size: float, bold: bool = False) -> None:
+def _draw(
+    page, text: str, x: float, y: float, font: str, size: float,
+    bold: bool = False, embedded: tuple[str | None, str | None] = (None, None),
+) -> None:
     if not text:
+        return
+    regular, bold_file = embedded
+    if regular:
+        fontfile = (bold_file or regular) if bold else regular
+        name = "bodyb" if bold and bold_file else "body"
+        page.insert_font(fontname=name, fontfile=fontfile)
+        page.insert_text((x, y), text, fontname=name, fontsize=size)
         return
     name = font
     if bold:
@@ -149,45 +249,50 @@ def _draw_row(
     size: float,
     bold: bool = False,
 ) -> None:
+    embedded = font_files(fixture)
     for column, text, start, width in zip(fixture.columns, values, starts, widths):
         if not text:
             continue
         if column.align == "right":
-            x = start + width - CELL_PAD - _width(text, fixture.font, size)
+            x = start + width - CELL_PAD - _width(text, fixture.font, size, embedded[0])
         else:
             x = start + CELL_PAD
-        _draw(page, text, x, y, fixture.font, size, bold)
+        _draw(page, text, x, y, fixture.font, size, bold, embedded)
 
 
 def _draw_document_header(page, fixture: Fixture, size: float, page_no: int, pages: int) -> float:
     """Carrier block at the top of every page; returns the first table y."""
     font = fixture.font
+    embedded = font_files(fixture)
     y = MARGIN + 10
-    _draw(page, fixture.carrier, MARGIN, y, font, size + 3.5, bold=True)
+    letterhead = fixture.carrier
+    if fixture.report_title:
+        letterhead = f"{fixture.carrier} - {fixture.report_title}"
+    _draw(page, letterhead, MARGIN, y, font, size + 3.5, bold=True, embedded=embedded)
     right = (PORTRAIT_SIZE if not fixture.landscape else PAGE_SIZE)[0] - MARGIN
     label = f"Page {page_no} of {pages}"
-    _draw(page, label, right - _width(label, font, size), y, font, size)
+    _draw(page, label, right - _width(label, font, size, embedded[0]), y, font, size, embedded=embedded)
 
     y += LINE_HEIGHT + 2
-    _draw(page, "LOSS RUN REPORT", MARGIN, y, font, size + 1, bold=True)
+    _draw(page, "LOSS RUN REPORT", MARGIN, y, font, size + 1, bold=True, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Named Insured: {fixture.named_insured}", MARGIN, y, font, size)
+    _draw(page, f"Named Insured: {fixture.named_insured}", MARGIN, y, font, size, embedded=embedded)
     valuation = format_date(fixture.valuation_date, fixture.date_format)
-    _draw(page, f"Valuation Date: {valuation}", MARGIN + 340, y, font, size)
+    _draw(page, f"Valuation Date: {valuation}", MARGIN + 340, y, font, size, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Policy Number: {fixture.policy_number}", MARGIN, y, font, size)
+    _draw(page, f"Policy Number: {fixture.policy_number}", MARGIN, y, font, size, embedded=embedded)
     start, end = fixture.policy_period
     period = (
         f"Policy Period: {format_date(start, fixture.date_format)} to "
         f"{format_date(end, fixture.date_format)}"
     )
-    _draw(page, period, MARGIN + 340, y, font, size)
+    _draw(page, period, MARGIN + 340, y, font, size, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Line of Business: {fixture.line_of_business}", MARGIN, y, font, size)
-    _draw(page, f"Currency: {fixture.currency}", MARGIN + 340, y, font, size)
+    _draw(page, f"Line of Business: {fixture.line_of_business}", MARGIN, y, font, size, embedded=embedded)
+    _draw(page, f"Currency: {fixture.currency}", MARGIN + 340, y, font, size, embedded=embedded)
 
     return MARGIN + HEADER_BLOCK_HEIGHT
 
@@ -256,17 +361,20 @@ def render(fixture: Fixture, path: Path) -> Path:
                     if index == 0:
                         row.append(fixture.total_label)
                     elif column.field in totals:
-                        row.append(format_money(totals[column.field], fixture.number_format))
+                        row.append(money_cell(totals[column.field], fixture, column.field))
+                    elif index == 1 and fixture.claim_count_in_totals_row:
+                        row.append(f"{fixture.claim_count_label} {len(fixture.claims)}")
                     else:
                         row.append("")
                 _draw_row(page, fixture, row, starts, widths, y, size, bold=True)
                 y += LINE_HEIGHT
-            if fixture.print_claim_count:
+            if fixture.print_claim_count and not fixture.claim_count_in_totals_row:
                 y += 4
                 _draw(
                     page,
-                    f"Total Claims: {len(fixture.claims)}",
+                    f"{fixture.claim_count_label} {len(fixture.claims)}",
                     starts[0] + CELL_PAD, y, fixture.font, size, bold=True,
+                    embedded=font_files(fixture),
                 )
 
     path.parent.mkdir(parents=True, exist_ok=True)

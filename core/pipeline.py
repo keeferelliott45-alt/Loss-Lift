@@ -20,9 +20,11 @@ from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
+    RecoverySignInference,
     clean_text,
     infer_date_order,
     infer_locale,
+    infer_recovery_sign,
     parse_bool,
     parse_date,
     parse_money,
@@ -92,6 +94,9 @@ class ExtractionResult:
     classification: DocumentClassification
     locale: LocaleInference
     date_order: DateOrderInference
+    recovery_sign: RecoverySignInference = field(
+        default_factory=RecoverySignInference
+    )
     tables: list[RawTable] = field(default_factory=list)
     profile: CarrierProfile | None = None
     warnings: list[str] = field(default_factory=list)
@@ -323,24 +328,56 @@ def _money_tokens(tables: Sequence[RawTable], mapping: ColumnMapping) -> list[st
     return [token for token in tokens if token.strip()]
 
 
-def _date_tokens(
-    tables: Sequence[RawTable], mapping: ColumnMapping, metadata: DocumentMetadata
+def _table_date_tokens(
+    tables: Sequence[RawTable], mapping: ColumnMapping
 ) -> list[str]:
+    """Date cells from the claims table itself."""
     indexes = [i for i, name in mapping.fields.items() if name in DATE_FIELDS]
     tokens: list[str] = []
     for table in tables:
         for row in table.rows:
             tokens.extend(row.cell(index) for index in indexes)
-    tokens.extend(
+    return [token for token in tokens if token.strip()]
+
+
+def _metadata_date_tokens(metadata: DocumentMetadata) -> list[str]:
+    """Dates from the header block, which is a separate format context."""
+    return [
         text
         for text in (
             metadata.valuation_date_text,
             metadata.policy_period_start_text,
             metadata.policy_period_end_text,
         )
-        if text
-    )
-    return [token for token in tokens if token.strip()]
+        if text and text.strip()
+    ]
+
+
+def resolve_date_order(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    metadata: DocumentMetadata,
+    locale: str | None,
+) -> tuple[DateOrderInference, DateOrderInference]:
+    """Settle the day/month order for the table, and for the header block.
+
+    The table's own dates decide first. Failing that, the document's number
+    convention does — a report that writes ``5.700,50`` writes ``12.03.2023``
+    day-first. The header block is consulted last and separately, because it
+    is often templated in a different style from the table: a European report
+    can print ``Valuation Date: 06/30/2024`` above dates written the other way
+    round, and letting that settle the table would move every loss date.
+    """
+    table_order = infer_date_order(_table_date_tokens(tables, mapping), locale)
+    header_order = infer_date_order(_metadata_date_tokens(metadata), locale)
+
+    if table_order.source == "evidence":
+        return table_order, header_order
+    if table_order.source == "locale":
+        return table_order, header_order
+    if header_order.source == "evidence":
+        return header_order, header_order
+    return table_order, header_order
 
 
 def _line_of_business(text: str | None) -> LineOfBusiness | None:
@@ -433,11 +470,14 @@ def run_pipeline(
         locale_inference = LocaleInference(
             profile.number_locale, True, "carrier profile"
         )
-    date_inference = infer_date_order(
-        _date_tokens(tables, mapping, metadata), locale_inference.for_parsing
+    date_inference, header_date_inference = resolve_date_order(
+        tables, mapping, metadata, locale_inference.for_parsing
     )
     if profile and profile.date_order:
-        date_inference = DateOrderInference(profile.date_order, True, "carrier profile")
+        date_inference = DateOrderInference(
+            profile.date_order, True, "carrier profile", source="evidence"
+        )
+        header_date_inference = date_inference
 
     locale = locale_inference.for_parsing
     date_order = date_inference.for_parsing
@@ -462,16 +502,56 @@ def run_pipeline(
 
     # Document-level facts.
     document_issues: dict[str, NullReason] = {}
-    valuation = parse_date(metadata.valuation_date_text or "", date_order)
+    header_order = header_date_inference.for_parsing or date_order
+    valuation = parse_date(metadata.valuation_date_text or "", header_order)
     if valuation.value is None and metadata.valuation_date_text:
         document_issues["valuation_date"] = valuation.reason or NullReason.UNPARSEABLE
-    period_start = parse_date(metadata.policy_period_start_text or "", date_order)
-    period_end = parse_date(metadata.policy_period_end_text or "", date_order)
+    period_start = parse_date(metadata.policy_period_start_text or "", header_order)
+    period_end = parse_date(metadata.policy_period_end_text or "", header_order)
 
-    currency = (metadata.currency or "USD").strip().upper()[:3] or "USD"
-    currencies_seen = sorted(
-        {claim.currency for claim in claims if claim.currency} | {currency}
+    printed_totals = collect_printed_totals(tables, mapping, locale)
+
+    # Recoveries: settle the carrier's sign convention before anything is
+    # reconciled, and apply it to the printed totals too — otherwise R-04
+    # would compare a corrected column against an uncorrected footer.
+    recovery_sign = infer_recovery_sign(
+        (
+            claim.claim_number,
+            claim.paid_total,
+            claim.reserve_total,
+            claim.recovery_total,
+            claim.incurred_total,
+        )
+        for claim in claims
     )
+    if profile and profile.recovery_convention:
+        recovery_sign = RecoverySignInference(
+            credit_convention=profile.recovery_convention == "credit",
+            confident=True,
+            evidence="carrier profile",
+        )
+    if recovery_sign.should_negate:
+        for claim in claims:
+            if claim.recovery_total is not None:
+                claim.recovery_total = -claim.recovery_total
+        printed_totals = {
+            name: (-value if name == "recovery_total" and value is not None else value)
+            for name, value in printed_totals.items()
+        }
+
+    # Currency: what the rows actually show, not what the default assumes.
+    # Defaulting to USD and then comparing that default against a euro symbol
+    # is how R-16 accuses every European document of mixing currencies.
+    declared = (metadata.currency or "").strip().upper()[:3]
+    declared = declared if len(declared) == 3 and declared.isalpha() else ""
+    symbols = {claim.currency for claim in claims if claim.currency}
+    if declared:
+        currency = declared
+    elif len(symbols) == 1:
+        currency = next(iter(symbols))
+    else:
+        currency = "USD"
+    currencies_seen = sorted(symbols | ({declared} if declared else set()))
 
     document = LossRunDocument(
         document_id=ingested.document_id,
@@ -484,7 +564,7 @@ def run_pipeline(
         policy_period_end=period_end.value,
         line_of_business=_line_of_business(metadata.line_of_business),
         valuation_date=valuation.value,
-        currency=currency if len(currency) == 3 and currency.isalpha() else "USD",
+        currency=currency,
         locale_hint=locale_inference.locale,
         locale_confident=locale_inference.confident,
         date_order=date_inference.order,
@@ -492,13 +572,14 @@ def run_pipeline(
         page_count=classification.page_count,
         extraction_method=classification.extraction_method,
         scanned_pages=scanned_pages,
-        printed_totals=collect_printed_totals(tables, mapping, locale),
+        printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         claims=claims,
         currencies_seen=currencies_seen,
         document_issues=document_issues,
         profile_fingerprint=fingerprint_value,
         profile_name=profile.profile_name if profile else None,
+        recovery_convention="credit" if recovery_sign.should_negate else None,
     )
 
     config = reconcile_config or _config_for(profile)
@@ -509,6 +590,7 @@ def run_pipeline(
         classification=classification,
         locale=locale_inference,
         date_order=date_inference,
+        recovery_sign=recovery_sign,
         tables=tables,
         profile=profile,
         warnings=warnings,
@@ -556,6 +638,9 @@ def save_confirmed_mapping(
         carrier=document.carrier,
         date_order=result.date_order.order if result.date_order.confident else None,
         number_locale=result.locale.locale if result.locale.confident else None,
+        recovery_convention=(
+            "credit" if result.recovery_sign.should_negate else None
+        ),
         currency=document.currency,
         line_of_business=(
             document.line_of_business.value if document.line_of_business else None

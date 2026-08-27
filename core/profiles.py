@@ -49,6 +49,9 @@ LABEL_SYNONYMS: dict[str, str] = {
     "claim id": "claim_number", "file number": "claim_number",
     "file no": "claim_number", "claim num": "claim_number",
     "claimno": "claim_number", "occurrence number": "claim_number",
+    "claim ref": "claim_number", "claim reference": "claim_number",
+    "clm ref": "claim_number", "claim ref no": "claim_number",
+    "claim reference number": "claim_number", "file ref": "claim_number",
     # dates
     "date of loss": "date_of_loss", "loss date": "date_of_loss",
     "dol": "date_of_loss", "loss dt": "date_of_loss",
@@ -136,7 +139,7 @@ def guess_field(label: str) -> FieldGuess:
     if "claimant" in token_set or "injured" in token_set:
         return FieldGuess("claimant_name", 0.8, "heuristic")
     if token_set & {"claim", "clm", "file"} and token_set & {
-        "number", "no", "nbr", "num", "id", "#"
+        "number", "no", "nbr", "num", "id", "#", "ref", "reference"
     }:
         return FieldGuess("claim_number", 0.85, "heuristic")
     if token_set & {"status", "stat"}:
@@ -235,6 +238,26 @@ _CARRIER_LABEL = re.compile(
 
 _PAGE_MARKER = re.compile(r"\s*page\s+\d+\s*(?:of\s*\d+)?\s*$", re.IGNORECASE)
 
+#: Letterheads commonly read "CARRIER NAME - DOCUMENT TITLE" on one line.
+_DOCUMENT_TITLE = re.compile(
+    r"\b(loss\s*run|loss\s*report|claims?\s*(?:listing|report|detail|summary|"
+    r"history|experience)|statement|report|listing|summary|experience)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_document_title(line: str) -> str:
+    """Drop a trailing document title so the carrier name stands alone.
+
+    "STATE AUTO - HISTORICAL LOSS REPORT" is State Auto. Keeping the title
+    would put the report's name into the profile fingerprint and show it to
+    the user as the carrier.
+    """
+    parts = re.split(r"\s+[-–—|]\s+", line)
+    while len(parts) > 1 and _DOCUMENT_TITLE.search(parts[-1]):
+        parts.pop()
+    return " - ".join(parts).strip()
+
 
 def detect_carrier(text: str) -> str | None:
     """Best-effort carrier name from the letterhead.
@@ -254,11 +277,13 @@ def detect_carrier(text: str) -> str | None:
     candidates: list[str] = []
     for line in lines:
         candidate = _PAGE_MARKER.sub("", line.strip())
-        if not candidate or len(candidate) > 80 or ":" in candidate:
+        if not candidate or len(candidate) > 120 or ":" in candidate:
             continue
         if _NOT_A_CARRIER.match(candidate):
             continue
-        candidates.append(candidate)
+        candidate = _strip_document_title(candidate)
+        if candidate:
+            candidates.append(candidate)
 
     for candidate in candidates:
         match = _CARRIER_SUFFIX_RE.search(candidate)
@@ -329,6 +354,7 @@ PROFILE_WHITELIST: frozenset[str] = frozenset(
         "date_order",
         "number_locale",
         "negative_convention",
+        "recovery_convention",
         "dash_means_zero",
         "total_row_pattern",
         "money_tolerance",
@@ -359,6 +385,8 @@ class CarrierProfile:
     date_order: str | None = None
     number_locale: str | None = None
     negative_convention: str | None = None
+    #: "credit" when the carrier prints recoveries as negative amounts.
+    recovery_convention: str | None = None
     dash_means_zero: bool = False
     total_row_pattern: str = r"^\s*(grand\s+)?(report\s+)?totals?\b"
     money_tolerance: str = "0.01"
@@ -392,6 +420,7 @@ class CarrierProfile:
                 "date_order": self.date_order,
                 "number_locale": self.number_locale,
                 "negative_convention": self.negative_convention,
+                "recovery_convention": self.recovery_convention,
                 "dash_means_zero": self.dash_means_zero,
                 "total_row_pattern": self.total_row_pattern,
                 "money_tolerance": self.money_tolerance,
@@ -497,6 +526,7 @@ def profile_from_mapping(
     carrier: str | None = None,
     date_order: str | None = None,
     number_locale: str | None = None,
+    recovery_convention: str | None = None,
     dash_means_zero: bool = False,
     currency: str = "USD",
     line_of_business: str | None = None,
@@ -515,6 +545,7 @@ def profile_from_mapping(
         column_map=column_map,
         date_order=date_order,
         number_locale=number_locale,
+        recovery_convention=recovery_convention,
         dash_means_zero=dash_means_zero,
         currency=currency,
         line_of_business=line_of_business,

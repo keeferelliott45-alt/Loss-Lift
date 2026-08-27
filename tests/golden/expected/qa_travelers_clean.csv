@@ -1,0 +1,3 @@
+claim_number,date_of_loss,claim_status,paid_total,reserve_total,incurred_total
+CA-88392,2023-05-12,CLOSED,13750.50,,13750.50
+CA-90112,2023-08-20,OPEN,3600.00,5000.00,8600.00

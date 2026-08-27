@@ -524,10 +524,19 @@ class DateOrderInference:
     evidence: str | None = None
     mdy_votes: int = 0
     dmy_votes: int = 0
+    #: evidence — a date settled it; locale — the number convention implies it;
+    #: default — nothing did.
+    source: str = "default"
 
     @property
     def for_parsing(self) -> DateOrder | None:
-        return self.order if self.confident else None
+        """The order to parse with, or ``None`` to refuse.
+
+        Spec section 4 says to fall back to ``locale_hint`` when no date proves
+        the order, and to flag it — so a locale-derived order is used but is
+        never reported as confident.
+        """
+        return self.order if self.source in ("evidence", "locale") else None
 
 
 def infer_date_order(
@@ -560,13 +569,15 @@ def infer_date_order(
             mdy_evidence = mdy_evidence or text
 
     if dmy and not mdy:
-        return DateOrderInference("dmy", True, dmy_evidence, mdy, dmy)
+        return DateOrderInference("dmy", True, dmy_evidence, mdy, dmy, "evidence")
     if mdy and not dmy:
-        return DateOrderInference("mdy", True, mdy_evidence, mdy, dmy)
+        return DateOrderInference("mdy", True, mdy_evidence, mdy, dmy, "evidence")
     if not mdy and not dmy and locale is not None:
         order: DateOrder = "dmy" if locale == "eu" else "mdy"
-        return DateOrderInference(order, False, None, mdy, dmy)
-    return DateOrderInference(default, False, mdy_evidence or dmy_evidence, mdy, dmy)
+        return DateOrderInference(order, False, None, mdy, dmy, "locale")
+    return DateOrderInference(
+        default, False, mdy_evidence or dmy_evidence, mdy, dmy, "default"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -630,3 +641,76 @@ def parse_text(raw: object) -> str | None:
     if not text or text.upper() in _NA_TOKENS or re.fullmatch(r"-+", text):
         return None
     return text
+
+
+# --------------------------------------------------------------------------
+# Recovery sign convention
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RecoverySignInference:
+    """Whether this carrier prints recoveries as credits.
+
+    Carriers disagree about the sign of a recovery column. Most print the
+    amount recovered as a positive number; mainframe and European reports
+    often print it as a credit — ``250.00-`` or ``(250.00)`` — because that is
+    how it lands in the ledger.
+
+    R-01 subtracts recovery from paid plus reserve, so reading a credit at
+    face value turns a subtraction into an addition and every row fails.
+    Taking the absolute value would hide that, but it would also destroy a
+    genuinely negative recovery (a reversal or chargeback, which is real) and
+    quietly repair a document that is actually wrong — the opposite of what
+    this product is for. So the convention is *inferred from the document's
+    own arithmetic* and only applied when the evidence is unanimous.
+    """
+
+    credit_convention: bool = False
+    confident: bool = False
+    evidence: str | None = None
+    positive_votes: int = 0
+    credit_votes: int = 0
+
+    @property
+    def should_negate(self) -> bool:
+        return self.credit_convention and self.confident
+
+
+def infer_recovery_sign(
+    rows: Iterable[
+        tuple[str, Decimal | None, Decimal | None, Decimal | None, Decimal | None]
+    ],
+    tolerance: Decimal = Decimal("0.01"),
+) -> RecoverySignInference:
+    """Read the sign convention off the rows' own arithmetic.
+
+    Each row is ``(claim_number, paid_total, reserve_total, recovery_total,
+    incurred_total)``. A row votes only when it can settle the question: it
+    needs a non-zero recovery, an incurred total, and at least one of paid or
+    reserve.
+
+    Conflicting votes mean the document is not internally consistent, which is
+    exactly when guessing would be worst — so nothing is applied and R-01
+    reports the rows that do not tie.
+    """
+    positive = credit = 0
+    evidence: str | None = None
+
+    for claim_number, paid, reserve, recovery, incurred in rows:
+        if recovery is None or incurred is None or recovery == 0:
+            continue
+        if paid is None and reserve is None:
+            continue
+        base = (paid or Decimal("0")) + (reserve or Decimal("0"))
+        subtracts = abs((base - recovery) - incurred) <= tolerance
+        adds = abs((base + recovery) - incurred) <= tolerance
+        if subtracts and not adds:
+            positive += 1
+        elif adds and not subtracts:
+            credit += 1
+            evidence = evidence or claim_number
+
+    if credit and not positive:
+        return RecoverySignInference(True, True, evidence, positive, credit)
+    return RecoverySignInference(False, positive > 0 and not credit, None, positive, credit)

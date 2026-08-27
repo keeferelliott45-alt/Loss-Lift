@@ -244,6 +244,9 @@ class LossRunDocument(BaseModel):
     document_issues: dict[str, NullReason] = Field(default_factory=dict)
     profile_fingerprint: str | None = None
     profile_name: str | None = None
+    #: "credit" when this carrier prints recoveries as negative amounts, which
+    #: are normalised to positive so R-01's subtraction means what it says.
+    recovery_convention: str | None = None
     scanned_pages: list[int] = Field(default_factory=list)
     extracted_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -271,6 +274,12 @@ class LossRunDocument(BaseModel):
         if value < 0:
             raise ValueError("page_count may not be negative")
         return value
+
+    @property
+    def recovery_convention_label(self) -> str:
+        if self.recovery_convention == "credit":
+            return "credits, normalised to positive amounts"
+        return "positive amounts"
 
     def column_total(self, field: str) -> Decimal:
         """Sum of a money column across claims, ignoring nulls.

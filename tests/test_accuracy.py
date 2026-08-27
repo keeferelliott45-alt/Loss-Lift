@@ -121,11 +121,35 @@ def test_document_metadata_matches_expectations(golden_dir):
         assert document.policy_period_end.isoformat() == meta["policy_period_end"]
 
 
-def test_locale_and_date_order_are_inferred_confidently(golden_dir):
+def test_every_document_resolves_its_number_and_date_conventions(golden_dir):
+    """Both conventions must be settled well enough to parse with.
+
+    Date order is not always *proven*: a document with one claim whose date is
+    03.12.2023 has no date that can settle day-first from month-first, and the
+    spec falls back to the number convention there. What matters is that the
+    order is resolved and that a fallback is reported as assumed rather than
+    claimed as evidence.
+    """
     for fixture in DIGITAL_FIXTURES:
         _, result = score_fixture(fixture.name, golden_dir / f"{fixture.name}.pdf")
         assert result.locale.confident, f"{fixture.name}: locale unproven"
-        assert result.date_order.confident, f"{fixture.name}: date order unproven"
+        assert result.date_order.for_parsing is not None, (
+            f"{fixture.name}: date order unresolved, so every date is null"
+        )
+        if result.date_order.source != "evidence":
+            assert not result.date_order.confident, (
+                f"{fixture.name}: an assumed date order must not report as proven"
+            )
+
+
+def test_a_document_with_no_datable_evidence_falls_back_to_its_numbers(golden_dir):
+    """One EU-formatted claim date, and a US-formatted header above it."""
+    _, result = score_fixture("qa_european_credit", golden_dir / "qa_european_credit.pdf")
+    assert result.date_order.source == "locale"
+    assert result.date_order.order == "dmy"
+    assert result.date_order.confident is False
+    # 12.03.2023 is 12 March, not 3 December.
+    assert result.document.claims[0].date_of_loss.month == 3
 
 
 # --- The specific fixtures that carry a planted defect ---------------------
