@@ -22,12 +22,23 @@ def golden_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return target
 
 
-@pytest.fixture()
-def profiles_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the profile library at a throwaway directory."""
+@pytest.fixture(autouse=True)
+def isolate_profile_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Never read or write the developer's real profile directory.
+
+    Without this a profile saved by a previous run — or by using the app —
+    silently changes what the tests extract, and the suite passes or fails
+    depending on what is on disk.
+    """
     from core import profiles
 
     target = tmp_path / "profiles"
-    target.mkdir()
+    target.mkdir(exist_ok=True)
     monkeypatch.setattr(profiles, "PROFILE_DIR", target)
     return target
+
+
+@pytest.fixture()
+def profiles_dir(isolate_profile_library: Path) -> Path:
+    """The throwaway profile directory, for tests that write to it explicitly."""
+    return isolate_profile_library

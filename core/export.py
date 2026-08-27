@@ -1,0 +1,426 @@
+"""Stage 7 — export (spec section 5).
+
+One workbook, three sheets:
+
+* **Claims** — the table, in the chosen column order, with cells that carry a
+  finding shaded amber and vision-extracted cells marked.
+* **Exceptions** — every finding, errors first, with expected, actual and delta.
+* **Source Info** — filename, hash, valuation date, extraction method,
+  timestamp and reconciliation status, so the workbook can be audited back to
+  the document it came from.
+
+The redaction toggle drops claimant names and loss descriptions (spec
+section 9).
+"""
+
+from __future__ import annotations
+
+import io
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+from core.schema import (
+    DATE_FIELDS,
+    MONEY_FIELDS,
+    REDACTED_FIELDS,
+    Claim,
+    DocumentStatus,
+    Finding,
+    LossRunDocument,
+    ReconciliationResult,
+    Severity,
+    SourceMethod,
+)
+
+#: Column-order templates offered on the export screen.
+EXPORT_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "Underwriting standard": (
+        "claim_number",
+        "date_of_loss",
+        "date_reported",
+        "claim_status",
+        "cause_of_loss",
+        "loss_description",
+        "paid_total",
+        "reserve_total",
+        "recovery_total",
+        "incurred_total",
+    ),
+    "Full detail": (
+        "claim_number",
+        "date_of_loss",
+        "date_reported",
+        "claim_status",
+        "claimant_name",
+        "loss_description",
+        "cause_of_loss",
+        "paid_indemnity",
+        "paid_medical",
+        "paid_expense",
+        "paid_total",
+        "reserve_indemnity",
+        "reserve_medical",
+        "reserve_expense",
+        "reserve_total",
+        "recovery_total",
+        "incurred_total",
+        "litigation_flag",
+    ),
+    "Workers comp": (
+        "claim_number",
+        "date_of_loss",
+        "date_reported",
+        "claim_status",
+        "claimant_name",
+        "paid_indemnity",
+        "paid_medical",
+        "paid_expense",
+        "paid_total",
+        "reserve_indemnity",
+        "reserve_medical",
+        "reserve_expense",
+        "reserve_total",
+        "incurred_total",
+    ),
+    "Claim numbers and incurred": (
+        "claim_number",
+        "date_of_loss",
+        "incurred_total",
+    ),
+}
+
+DEFAULT_TEMPLATE = "Underwriting standard"
+
+COLUMN_TITLES: dict[str, str] = {
+    "claim_number": "Claim number",
+    "date_of_loss": "Date of loss",
+    "date_reported": "Date reported",
+    "claim_status": "Status",
+    "claimant_name": "Claimant",
+    "loss_description": "Loss description",
+    "cause_of_loss": "Cause of loss",
+    "paid_indemnity": "Paid indemnity",
+    "paid_medical": "Paid medical",
+    "paid_expense": "Paid expense",
+    "paid_total": "Paid total",
+    "reserve_indemnity": "Reserve indemnity",
+    "reserve_medical": "Reserve medical",
+    "reserve_expense": "Reserve expense",
+    "reserve_total": "Reserve total",
+    "recovery_total": "Recovery",
+    "incurred_total": "Total incurred",
+    "litigation_flag": "In suit",
+    "source_page": "Source page",
+    "source_method": "Extraction",
+}
+
+MONEY_FORMAT = '#,##0.00;[Red](#,##0.00)'
+DATE_FORMAT = "yyyy-mm-dd"
+
+_HEADER_FILL = PatternFill("solid", fgColor="1F2933")
+_HEADER_FONT = Font(color="FFFFFF", bold=True)
+_FINDING_FILL = PatternFill("solid", fgColor="FDE8C8")   # amber
+_ERROR_FILL = PatternFill("solid", fgColor="F8D7DA")     # red
+_VISION_FONT = Font(italic=True, color="6B5B00")
+
+
+def _title(field_name: str) -> str:
+    return COLUMN_TITLES.get(field_name, field_name.replace("_", " ").capitalize())
+
+
+def resolve_columns(
+    template: str | Sequence[str] = DEFAULT_TEMPLATE,
+    *,
+    redact: bool = False,
+    include_provenance: bool = True,
+) -> list[str]:
+    """The column order for the Claims sheet."""
+    if isinstance(template, str):
+        columns = list(EXPORT_TEMPLATES.get(template, EXPORT_TEMPLATES[DEFAULT_TEMPLATE]))
+    else:
+        columns = list(template)
+    if redact:
+        columns = [name for name in columns if name not in REDACTED_FIELDS]
+    if include_provenance:
+        columns += ["source_page", "source_method"]
+    return columns
+
+
+def _cell_value(claim: Claim, field_name: str) -> Any:
+    value = getattr(claim, field_name, None)
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        # openpyxl has no Decimal type; float here is presentation only and
+        # never feeds a reconciliation.
+        return float(value)
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, date):
+        return value
+    if hasattr(value, "value"):
+        return value.value
+    return str(value)
+
+
+def _findings_index(
+    result: ReconciliationResult | None,
+) -> dict[tuple[str, str], Severity]:
+    """Which (claim, field) pairs carry a finding, and how bad."""
+    index: dict[tuple[str, str], Severity] = {}
+    if result is None:
+        return index
+    for finding in result.findings:
+        if not finding.claim_number or not finding.field:
+            continue
+        key = (finding.claim_number, finding.field)
+        current = index.get(key)
+        if current is None or finding.severity is Severity.ERROR:
+            index[key] = finding.severity
+    return index
+
+
+def _autosize(sheet: Worksheet, widths: dict[int, int]) -> None:
+    for index, width in widths.items():
+        sheet.column_dimensions[get_column_letter(index)].width = min(max(width, 10), 52)
+
+
+def _write_claims_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    columns: Sequence[str],
+    result: ReconciliationResult | None,
+) -> None:
+    findings = _findings_index(result)
+    widths: dict[int, int] = {}
+
+    for column_index, field_name in enumerate(columns, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=_title(field_name))
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        widths[column_index] = len(_title(field_name)) + 2
+
+    for row_index, claim in enumerate(document.claims, start=2):
+        for column_index, field_name in enumerate(columns, start=1):
+            value = _cell_value(claim, field_name)
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+
+            if field_name in MONEY_FIELDS:
+                cell.number_format = MONEY_FORMAT
+            elif field_name in DATE_FIELDS:
+                cell.number_format = DATE_FORMAT
+
+            severity = findings.get((claim.claim_number, field_name))
+            if severity is Severity.ERROR:
+                cell.fill = _ERROR_FILL
+            elif severity is not None:
+                cell.fill = _FINDING_FILL
+            elif claim.field_issues.get(field_name):
+                cell.fill = _FINDING_FILL
+
+            if claim.source_method is SourceMethod.VISION:
+                cell.font = _VISION_FONT
+
+            if value is not None:
+                widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+    sheet.freeze_panes = "A2"
+    if document.claims:
+        sheet.auto_filter.ref = (
+            f"A1:{get_column_letter(len(columns))}{len(document.claims) + 1}"
+        )
+    _autosize(sheet, widths)
+
+
+def _write_exceptions_sheet(
+    sheet: Worksheet, result: ReconciliationResult | None
+) -> None:
+    headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
+               "Expected", "Actual", "Delta", "Page"]
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = len(title) + 2
+
+    findings = result.findings if result else []
+    for row_index, finding in enumerate(findings, start=2):
+        values = [
+            finding.rule_id,
+            finding.severity.value,
+            finding.claim_number or "",
+            _title(finding.field) if finding.field else "",
+            finding.message,
+            float(finding.expected) if isinstance(finding.expected, Decimal) else finding.expected,
+            float(finding.actual) if isinstance(finding.actual, Decimal) else finding.actual,
+            float(finding.delta) if finding.delta is not None else None,
+            finding.page,
+        ]
+        for column_index, value in enumerate(values, start=1):
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            if column_index in (6, 7, 8) and isinstance(value, float):
+                cell.number_format = MONEY_FORMAT
+            if finding.severity is Severity.ERROR:
+                cell.fill = _ERROR_FILL
+            elif finding.severity is Severity.WARN:
+                cell.fill = _FINDING_FILL
+            if value is not None:
+                widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+    if not findings:
+        sheet.cell(row=2, column=1, value="No exceptions. Every check passed.")
+
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
+def _write_source_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    result: ReconciliationResult | None,
+    *,
+    redacted: bool,
+    template: str,
+) -> None:
+    status = result.status if result else DocumentStatus.CLEAN
+    error_count = len(result.errors) if result else 0
+    warn_count = len(result.warnings) if result else 0
+
+    rows: list[tuple[str, Any]] = [
+        ("Source file", document.source_filename),
+        ("SHA-256", document.file_sha256),
+        ("Carrier", document.carrier or "not found"),
+        ("Named insured", document.named_insured or "not found"),
+        ("Policy number", document.policy_number or "not found"),
+        ("Policy period", _period(document)),
+        ("Line of business", document.line_of_business.value if document.line_of_business else "not found"),
+        ("Valuation date", document.valuation_date or "MISSING — see exceptions"),
+        ("Currency", document.currency),
+        ("Number format", "European (1.234,56)" if document.locale_hint == "eu" else "US (1,234.56)"),
+        ("Number format proven", "yes" if document.locale_confident else "no — assumed"),
+        ("Date order", document.date_order or "unknown"),
+        ("Date order proven", "yes" if document.date_order_confident else "no — assumed"),
+        ("Pages", document.page_count),
+        ("Extraction method", document.extraction_method.value),
+        ("Scanned pages", ", ".join(str(p) for p in document.scanned_pages) or "none"),
+        ("Carrier profile", document.profile_name or "none saved"),
+        ("Claims extracted", len(document.claims)),
+        ("Claim count printed on document", document.printed_claim_count if document.printed_claim_count is not None else "not printed"),
+        ("Reconciliation status", "Reconciled" if status is DocumentStatus.CLEAN else "Needs review"),
+        ("Errors", error_count),
+        ("Warnings", warn_count),
+        ("Claimant data redacted", "yes" if redacted else "no"),
+        ("Column template", template if isinstance(template, str) else "custom"),
+        ("Exported at", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+    ]
+
+    for row_index, (label, value) in enumerate(rows, start=1):
+        label_cell = sheet.cell(row=row_index, column=1, value=label)
+        label_cell.font = Font(bold=True)
+        value_cell = sheet.cell(row=row_index, column=2, value=value)
+        if isinstance(value, date):
+            value_cell.number_format = DATE_FORMAT
+
+    blank = len(rows) + 2
+    sheet.cell(row=blank, column=1, value="Printed totals vs extracted").font = Font(bold=True)
+    header_row = blank + 1
+    for column_index, title in enumerate(
+        ["Column", "Printed on document", "Extracted total", "Difference"], start=1
+    ):
+        cell = sheet.cell(row=header_row, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+
+    row_index = header_row + 1
+    for field_name in MONEY_FIELDS:
+        printed = document.printed_totals.get(field_name)
+        if printed is None:
+            continue
+        extracted = document.column_total(field_name)
+        sheet.cell(row=row_index, column=1, value=_title(field_name))
+        for column_index, amount in enumerate(
+            (printed, extracted, extracted - printed), start=2
+        ):
+            cell = sheet.cell(row=row_index, column=column_index, value=float(amount))
+            cell.number_format = MONEY_FORMAT
+        row_index += 1
+    if row_index == header_row + 1:
+        sheet.cell(row=row_index, column=1, value="The document printed no column totals.")
+
+    _autosize(sheet, {1: 34, 2: 46, 3: 20, 4: 18})
+
+
+def _period(document: LossRunDocument) -> str:
+    start, end = document.policy_period_start, document.policy_period_end
+    if not start and not end:
+        return "not found"
+    return f"{start or '?'} to {end or '?'}"
+
+
+def build_workbook(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    *,
+    template: str | Sequence[str] = DEFAULT_TEMPLATE,
+    redact: bool = False,
+    include_provenance: bool = True,
+) -> Workbook:
+    """Build the three-sheet workbook."""
+    columns = resolve_columns(
+        template, redact=redact, include_provenance=include_provenance
+    )
+    workbook = Workbook()
+    claims_sheet = workbook.active
+    claims_sheet.title = "Claims"
+    _write_claims_sheet(claims_sheet, document, columns, result)
+    _write_exceptions_sheet(workbook.create_sheet("Exceptions"), result)
+    _write_source_sheet(
+        workbook.create_sheet("Source Info"),
+        document,
+        result,
+        redacted=redact,
+        template=template if isinstance(template, str) else "custom",
+    )
+    return workbook
+
+
+def to_bytes(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    **kwargs: Any,
+) -> bytes:
+    """The workbook as bytes, for a Streamlit download button."""
+    buffer = io.BytesIO()
+    build_workbook(document, result, **kwargs).save(buffer)
+    return buffer.getvalue()
+
+
+def write_xlsx(
+    document: LossRunDocument,
+    path: str | Path,
+    result: ReconciliationResult | None = None,
+    **kwargs: Any,
+) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    build_workbook(document, result, **kwargs).save(target)
+    return target
+
+
+def suggested_filename(document: LossRunDocument) -> str:
+    """A filename an account manager can find again."""
+    stem = Path(document.source_filename).stem or "loss-run"
+    parts = [part for part in (document.named_insured, stem) if part]
+    label = " - ".join(parts)[:80]
+    valuation = document.valuation_date.isoformat() if document.valuation_date else "no-valuation-date"
+    safe = "".join(ch if ch.isalnum() or ch in " -_." else "-" for ch in label).strip()
+    return f"{safe} {valuation}.xlsx".replace("  ", " ")

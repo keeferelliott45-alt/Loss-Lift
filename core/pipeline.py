@@ -570,3 +570,219 @@ def sample_rows(tables: Sequence[RawTable], count: int = 3) -> list[list[str]]:
             if len(rows) >= count:
                 return rows
     return rows
+
+
+# --------------------------------------------------------------------------
+# Stage 6 — review adapters
+#
+# The review table is a presentation of the document, and turning one into the
+# other is logic, so it lives here rather than in the Streamlit layer.
+# --------------------------------------------------------------------------
+
+#: Provenance columns carried through the editor so an edited row can still be
+#: traced back to the page it came from. Shown read-only.
+PROVENANCE_COLUMNS = ("_page", "_row", "_method")
+
+REVIEW_COLUMNS: tuple[str, ...] = (
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "cause_of_loss",
+    "paid_indemnity",
+    "paid_medical",
+    "paid_expense",
+    "paid_total",
+    "reserve_indemnity",
+    "reserve_medical",
+    "reserve_expense",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total",
+    "litigation_flag",
+)
+
+
+def review_columns(document: LossRunDocument) -> list[str]:
+    """Show the columns this document actually has, plus the required ones."""
+    always = {"claim_number", "date_of_loss", "incurred_total"}
+    present = []
+    for name in REVIEW_COLUMNS:
+        if name in always:
+            present.append(name)
+            continue
+        if any(getattr(claim, name, None) is not None for claim in document.claims):
+            present.append(name)
+    return present
+
+
+def to_records(
+    document: LossRunDocument, columns: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """The claims as plain rows for the editable table."""
+    names = list(columns or review_columns(document))
+    records = []
+    for claim in document.claims:
+        row: dict[str, Any] = {}
+        for name in names:
+            value = getattr(claim, name, None)
+            if isinstance(value, Decimal):
+                # float is presentation only; apply_edits converts back through
+                # str() so no float artefact ever reaches a reconciliation.
+                row[name] = float(value)
+            elif hasattr(value, "value"):
+                row[name] = value.value
+            else:
+                row[name] = value
+        row["_page"] = claim.source_page
+        row["_row"] = claim.source_row
+        row["_method"] = claim.source_method.value
+        records.append(row)
+    return records
+
+
+def _is_missing(value: Any) -> bool:
+    """True for every flavour of "no value" a table round trip can produce.
+
+    pandas, numpy and pyarrow each have their own null, and none of them is
+    ``None``. Any of them reaching ``Decimal`` becomes ``Decimal("NaN")``,
+    which the schema rejects — so they are all caught in one place.
+    """
+    if value is None:
+        return True
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    try:
+        # numpy.nan, pandas.NA and pyarrow nulls all answer this.
+        import pandas as pd
+
+        result = pd.isna(value)
+    except (ImportError, ValueError, TypeError):
+        return False
+    return bool(result) if isinstance(result, bool) or getattr(result, "ndim", 0) == 0 else False
+
+
+def _coerce(
+    field_name: str, value: Any, locale: str | None, date_order: str | None
+) -> tuple[Any, NullReason | None]:
+    """Turn one edited cell back into a canonical value."""
+    # Status has no null: an unset status is UNKNOWN, not a missing value.
+    if field_name == "claim_status":
+        return parse_status(value), None
+
+    # An empty numeric cell arrives as NaN once the table has been through
+    # pandas. NaN is a null, not a zero, and it must never reach a Decimal.
+    if _is_missing(value):
+        return None, NullReason.EMPTY
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, NullReason.EMPTY
+
+    if field_name in MONEY_FIELDS:
+        if isinstance(value, Decimal):
+            return (value, None) if value.is_finite() else (None, NullReason.EMPTY)
+        if isinstance(value, bool):
+            return None, NullReason.UNPARSEABLE
+        if isinstance(value, (int, float)):
+            # str() first: Decimal(0.1) is not Decimal("0.1").
+            amount = Decimal(str(value))
+            return (amount, None) if amount.is_finite() else (None, NullReason.EMPTY)
+        parsed = parse_money(str(value), locale)
+        return parsed.value, parsed.reason
+    if field_name in DATE_FIELDS:
+        if isinstance(value, date):
+            return value, None
+        parsed_date = parse_date(str(value), date_order)
+        return parsed_date.value, parsed_date.reason
+    if field_name == "litigation_flag":
+        return parse_bool(value), None
+    return parse_text(value), None
+
+
+def apply_edits(
+    document: LossRunDocument,
+    records: Sequence[dict[str, Any]],
+    *,
+    locale: str | None = None,
+    date_order: str | None = None,
+) -> LossRunDocument:
+    """Rebuild the document from the edited table.
+
+    A cell the human changed becomes ``source_method="manual"`` with full
+    confidence and no outstanding issue — they are the authority, and the audit
+    trail records that they were.
+    """
+    locale = locale or (document.locale_hint if document.locale_confident else None)
+    date_order = date_order or (
+        document.date_order if document.date_order_confident else None
+    )
+    originals = {
+        (claim.source_page, claim.source_row, claim.claim_number): claim
+        for claim in document.claims
+    }
+    by_position = list(document.claims)
+
+    claims: list[Claim] = []
+    for index, record in enumerate(records):
+        claim_number = clean_text(record.get("claim_number", ""))
+        if not claim_number:
+            continue  # a row emptied out is a row deleted
+
+        key = (record.get("_page"), record.get("_row"), claim_number)
+        original = originals.get(key)
+        if original is None and index < len(by_position):
+            candidate = by_position[index]
+            if candidate.claim_number == claim_number:
+                original = candidate
+
+        issues = dict(original.field_issues) if original else {}
+        confidence = dict(original.field_confidence) if original else {}
+        raw_cells = dict(original.raw_cells) if original else {}
+        edited = False
+        fields: dict[str, Any] = {}
+
+        for name, value in record.items():
+            if name in PROVENANCE_COLUMNS or name == "claim_number":
+                continue
+            if name not in Claim.model_fields:
+                continue
+            coerced, reason = _coerce(name, value, locale, date_order)
+            previous = getattr(original, name, None) if original else None
+            fields[name] = coerced
+            if coerced != previous:
+                edited = True
+                confidence[name] = 1.0
+                issues.pop(name, None)
+                if coerced is None and reason and reason is not NullReason.EMPTY:
+                    issues[name] = reason
+            elif original is not None and name in original.field_issues:
+                issues[name] = original.field_issues[name]
+
+        if original is not None and claim_number != original.claim_number:
+            edited = True
+
+        claims.append(
+            Claim(
+                claim_number=claim_number,
+                source_page=int(record.get("_page") or (original.source_page if original else 1)),
+                source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
+                source_bbox=original.source_bbox if original else None,
+                source_method=(
+                    SourceMethod.MANUAL
+                    if edited or original is None
+                    else original.source_method
+                ),
+                field_issues=issues,
+                field_confidence=confidence,
+                raw_cells=raw_cells,
+                currency=original.currency if original else None,
+                **fields,
+            )
+        )
+
+    updated = document.model_copy(deep=True)
+    updated.claims = claims
+    return updated

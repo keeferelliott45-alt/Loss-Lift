@@ -52,6 +52,8 @@ class Fixture:
     rows_per_page: int = 40
     scanned: bool = False
     needs_mapping: bool = False
+    #: Claim numbers whose printed arithmetic is deliberately wrong.
+    deliberate_r01_errors: tuple[str, ...] = ()
     print_totals: bool = True
     print_claim_count: bool = True
     total_label: str = "TOTALS"
@@ -296,7 +298,7 @@ WC_MEDICAL = Fixture(
                   res_expense=D("1500.00"), claimant="Park, Hyun"),
         _totalled("WC24-1004", date(2024, 8, 15), date(2024, 8, 21), "CLOSED",
                   indemnity=D("16750.00"), medical=D("28900.00"), expense=D("3250.00"),
-                  recovery=D("4500.00"), claimant="Quinn, Sean"),
+                  claimant="Quinn, Sean"),
         _totalled("WC24-1005", date(2024, 11, 6), date(2024, 11, 8), "OPEN",
                   indemnity=D("3100.00"), medical=D("7625.00"), expense=D("800.00"),
                   res_indemnity=D("18000.00"), res_medical=D("26500.00"),
@@ -445,6 +447,7 @@ ARITHMETIC_ERROR = Fixture(
     line_of_business="GL",
     columns=_GL_COLUMNS,
     print_totals=False,  # the footer would disagree with the broken row
+    deliberate_r01_errors=("FM-0003",),
     claims=(
         _totalled("FM-0001", date(2024, 1, 8), date(2024, 1, 12), "Open",
                   indemnity=D("5000.00"), expense=D("1000.00"),
@@ -571,3 +574,27 @@ DIGITAL_FIXTURES: tuple[Fixture, ...] = tuple(
     for fixture in ALL_FIXTURES
     if not fixture.scanned and not fixture.needs_mapping
 )
+
+
+def printed_r01_violations(fixture: Fixture) -> list[str]:
+    """Claims whose incurred cannot be derived from the columns actually printed.
+
+    A value that exists in the canonical data but has no column on the page is
+    invisible to a reader and to the reconciler, so leaving one in a fixture
+    that is meant to be clean plants an error nobody intended.
+    """
+    printed = {column.field for column in fixture.columns}
+    violations = []
+    for claim in fixture.claims:
+        incurred = claim.get("incurred_total")
+        if incurred is None or "incurred_total" not in printed:
+            continue
+        expected = Decimal("0")
+        for name, sign in (
+            ("paid_total", 1), ("reserve_total", 1), ("recovery_total", -1)
+        ):
+            if name in printed and claim.get(name) is not None:
+                expected += sign * claim[name]
+        if expected != incurred:
+            violations.append(claim["claim_number"])
+    return violations
