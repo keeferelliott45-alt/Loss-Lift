@@ -1,9 +1,10 @@
-"""Exhaustive tests for core/normalize.py — every format in CLAUDE.md §4.
+"""Exhaustive coverage of spec section 4.
 
-Money parsing is the single highest-bug-density area of the product; every
-case in the spec's format table appears here, plus the ambiguous cases under
-each resolution path (no evidence / us / eu).
+Every format listed in the spec appears here by name, plus the ambiguous cases
+that must fail rather than guess.
 """
+
+from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
@@ -11,342 +12,407 @@ from decimal import Decimal
 import pytest
 
 from core.normalize import (
-    classify_token_date_order,
-    classify_token_locale,
+    DateOrderInference,
+    LocaleInference,
+    NumberParse,
+    clean_text,
     infer_date_order,
     infer_locale,
-    normalize_status,
-    parse_count,
+    normalize_label,
+    parse_bool,
     parse_date,
+    parse_int,
     parse_money,
+    parse_status,
+    parse_text,
 )
 from core.schema import ClaimStatus, NullReason
 
 
-def D(s: str) -> Decimal:
-    return Decimal(s)
+def money(raw, locale=None, **kwargs) -> NumberParse:
+    return parse_money(raw, locale, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# parse_money — unambiguous formats from the §4 table
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# The table in spec section 4, line by line
+# --------------------------------------------------------------------------
 
 
-class TestMoneyUnambiguous:
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [
-            ("1,234.56", D("1234.56")),  # US thousands + decimal
-            ("1.234,56", D("1234.56")),  # EU thousands + decimal
-            ("1 234,56", D("1234.56")),  # French space grouping
-            ("1 234,56", D("1234.56")),  # non-breaking space
-            ("1 234,56", D("1234.56")),  # narrow no-break space
-            ("(1,234.56)", D("-1234.56")),  # accounting negative
-            ("1,234.56-", D("-1234.56")),  # mainframe trailing minus
-            ("-1,234.56", D("-1234.56")),  # leading minus
-            ("-0-", D("0")),  # mainframe zero
-            ("-0.00-", D("0")),
-            ("1,234.56 CR", D("-1234.56")),  # credit = negative
-            ("1,234.56CR", D("-1234.56")),
-            ("0.00", D("0")),  # zero is a fact, not null
-            ("0", D("0")),
-            ("1234", D("1234")),
-            ("1234567", D("1234567")),
-            ("1,23", D("1.23")),  # 2 digits after comma: decimal
-            ("1.5", D("1.5")),
-            ("12,3456", D("12.3456")),  # 4 digits after: decimal
-            ("1,234,567.89", D("1234567.89")),
-            ("1.234.567,89", D("1234567.89")),
-            ("1,234,567", D("1234567")),  # repeated separator: grouping
-            ("1.234.567", D("1234567")),
-            ("1234,567", D("1234.567")),  # 4-digit lead can't be grouping
-            ("1'234.56", D("1234.56")),  # Swiss apostrophe grouping
-            ("(1.234,56)", D("-1234.56")),
-            ("1 234,56-", D("-1234.56")),
-        ],
-    )
-    def test_parses_without_locale(self, raw, expected):
-        result = parse_money(raw)
-        assert result.reason is None
-        assert result.value == expected
-
-    def test_zero_is_not_null(self):
-        assert parse_money("0.00").value == D("0")
-        assert parse_money("0.00").reason is None
-        assert parse_money("").value is None  # the two facts stay distinct
+@pytest.mark.parametrize(
+    ("raw", "locale", "expected"),
+    [
+        ("1,234.56", None, Decimal("1234.56")),      # US thousands + decimal
+        ("1.234,56", None, Decimal("1234.56")),      # EU thousands + decimal
+        ("1 234,56", None, Decimal("1234.56")),      # French / non-breaking space
+        ("1 234,56", None, Decimal("1234.56")), # literal NBSP
+        ("(1,234.56)", None, Decimal("-1234.56")),   # accounting negative
+        ("1,234.56-", None, Decimal("-1234.56")),    # mainframe trailing minus
+        ("-1,234.56", None, Decimal("-1234.56")),    # leading minus
+        ("$1,234", "us", Decimal("1234")),           # currency prefix
+        ("1.234 €", "eu", Decimal("1234")),     # currency suffix
+        ("-0-", None, Decimal("0")),                 # mainframe zero
+        ("1,234.56 CR", None, Decimal("-1234.56")),  # credit is negative
+    ],
+)
+def test_spec_number_formats(raw, locale, expected):
+    parsed = money(raw, locale)
+    assert parsed.value == expected, f"{raw!r} -> {parsed.value} ({parsed.reason})"
+    assert parsed.reason is None
 
 
-class TestMoneyCurrency:
-    def test_currency_prefix(self):
-        result = parse_money("$1,234", locale="us")
-        assert result.value == D("1234")
-        assert result.currency_symbol == "$"
-
-    def test_currency_suffix_eu(self):
-        result = parse_money("1.234 €", locale="eu")
-        assert result.value == D("1234")
-        assert result.currency_symbol == "€"
-
-    def test_currency_with_unambiguous_number(self):
-        result = parse_money("$1,234.56")
-        assert result.value == D("1234.56")
-        assert result.currency_symbol == "$"
-
-    def test_currency_inside_parens(self):
-        result = parse_money("($1,234.56)")
-        assert result.value == D("-1234.56")
-        assert result.currency_symbol == "$"
-
-    def test_currency_with_leading_minus(self):
-        result = parse_money("$ -1,234.56")
-        assert result.value == D("-1234.56")
-        assert result.currency_symbol == "$"
-
-    @pytest.mark.parametrize("raw,symbol", [("£500.25", "£"), ("¥1,000.50", "¥")])
-    def test_other_symbols(self, raw, symbol):
-        result = parse_money(raw)
-        assert result.reason is None
-        assert result.currency_symbol == symbol
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        ("N/A", NullReason.NOT_APPLICABLE),
+        ("NA", NullReason.NOT_APPLICABLE),
+        ("n/a", NullReason.NOT_APPLICABLE),
+        ("", NullReason.EMPTY),
+        ("   ", NullReason.EMPTY),
+        (None, NullReason.EMPTY),
+        ("--", NullReason.DASH_PLACEHOLDER),
+    ],
+)
+def test_null_tokens_are_null_never_zero(raw, reason):
+    parsed = money(raw)
+    assert parsed.value is None
+    assert parsed.reason is reason
 
 
-class TestMoneyNulls:
-    @pytest.mark.parametrize("raw", ["N/A", "NA", "n/a", "na", "N.A.", "none"])
-    def test_na_tokens_are_null_not_zero(self, raw):
-        result = parse_money(raw)
-        assert result.value is None
-        assert result.reason == NullReason.NA_TOKEN
-
-    @pytest.mark.parametrize("raw", ["", "   ", None, " ", "-"])
-    def test_blank_is_null_not_zero(self, raw):
-        result = parse_money(raw)
-        assert result.value is None
-        assert result.reason == NullReason.BLANK
-
-    def test_double_dash_defaults_to_null_with_reason(self):
-        result = parse_money("--")
-        assert result.value is None
-        assert result.reason == NullReason.DOUBLE_DASH
-
-    def test_double_dash_zero_when_profile_says_so(self):
-        result = parse_money("--", double_dash_is_zero=True)
-        assert result.value == D("0")
-        assert result.reason is None
-
-    @pytest.mark.parametrize(
-        "raw",
-        ["abc", "12..34", "1,23,45", "1,2345.00", "..", "$", "()", "1,2,3", "--1--"],
-    )
-    def test_garbage_fails_loud(self, raw):
-        result = parse_money(raw)
-        assert result.value is None
-        assert result.reason is not None
+def test_dash_is_zero_when_the_carrier_profile_says_so():
+    assert money("--", dash_means_zero=True).value == Decimal("0")
+    assert money("--", dash_means_zero=False).value is None
 
 
-class TestMoneyAmbiguous:
-    """One separator, exactly three digits after it: never guess."""
-
-    @pytest.mark.parametrize("raw", ["1,234", "1.234", "$1,234", "1.234 €", "12,345", "123.456"])
-    def test_flagged_without_evidence(self, raw):
-        result = parse_money(raw)  # locale=None: no evidence
-        assert result.value is None
-        assert result.reason == NullReason.AMBIGUOUS_SEPARATOR
-
-    @pytest.mark.parametrize(
-        ("raw", "locale", "expected"),
-        [
-            ("1,234", "us", D("1234")),  # comma is grouping in US
-            ("1,234", "eu", D("1.234")),  # comma is decimal in EU
-            ("1.234", "us", D("1.234")),
-            ("1.234", "eu", D("1234")),
-            ("$1,234", "us", D("1234")),
-            ("1.234 €", "eu", D("1234")),
-            ("(12,345)", "us", D("-12345")),
-        ],
-    )
-    def test_resolved_by_evidenced_locale(self, raw, locale, expected):
-        result = parse_money(raw, locale=locale)
-        assert result.reason is None
-        assert result.value == expected
-
-    def test_invalid_locale_rejected(self):
-        with pytest.raises(ValueError):
-            parse_money("1,234", locale="fr")
+# --------------------------------------------------------------------------
+# Separator disambiguation (the four numbered rules)
+# --------------------------------------------------------------------------
 
 
-class TestLocaleInference:
-    @pytest.mark.parametrize(
-        ("token", "verdict"),
-        [
-            ("1,234.56", "us"),
-            ("1.234,56", "eu"),
-            ("1,234,567", "us"),
-            ("1.234.567", "eu"),
-            ("1,23", "eu"),  # comma decimal
-            ("1.5", "us"),  # dot decimal
-            ("0.00", "us"),
-            ("0,00", "eu"),
-            ("1,234", None),  # the ambiguous shape
-            ("1.234", None),
-            ("1234", None),  # no separator, no evidence
-            ("N/A", None),
-            ("", None),
-            (None, None),
-        ],
-    )
-    def test_single_token_classification(self, token, verdict):
-        assert classify_token_locale(token) == verdict
-
-    def test_document_level_us(self):
-        assert infer_locale(["1,234", "5,678.90", "12"]) == "us"
-
-    def test_document_level_eu(self):
-        assert infer_locale(["1.234", "5.678,90", "12"]) == "eu"
-
-    def test_no_evidence_returns_none(self):
-        assert infer_locale(["1,234", "5,678", "12"]) is None
-
-    def test_conflicting_evidence_returns_none(self):
-        assert infer_locale(["1,234.56", "1.234,56"]) is None
-
-    def test_empty_returns_none(self):
-        assert infer_locale([]) is None
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1,234.56", Decimal("1234.56")),
+        ("1.234,56", Decimal("1234.56")),
+        ("1,234,567.89", Decimal("1234567.89")),
+        ("1.234.567,89", Decimal("1234567.89")),
+        ("12,345,678.90", Decimal("12345678.90")),
+    ],
+)
+def test_rule_1_last_separator_is_the_decimal(raw, expected):
+    assert money(raw).value == expected
 
 
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", ["1,234", "1.234", "$1,234", "12.345"])
+def test_rule_2_lone_separator_with_three_digits_is_ambiguous(raw):
+    parsed = money(raw, locale=None)
+    assert parsed.value is None
+    assert parsed.reason is NullReason.AMBIGUOUS_SEPARATOR
+    assert parsed.ambiguous is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "us_value", "eu_value"),
+    [
+        ("1,234", Decimal("1234"), Decimal("1.234")),
+        ("1.234", Decimal("1.234"), Decimal("1234")),
+    ],
+)
+def test_rule_2_resolves_with_a_locale(raw, us_value, eu_value):
+    assert money(raw, "us").value == us_value
+    assert money(raw, "eu").value == eu_value
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1,5", Decimal("1.5")),        # two digits after: decimal either way
+        ("1.5", Decimal("1.5")),
+        ("1,23", Decimal("1.23")),
+        ("0.05", Decimal("0.05")),
+        ("1234.5678", Decimal("1234.5678")),
+        ("12345,678", Decimal("12345.678")),   # too many leading digits to group
+        ("1,234,567", Decimal("1234567")),     # repeated separator is grouping
+        ("1.234.567", Decimal("1234567")),
+    ],
+)
+def test_unambiguous_lone_separators_need_no_locale(raw, expected):
+    parsed = money(raw, locale=None)
+    assert parsed.value == expected
+    assert parsed.reason is None
+
+
+def test_rule_3_document_level_inference():
+    inference = infer_locale(["1,234.56", "900", "12"])
+    assert inference.locale == "us"
+    assert inference.confident is True
+    assert money("1,234", inference.for_parsing).value == Decimal("1234")
+
+    inference = infer_locale(["1.234,56", "900"])
+    assert inference.locale == "eu"
+    assert inference.confident is True
+    assert money("1.234", inference.for_parsing).value == Decimal("1234")
+
+
+def test_rule_3_default_is_us_but_unproven():
+    inference = infer_locale(["100", "200", "300"])
+    assert inference.locale == "us"
+    assert inference.confident is False
+    assert inference.for_parsing is None
+
+
+def test_rule_4_unproven_locale_never_guesses():
+    inference = infer_locale(["100", "250"])
+    parsed = money("1,234", inference.for_parsing)
+    assert parsed.value is None
+    assert parsed.reason is NullReason.AMBIGUOUS_SEPARATOR
+
+
+def test_conflicting_evidence_is_not_confident():
+    inference = infer_locale(["1,234.56", "9.876,54"])
+    assert inference.confident is False
+    assert inference.us_votes == 1
+    assert inference.eu_votes == 1
+
+
+@pytest.mark.parametrize(
+    ("tokens", "locale"),
+    [
+        (["1,234,567"], "us"),     # repeated comma = grouping = US
+        (["1.234.567"], "eu"),
+        (["12,5"], "eu"),          # comma with 2 digits after = EU decimal
+        (["12.5"], "us"),
+        (["1.234,56"], "eu"),
+        (["1,234.56"], "us"),
+    ],
+)
+def test_locale_evidence_sources(tokens, locale):
+    assert infer_locale(tokens).locale == locale
+    assert infer_locale(tokens).confident is True
+
+
+# --------------------------------------------------------------------------
+# Signs, currency, junk
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("(0.00)", Decimal("0.00")),
+        ("($1,234.56)", Decimal("-1234.56")),
+        ("1,234.56 DR", Decimal("1234.56")),
+        ("+1,234.56", Decimal("1234.56")),
+        ("−1,234.56", Decimal("-1234.56")),   # unicode minus
+        ("USD 1,234.56", Decimal("1234.56")),
+        ("1,234.56 USD", Decimal("1234.56")),
+        ("0", Decimal("0")),
+        ("0.00", Decimal("0.00")),
+    ],
+)
+def test_signs_and_currency(raw, expected):
+    parsed = money(raw)
+    assert parsed.value == expected
+    assert parsed.reason is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "code"),
+    [("$1,234.56", "USD"), ("1.234,56 €", "EUR"), ("£500.00", "GBP"), ("1,234.56", None)],
+)
+def test_currency_symbol_is_reported(raw, code):
+    assert money(raw).currency == code
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["abc", "12abc", "1,23,456", "12,34,567", "1.2.3,4,5", "(1,234", "50%", "#REF!"],
+)
+def test_junk_is_unparseable_not_zero(raw):
+    parsed = money(raw)
+    assert parsed.value is None
+    assert parsed.reason is NullReason.UNPARSEABLE
+
+
+def test_floats_are_refused_outright():
+    with pytest.raises(TypeError):
+        parse_money(1234.56)
+
+
+def test_decimal_and_int_pass_through():
+    assert money(Decimal("1234.56")).value == Decimal("1234.56")
+    assert money(7).value == Decimal("7")
+
+
+def test_parse_result_has_no_truthiness_trap():
+    parsed = money("0.00")
+    with pytest.raises(TypeError):
+        bool(parsed)
+    assert parsed.ok is True
+
+
+def test_zero_and_null_are_different_facts():
+    zero, null = money("0.00"), money("")
+    assert zero.value == Decimal("0.00") and zero.ok
+    assert null.value is None and not null.ok
+
+
+# --------------------------------------------------------------------------
 # Dates
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 
-class TestDateUnambiguous:
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [
-            ("2024-03-04", date(2024, 3, 4)),  # ISO always unambiguous
-            ("2024/03/04", date(2024, 3, 4)),
-            ("13/04/2024", date(2024, 4, 13)),  # first > 12: day-first
-            ("04/13/2024", date(2024, 4, 13)),  # second > 12: month-first
-            ("31/12/2024", date(2024, 12, 31)),
-            ("12/31/2024", date(2024, 12, 31)),
-            ("03/03/2024", date(2024, 3, 3)),  # readings coincide
-            ("Mar 4, 2024", date(2024, 3, 4)),
-            ("March 4, 2024", date(2024, 3, 4)),
-            ("4 Mar 2024", date(2024, 3, 4)),
-            ("4 March 2024", date(2024, 3, 4)),
-            ("Feb 29, 2024", date(2024, 2, 29)),  # leap day
-            ("25/12/23", date(2023, 12, 25)),  # two-digit year
-        ],
+@pytest.mark.parametrize(
+    ("raw", "order", "expected"),
+    [
+        ("03/04/2024", "mdy", date(2024, 3, 4)),
+        ("03/04/2024", "dmy", date(2024, 4, 3)),
+        ("13/04/2024", None, date(2024, 4, 13)),    # >12 settles it
+        ("04/13/2024", None, date(2024, 4, 13)),
+        ("2024-03-04", None, date(2024, 3, 4)),     # ISO is self-identifying
+        ("2024/03/04", None, date(2024, 3, 4)),
+        ("20240304", None, date(2024, 3, 4)),
+        ("4-Mar-24", None, date(2024, 3, 4)),
+        ("Mar 4, 2024", None, date(2024, 3, 4)),
+        ("March 4, 2024", None, date(2024, 3, 4)),
+        ("4 March 2024", None, date(2024, 3, 4)),
+        ("SEPT 9 2019", None, date(2019, 9, 9)),
+        ("03.04.2024", "dmy", date(2024, 4, 3)),
+        ("3/4/24", "mdy", date(2024, 3, 4)),
+        ("03/04/2024 00:00:00", "mdy", date(2024, 3, 4)),
+    ],
+)
+def test_date_formats(raw, order, expected):
+    parsed = parse_date(raw, order)
+    assert parsed.value == expected, f"{raw!r} -> {parsed.value} ({parsed.reason})"
+
+
+def test_ambiguous_date_without_order_is_flagged():
+    parsed = parse_date("03/04/2024", None)
+    assert parsed.value is None
+    assert parsed.reason is NullReason.AMBIGUOUS_DATE_ORDER
+    assert parsed.ambiguous is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        ("2024-02-30", NullReason.INVALID_DATE),
+        ("13/13/2024", NullReason.INVALID_DATE),
+        ("0007-01-01", NullReason.OUT_OF_RANGE),
+        ("not a date", NullReason.UNPARSEABLE),
+        ("", NullReason.EMPTY),
+        ("N/A", NullReason.NOT_APPLICABLE),
+    ],
+)
+def test_bad_dates_fail_loudly(raw, reason):
+    parsed = parse_date(raw)
+    assert parsed.value is None
+    assert parsed.reason is reason
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("01/02/69", date(2069, 1, 2)), ("01/02/70", date(1970, 1, 2)), ("01/02/87", date(1987, 1, 2))],
+)
+def test_two_digit_year_pivot(raw, expected):
+    assert parse_date(raw, "mdy").value == expected
+
+
+def test_infer_date_order_from_a_day_above_twelve():
+    inference = infer_date_order(["03/04/2024", "17/05/2024", "01/02/2024"])
+    assert inference.order == "dmy"
+    assert inference.confident is True
+    assert parse_date("03/04/2024", inference.for_parsing).value == date(2024, 4, 3)
+
+
+def test_infer_date_order_month_first():
+    inference = infer_date_order(["03/14/2024", "01/02/2024"])
+    assert inference.order == "mdy"
+    assert inference.confident is True
+
+
+def test_infer_date_order_without_evidence_is_unproven():
+    inference = infer_date_order(["01/02/2024", "03/04/2024"])
+    assert inference.confident is False
+    assert inference.for_parsing is None
+    assert parse_date("01/02/2024", inference.for_parsing).reason is (
+        NullReason.AMBIGUOUS_DATE_ORDER
     )
-    def test_parses_without_order_hint(self, raw, expected):
-        result = parse_date(raw)
-        assert result.reason is None
-        assert result.value == expected
 
 
-class TestDateAmbiguous:
-    def test_flagged_without_evidence(self):
-        result = parse_date("03/04/2024")  # Mar 4 or Apr 3
-        assert result.value is None
-        assert result.reason == NullReason.AMBIGUOUS_DATE_ORDER
-
-    def test_resolved_month_first(self):
-        result = parse_date("03/04/2024", day_first=False)
-        assert result.value == date(2024, 3, 4)
-
-    def test_resolved_day_first(self):
-        result = parse_date("03/04/2024", day_first=True)
-        assert result.value == date(2024, 4, 3)
-
-    def test_two_digit_year_ambiguous(self):
-        result = parse_date("3/4/24")
-        assert result.reason == NullReason.AMBIGUOUS_DATE_ORDER
-        assert parse_date("3/4/24", day_first=False).value == date(2024, 3, 4)
-
-    def test_self_evident_overrides_wrong_hint(self):
-        # 03/25 can only be March 25 even if the document is day-first.
-        result = parse_date("03/25/2024", day_first=True)
-        assert result.value == date(2024, 3, 25)
+def test_conflicting_date_evidence_is_not_confident():
+    inference = infer_date_order(["13/04/2024", "04/13/2024"])
+    assert inference.confident is False
 
 
-class TestDateInvalid:
-    @pytest.mark.parametrize("raw", ["99/99/9999", "13/13/2024", "00/00/2024", "31/02/2024 "])
-    def test_invalid_dates(self, raw):
-        result = parse_date(raw.strip())
-        assert result.value is None
-        assert result.reason == NullReason.INVALID_DATE
-
-    def test_feb_29_non_leap(self):
-        result = parse_date("Feb 29, 2023")
-        assert result.value is None
-        assert result.reason == NullReason.INVALID_DATE
-
-    @pytest.mark.parametrize("raw", ["not a date", "2024", "Marchtember 4, 2024"])
-    def test_unparseable(self, raw):
-        result = parse_date(raw)
-        assert result.value is None
-        assert result.reason == NullReason.UNPARSEABLE
-
-    @pytest.mark.parametrize("raw,reason", [("", NullReason.BLANK), (None, NullReason.BLANK), ("N/A", NullReason.NA_TOKEN)])
-    def test_null_inputs(self, raw, reason):
-        result = parse_date(raw)
-        assert result.value is None
-        assert result.reason == reason
+def test_eu_locale_hints_day_first_but_stays_unproven():
+    inference = infer_date_order(["01/02/2024"], locale="eu")
+    assert inference.order == "dmy"
+    assert inference.confident is False
 
 
-class TestDateOrderInference:
-    @pytest.mark.parametrize(
-        ("token", "verdict"),
-        [
-            ("25/06/2024", True),
-            ("06/25/2024", False),
-            ("03/04/2024", None),
-            ("2024-03-04", None),  # ISO carries no order signal
-            ("garbage", None),
-            (None, None),
-        ],
-    )
-    def test_single_token(self, token, verdict):
-        assert classify_token_date_order(token) == verdict
-
-    def test_document_day_first(self):
-        assert infer_date_order(["03/04/2024", "25/06/2024"]) is True
-
-    def test_document_month_first(self):
-        assert infer_date_order(["03/04/2024", "06/25/2024"]) is False
-
-    def test_no_evidence(self):
-        assert infer_date_order(["03/04/2024", "01/02/2024"]) is None
-
-    def test_conflicting_evidence(self):
-        assert infer_date_order(["25/06/2024", "06/25/2024"]) is None
+def test_date_passthrough():
+    assert parse_date(date(2024, 3, 4)).value == date(2024, 3, 4)
 
 
-# ---------------------------------------------------------------------------
-# Status vocabulary
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Vocabulary
+# --------------------------------------------------------------------------
 
 
-class TestStatus:
-    @pytest.mark.parametrize("raw", ["O", "OP", "Open", "OPEN", "open", " open "])
-    def test_open(self, raw):
-        assert normalize_status(raw) == ClaimStatus.OPEN
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("O", ClaimStatus.OPEN),
+        ("OP", ClaimStatus.OPEN),
+        ("Open", ClaimStatus.OPEN),
+        ("OPEN", ClaimStatus.OPEN),
+        ("  open  ", ClaimStatus.OPEN),
+        ("C", ClaimStatus.CLOSED),
+        ("CL", ClaimStatus.CLOSED),
+        ("Closed", ClaimStatus.CLOSED),
+        ("CLSD", ClaimStatus.CLOSED),
+        ("R", ClaimStatus.REOPENED),
+        ("RE-OPENED", ClaimStatus.REOPENED),
+        ("Reopened", ClaimStatus.REOPENED),
+        ("", ClaimStatus.UNKNOWN),
+        ("whatever", ClaimStatus.UNKNOWN),
+        (None, ClaimStatus.UNKNOWN),
+    ],
+)
+def test_status_vocabulary(raw, expected):
+    assert parse_status(raw) is expected
 
-    @pytest.mark.parametrize("raw", ["C", "CL", "Closed", "CLOSED", "CLSD", "closed"])
-    def test_closed(self, raw):
-        assert normalize_status(raw) == ClaimStatus.CLOSED
 
-    @pytest.mark.parametrize("raw", ["R", "RO", "Reopen", "REOPENED", "Re-Opened", "RE OPEN"])
-    def test_reopened(self, raw):
-        assert normalize_status(raw) == ClaimStatus.REOPENED
-
-    @pytest.mark.parametrize("raw", ["", None, "pending", "XX", "42"])
-    def test_unknown(self, raw):
-        assert normalize_status(raw) == ClaimStatus.UNKNOWN
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("Y", True), ("yes", True), ("TRUE", True), ("1", True),
+     ("N", False), ("no", False), ("0", False), ("", None), ("maybe", None)],
+)
+def test_litigation_flags(raw, expected):
+    assert parse_bool(raw) is expected
 
 
-class TestParseCount:
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [("12", 12), ("1,234", 1234), (" 7 ", 7), ("", None), (None, None), ("abc", None), ("12.5", None)],
-    )
-    def test_counts(self, raw, expected):
-        assert parse_count(raw) == expected
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("  Acme  Corp ", "Acme Corp"), ("N/A", None), ("--", None), ("", None), (None, None)],
+)
+def test_text_cells(raw, expected):
+    assert parse_text(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("Total claims: 12", 12), ("12", 12), ("1,234", 1234), ("none", None), ("", None)],
+)
+def test_parse_int(raw, expected):
+    assert parse_int(raw) == expected
+
+
+def test_clean_text_folds_exotic_whitespace():
+    assert clean_text("a  b c") == "a b c"
+
+
+def test_normalize_label():
+    assert normalize_label("  Paid   Indemnity ($) ") == "paid indemnity"
+    assert normalize_label("TOTAL_INCURRED") == "total incurred"

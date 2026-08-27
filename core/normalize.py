@@ -1,424 +1,632 @@
-"""Number, date, and status normalization (CLAUDE.md §4).
+"""Number, date and vocabulary normalisation (spec section 4).
 
-The contract for every parser here: a value that cannot be parsed with
-confidence comes back as ``None`` plus a reason — never ``0``, never a guess.
+This is the single highest-bug-density area in the product, so the rules are
+written out explicitly rather than left to a permissive regex.
 
-Locale handling
----------------
-``parse_money`` takes ``locale``:
+Two ideas run through the whole module:
 
-- ``"us"`` / ``"eu"``: an *evidenced* convention — either inferred from an
-  unambiguous token elsewhere in the same document (``infer_locale``) or pinned
-  by a human-confirmed carrier profile. Ambiguous tokens (one separator with
-  exactly three digits after it, e.g. ``1,234``) are resolved with it.
-- ``None``: no evidence. Ambiguous tokens return ``None`` with reason
-  ``AMBIGUOUS_SEPARATOR`` and are surfaced for human review (R-15).
-  Unambiguous tokens still parse.
-
-The document's stored ``locale_hint`` field defaults to ``"us"`` for display,
-but a *defaulted* locale is not evidence, so it never resolves an ambiguous
-token — that would be guessing. Same scheme for date order via ``day_first``.
+* **A null is not a zero.** Every failure returns ``None`` plus a
+  :class:`~core.schema.NullReason`, never a silent ``0``.
+* **Never guess.** ``1.234`` is 1234 in Europe and 1.234 in the US.  When the
+  document itself provides no evidence either way the value comes back null
+  with ``AMBIGUOUS_SEPARATOR`` and the review screen asks a human.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Iterable, Optional
+from typing import Iterable, Literal, Sequence
 
 from core.schema import ClaimStatus, NullReason
 
-# Characters treated as digit-grouping only — never a decimal separator:
-# NBSP, narrow NBSP, thin space, plain space, and Swiss-style apostrophes.
-_GROUPING_ONLY = ("\u00a0", "\u202f", "\u2009", " ", "'", "\u2019")
+Locale = Literal["us", "eu"]
+DateOrder = Literal["mdy", "dmy", "ymd"]
 
-_CURRENCY_SYMBOLS = "$\u20ac\u00a3\u00a5"  # $ € £ ¥
+# --------------------------------------------------------------------------
+# Character-level cleaning
+# --------------------------------------------------------------------------
 
-# Exotic space characters normalized to plain spaces before parsing.
-_SPACE_VARIANTS = ("\u00a0", "\u202f", "\u2009")
+#: Dash-ish characters that mean "minus" or "placeholder" in carrier reports.
+_DASHES = "−–—‐‑‒⁃"
+_DASH_TRANSLATION = {ord(ch): "-" for ch in _DASHES}
 
-_NA_TOKENS = {"N/A", "NA", "N.A.", "NONE"}
+#: Currency symbol -> ISO 4217.  Two-character symbols are matched first.
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "C$": "CAD",
+    "A$": "AUD",
+    "US$": "USD",
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₤": "GBP",
+    "₹": "INR",
+    "₽": "RUB",
+}
+
+CURRENCY_CODES: frozenset[str] = frozenset(
+    {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "MXN", "NZD", "SEK", "NOK", "DKK"}
+)
+
+_NA_TOKENS: frozenset[str] = frozenset(
+    {"N/A", "NA", "N.A.", "N/A.", "NIL", "NONE", "NULL", "N\\A", "NOT APPLICABLE"}
+)
+
+#: Thousands separators that are never decimal separators.
+_HARD_THOUSANDS = " '’"
+
+
+def clean_text(raw: object) -> str:
+    """Canonicalise whitespace and exotic punctuation, without changing meaning."""
+    if raw is None:
+        return ""
+    text = raw if isinstance(raw, str) else str(raw)
+    # NFKC folds non-breaking/thin spaces and full-width digits to ASCII.
+    text = unicodedata.normalize("NFKC", text)
+    text = text.translate(_DASH_TRANSLATION)
+    text = text.replace(" ", " ").replace(" ", " ").replace(" ", " ")
+    return " ".join(text.split())
+
+
+def normalize_label(raw: object) -> str:
+    """Fold a column header for comparison: lowercase, alphanumerics only."""
+    text = clean_text(raw).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+# --------------------------------------------------------------------------
+# Number parsing
+# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class ParsedMoney:
-    value: Optional[Decimal]
-    reason: Optional[str] = None
-    currency_symbol: Optional[str] = None
+class NumberParse:
+    """The outcome of parsing one numeric cell."""
+
+    value: Decimal | None
+    reason: NullReason | None = None
+    raw: str = ""
+    currency: str | None = None
+    ambiguous: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.value is not None
+
+    def __bool__(self) -> bool:  # pragma: no cover - guard against `if parse:`
+        raise TypeError(
+            "NumberParse has no truth value; a parsed 0 is not falsey. Use .ok"
+        )
 
 
-@dataclass(frozen=True)
-class ParsedDate:
-    value: Optional[date]
-    reason: Optional[str] = None
+def _fail(raw: str, reason: NullReason, currency: str | None = None) -> NumberParse:
+    return NumberParse(
+        value=None,
+        reason=reason,
+        raw=raw,
+        currency=currency,
+        ambiguous=reason is NullReason.AMBIGUOUS_SEPARATOR,
+    )
+
+
+def _strip_currency(text: str) -> tuple[str, str | None]:
+    """Remove a currency symbol or ISO code, returning what it was."""
+    found: str | None = None
+    for symbol in sorted(CURRENCY_SYMBOLS, key=len, reverse=True):
+        if symbol in text:
+            found = CURRENCY_SYMBOLS[symbol]
+            text = text.replace(symbol, " ")
+            break
+    match = re.search(r"(?<![A-Z])(%s)(?![A-Z])" % "|".join(CURRENCY_CODES), text.upper())
+    if match:
+        code = match.group(1)
+        if found is None:
+            found = code
+        start, end = match.span()
+        text = text[:start] + " " + text[end:]
+    return " ".join(text.split()), found
+
+
+def _grouping_is_valid(integer_part: str, separator: str) -> bool:
+    """``1,234,567`` yes; ``12,34,567`` no; ``1234,567`` no."""
+    if separator not in integer_part:
+        return True
+    pattern = r"^\d{1,3}(%s\d{3})+$" % re.escape(separator)
+    return re.match(pattern, integer_part) is not None
+
+
+def _to_decimal(text: str, decimal_sep: str | None, raw: str) -> NumberParse:
+    """Strip thousands separators and build the Decimal."""
+    if decimal_sep:
+        integer_part, _, fraction = text.rpartition(decimal_sep)
+    else:
+        integer_part, fraction = text, ""
+
+    stripped_integer = re.sub(r"[.,\s'’]", "", integer_part)
+    if fraction and not fraction.isdigit():
+        return _fail(raw, NullReason.UNPARSEABLE)
+    if stripped_integer and not stripped_integer.isdigit():
+        return _fail(raw, NullReason.UNPARSEABLE)
+    if not stripped_integer and not fraction:
+        return _fail(raw, NullReason.UNPARSEABLE)
+
+    literal = (stripped_integer or "0") + ("." + fraction if fraction else "")
+    try:
+        return NumberParse(value=Decimal(literal), raw=raw)
+    except InvalidOperation:  # pragma: no cover - defensive
+        return _fail(raw, NullReason.UNPARSEABLE)
 
 
 def parse_money(
-    raw: Optional[str],
-    locale: Optional[str] = None,
+    raw: object,
+    locale: Locale | None = None,
     *,
-    double_dash_is_zero: bool = False,
-) -> ParsedMoney:
-    """Parse one money cell into a Decimal.
+    dash_means_zero: bool = False,
+) -> NumberParse:
+    """Parse one money cell.
 
-    ``double_dash_is_zero`` reflects the carrier convention for ``--`` (some
-    mainframe reports print it for zero, others for "no data"). It comes from
-    the carrier profile; the default is the fail-loud choice: null + reason.
+    ``locale`` is the *document-level* locale once it has been established by
+    :func:`infer_locale`, or ``None`` when the document gave no evidence.  With
+    ``None``, genuinely ambiguous tokens fail rather than guess.
+
+    ``dash_means_zero`` reflects a per-carrier convention: ``--`` is zero for
+    some carriers and "no data" for others, so the profile decides.
     """
-    if locale not in (None, "us", "eu"):
-        raise ValueError(f"locale must be 'us', 'eu' or None, got {locale!r}")
-    if raw is None:
-        return ParsedMoney(None, NullReason.BLANK)
+    original = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
 
-    s = str(raw).strip()
-    for ch in _SPACE_VARIANTS:
-        s = s.replace(ch, " ")
-    s = s.strip()
-    if not s:
-        return ParsedMoney(None, NullReason.BLANK)
+    if isinstance(raw, Decimal):
+        return NumberParse(value=raw, raw=original)
+    if isinstance(raw, bool):
+        return _fail(original, NullReason.UNPARSEABLE)
+    if isinstance(raw, int):
+        return NumberParse(value=Decimal(raw), raw=original)
+    if isinstance(raw, float):
+        raise TypeError(
+            "parse_money refuses floats: money read as float has already lost "
+            "precision. Pass the source string or a Decimal."
+        )
 
-    upper = s.upper()
+    text = clean_text(raw)
+    if not text:
+        return _fail(original, NullReason.EMPTY)
+
+    upper = text.upper()
     if upper in _NA_TOKENS:
-        return ParsedMoney(None, NullReason.NA_TOKEN)
-    if s == "-":
-        return ParsedMoney(None, NullReason.BLANK)
-    if re.fullmatch(r"-0(?:[.,]0+)?-", s):
-        return ParsedMoney(Decimal("0"))
-    if s == "--":
-        if double_dash_is_zero:
-            return ParsedMoney(Decimal("0"))
-        return ParsedMoney(None, NullReason.DOUBLE_DASH)
+        return _fail(original, NullReason.NOT_APPLICABLE)
 
-    neg_marks = 0
-    currency_symbol: Optional[str] = None
+    # Mainframe zero: -0-, -00-
+    if re.fullmatch(r"-0+-", text):
+        return NumberParse(value=Decimal("0"), raw=original)
 
-    # Peel negativity markers and currency symbols from the outside in until
-    # the token stabilizes; real cells combine them freely ("($1,234.56)",
-    # "$ -1,234.56", "1,234.56 CR").
-    changed = True
-    while changed:
-        changed = False
-        s = s.strip()
-        if len(s) >= 2 and s.startswith("(") and s.endswith(")"):
-            neg_marks += 1
-            s = s[1:-1]
-            changed = True
-            continue
-        m = re.match(r"^(.*\S)\s*(CR)$", s, flags=re.IGNORECASE)
-        if m:
-            neg_marks += 1
-            s = m.group(1)
-            changed = True
-            continue
-        if len(s) > 1 and s.endswith("-"):
-            neg_marks += 1
-            s = s[:-1]
-            changed = True
-            continue
-        if len(s) > 1 and s.startswith("-"):
-            neg_marks += 1
-            s = s[1:]
-            changed = True
-            continue
-        if s and s[0] in _CURRENCY_SYMBOLS:
-            currency_symbol = s[0]
-            s = s[1:]
-            changed = True
-            continue
-        if s and s[-1] in _CURRENCY_SYMBOLS:
-            currency_symbol = s[-1]
-            s = s[:-1]
-            changed = True
-            continue
+    # Dash placeholders: "--", "-", "---"
+    if re.fullmatch(r"-+", text):
+        if dash_means_zero:
+            return NumberParse(value=Decimal("0"), raw=original)
+        return _fail(original, NullReason.DASH_PLACEHOLDER)
 
-    s = s.strip()
-    if not s:
-        return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-    if neg_marks > 1:
-        # More than one negativity marker ("--1--") is not a number a carrier
-        # prints; flag it rather than guessing at the sign.
-        return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-    negative = neg_marks == 1
+    sign = Decimal(1)
 
-    for ch in _GROUPING_ONLY:
-        s = s.replace(ch, "")
+    # Credit / debit suffix or prefix: "1,234.56 CR"
+    credit = re.search(r"(?:^|\s)(CR|DR)(?:\s|$|\.)", upper)
+    if credit:
+        if credit.group(1) == "CR":
+            sign = -sign
+        start, end = credit.span(1)
+        text = text[:start] + " " + text[end:]
+        text = " ".join(text.split())
 
-    if not re.fullmatch(r"[0-9.,]+", s):
-        return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-    if not s[0].isdigit() or not s[-1].isdigit():
-        return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
+    # Accounting negative: (1,234.56)
+    if text.startswith("(") and text.endswith(")"):
+        sign = -sign
+        text = text[1:-1].strip()
+    elif "(" in text or ")" in text:
+        return _fail(original, NullReason.UNPARSEABLE)
 
-    has_comma = "," in s
-    has_dot = "." in s
+    text, currency = _strip_currency(text)
+    if not text:
+        return _fail(original, NullReason.UNPARSEABLE, currency)
 
-    if has_comma and has_dot:
+    # Trailing minus (mainframe) then leading minus.
+    if text.endswith("-"):
+        sign = -sign
+        text = text[:-1].strip()
+    if text.startswith("-"):
+        sign = -sign
+        text = text[1:].strip()
+    elif text.startswith("+"):
+        text = text[1:].strip()
+
+    if not text:
+        return _fail(original, NullReason.UNPARSEABLE, currency)
+
+    # Percentages and free text are not money.
+    if not re.fullmatch(r"[\d.,\s'’]+", text):
+        return _fail(original, NullReason.UNPARSEABLE, currency)
+    if not any(ch.isdigit() for ch in text):
+        return _fail(original, NullReason.UNPARSEABLE, currency)
+
+    comma_count = text.count(",")
+    dot_count = text.count(".")
+
+    decimal_sep: str | None = None
+
+    if comma_count and dot_count:
         # Rule 1: the last separator encountered is the decimal separator.
-        decimal_sep = "," if s.rfind(",") > s.rfind(".") else "."
-        group_sep = "." if decimal_sep == "," else ","
-        int_part, _, frac_part = s.rpartition(decimal_sep)
-        if decimal_sep in int_part or not _valid_grouping(int_part, group_sep):
-            return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-        number = int_part.replace(group_sep, "") + "." + frac_part
-    elif has_comma or has_dot:
-        sep = "," if has_comma else "."
-        parts = s.split(sep)
-        if len(parts) > 2:
-            # Multiple occurrences of one separator: grouping.
-            if not _valid_grouping(s, sep):
-                return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-            number = s.replace(sep, "")
+        decimal_sep = "," if text.rfind(",") > text.rfind(".") else "."
+        thousands_sep = "." if decimal_sep == "," else ","
+        integer_part = text.rpartition(decimal_sep)[0]
+        if not _grouping_is_valid(integer_part.replace(" ", ""), thousands_sep):
+            return _fail(original, NullReason.UNPARSEABLE, currency)
+        if decimal_sep in integer_part:
+            return _fail(original, NullReason.UNPARSEABLE, currency)
+
+    elif comma_count or dot_count:
+        separator = "," if comma_count else "."
+        count = comma_count or dot_count
+        head, _, tail = text.rpartition(separator)
+        digits_before = re.sub(r"\D", "", head)
+        digits_after = re.sub(r"\D", "", tail)
+
+        if count > 1:
+            # Repeated separator can only be grouping: 1,234,567
+            if not _grouping_is_valid(text.replace(" ", ""), separator):
+                return _fail(original, NullReason.UNPARSEABLE, currency)
+            decimal_sep = None
+        elif len(digits_after) != 3:
+            # Rule 2 does not apply: a lone separator with anything other than
+            # three digits after it is a decimal point in both conventions.
+            decimal_sep = separator
+        elif not digits_before or len(digits_before) > 3:
+            # 12345.678 cannot be grouping, so it is a decimal.
+            decimal_sep = separator
         else:
-            head, tail = parts
-            if len(tail) == 3 and 1 <= len(head) <= 3:
-                # Rule 2: one separator, exactly three digits after it, and a
-                # plausible leading group — genuinely ambiguous.
-                if locale is None:
-                    return ParsedMoney(
-                        None, NullReason.AMBIGUOUS_SEPARATOR, currency_symbol
-                    )
-                treat_as_decimal = (locale == "us") == (sep == ".")
-                number = head + "." + tail if treat_as_decimal else head + tail
-            elif len(tail) == 3:
-                # Leading group longer than 3 digits can't be grouping.
-                number = head + "." + tail
+            # Genuinely ambiguous: 1,234 / 1.234
+            if locale is None:
+                return _fail(original, NullReason.AMBIGUOUS_SEPARATOR, currency)
+            if locale == "us":
+                decimal_sep = "." if separator == "." else None
             else:
-                number = head + "." + tail
+                decimal_sep = "," if separator == "," else None
     else:
-        number = s
+        decimal_sep = None
 
-    try:
-        value = Decimal(number)
-    except InvalidOperation:
-        return ParsedMoney(None, NullReason.UNPARSEABLE, currency_symbol)
-
-    if negative:
-        value = -value
-    return ParsedMoney(value, None, currency_symbol)
+    parsed = _to_decimal(text, decimal_sep, original)
+    if not parsed.ok:
+        return NumberParse(
+            value=None, reason=parsed.reason, raw=original, currency=currency
+        )
+    return NumberParse(value=sign * parsed.value, raw=original, currency=currency)
 
 
-def _valid_grouping(int_part: str, group_sep: str) -> bool:
-    """True when digit groups form a valid grouped integer (1–3 digits first,
-    exactly 3 in every later group). ``1,23,45`` and ``12..34`` fail loud."""
-    groups = int_part.split(group_sep)
-    if any(not g for g in groups):
-        return False
-    if len(groups) == 1:
-        return groups[0].isdigit()
-    if not (1 <= len(groups[0]) <= 3):
-        return False
-    return all(len(g) == 3 for g in groups[1:])
-
-
-def classify_token_locale(raw: Optional[str]) -> Optional[str]:
-    """Return "us"/"eu" when a single token unambiguously shows its number
-    convention, else None."""
-    if raw is None:
+def parse_int(raw: object) -> int | None:
+    """Pull an integer out of a cell such as ``"Total claims: 12"``."""
+    text = clean_text(raw)
+    if not text:
         return None
-    s = str(raw).strip()
-    for ch in _SPACE_VARIANTS:
-        s = s.replace(ch, " ")
-    # Strip decoration the same way parse_money does, minus sign handling.
-    s = re.sub(r"[()\-]|(?i:CR)$", "", s.strip()).strip()
-    for ch in _CURRENCY_SYMBOLS:
-        s = s.replace(ch, "")
-    for ch in _GROUPING_ONLY:
-        s = s.replace(ch, "")
-    s = s.strip()
-    if not re.fullmatch(r"[0-9.,]+", s or ""):
+    match = re.search(r"\d[\d,.\s']*", text)
+    if not match:
         return None
-    has_comma = "," in s
-    has_dot = "." in s
-    if has_comma and has_dot:
-        return "us" if s.rfind(".") > s.rfind(",") else "eu"
-    if has_comma or has_dot:
-        sep = "," if has_comma else "."
-        parts = s.split(sep)
-        if len(parts) > 2:
-            # Repeated separator = grouping: 1,234,567 is US, 1.234.567 is EU.
-            if _valid_grouping(s, sep):
-                return "us" if sep == "," else "eu"
-            return None
-        head, tail = parts
-        if len(tail) == 3 and 1 <= len(head) <= 3:
-            return None  # the ambiguous case
-        # Any other shape makes the separator a decimal point.
-        return "us" if sep == "." else "eu"
-    return None
+    digits = re.sub(r"\D", "", match.group(0))
+    return int(digits) if digits else None
 
 
-def infer_locale(tokens: Iterable[Optional[str]]) -> Optional[str]:
-    """Document-level locale inference (§4 step 3).
+# --------------------------------------------------------------------------
+# Document-level locale inference
+# --------------------------------------------------------------------------
 
-    Returns the convention when every unambiguous token agrees on it.
-    Conflicting evidence or no evidence returns None — never guess.
+
+@dataclass(frozen=True)
+class LocaleInference:
+    """What the document itself says about its number convention."""
+
+    locale: Locale = "us"
+    confident: bool = False
+    evidence: str | None = None
+    us_votes: int = 0
+    eu_votes: int = 0
+
+    @property
+    def for_parsing(self) -> Locale | None:
+        """The locale to pass to :func:`parse_money` — ``None`` if unproven."""
+        return self.locale if self.confident else None
+
+
+def _locale_vote(token: str) -> tuple[Locale | None, str | None]:
+    """What, if anything, one token proves about the document's convention."""
+    text = clean_text(token)
+    if not re.search(r"\d", text):
+        return None, None
+    text = re.sub(r"[^\d.,]", "", text)
+    comma, dot = text.count(","), text.count(".")
+
+    if comma and dot:
+        # The last separator is the decimal one; that names the convention.
+        return ("us", text) if text.rfind(".") > text.rfind(",") else ("eu", text)
+    if comma > 1:
+        return "us", text
+    if dot > 1:
+        return "eu", text
+    if comma == 1 and len(re.sub(r"\D", "", text.rpartition(",")[2])) != 3:
+        return "eu", text
+    if dot == 1 and len(re.sub(r"\D", "", text.rpartition(".")[2])) != 3:
+        return "us", text
+    return None, None
+
+
+def infer_locale(tokens: Iterable[object], default: Locale = "us") -> LocaleInference:
+    """Derive the document's number convention from its own numbers.
+
+    Conflicting evidence is reported as *not confident* rather than resolved by
+    majority: a document that uses both conventions is a document a human needs
+    to look at.
     """
-    verdicts = {v for v in (classify_token_locale(t) for t in tokens) if v}
-    if len(verdicts) == 1:
-        return verdicts.pop()
-    return None
+    us_votes = eu_votes = 0
+    us_evidence = eu_evidence = None
+    for token in tokens:
+        vote, evidence = _locale_vote(token if isinstance(token, str) else str(token))
+        if vote == "us":
+            us_votes += 1
+            us_evidence = us_evidence or evidence
+        elif vote == "eu":
+            eu_votes += 1
+            eu_evidence = eu_evidence or evidence
+
+    if us_votes and not eu_votes:
+        return LocaleInference("us", True, us_evidence, us_votes, eu_votes)
+    if eu_votes and not us_votes:
+        return LocaleInference("eu", True, eu_evidence, us_votes, eu_votes)
+    return LocaleInference(
+        default, False, us_evidence or eu_evidence, us_votes, eu_votes
+    )
 
 
 # --------------------------------------------------------------------------
-# Dates
+# Date parsing
 # --------------------------------------------------------------------------
 
-_MONTHS = {
-    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MAR": 3, "MARCH": 3,
-    "APR": 4, "APRIL": 4, "MAY": 5, "JUN": 6, "JUNE": 6, "JUL": 7, "JULY": 7,
-    "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPT": 9, "SEPTEMBER": 9, "OCT": 10,
-    "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12,
-}
 
-_NUMERIC_DATE_RE = re.compile(r"^(\d{1,4})[/\-.](\d{1,2})[/\-.](\d{1,4})$")
-_MONTH_NAME_MDY_RE = re.compile(r"^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$")
-_MONTH_NAME_DMY_RE = re.compile(r"^(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})$")
+@dataclass(frozen=True)
+class DateParse:
+    value: date | None
+    reason: NullReason | None = None
+    raw: str = ""
+    ambiguous: bool = False
 
-
-def _expand_year(y: int) -> int:
-    if y >= 100:
-        return y
-    return 2000 + y if y < 50 else 1900 + y
+    @property
+    def ok(self) -> bool:
+        return self.value is not None
 
 
-def _make_date(year: int, month: int, day: int) -> Optional[date]:
+_MONTH_NAMES: dict[str, int] = {}
+for _index, _name in enumerate(
+    [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ],
+    start=1,
+):
+    _MONTH_NAMES[_name] = _index
+    _MONTH_NAMES[_name[:3]] = _index
+_MONTH_NAMES["sept"] = 9
+
+#: Two-digit years at or below this map to 2000s, above to 1900s.  Loss runs
+#: carry claims decades old, so 87 must not become 2087.
+YEAR_PIVOT = 69
+
+
+def _expand_year(value: int) -> int:
+    if value >= 100:
+        return value
+    return 2000 + value if value <= YEAR_PIVOT else 1900 + value
+
+
+def _build_date(year: int, month: int, day: int, raw: str) -> DateParse:
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return DateParse(None, NullReason.INVALID_DATE, raw)
+    if not 1900 <= year <= 2100:
+        return DateParse(None, NullReason.OUT_OF_RANGE, raw)
     try:
-        return date(year, month, day)
+        return DateParse(date(year, month, day), None, raw)
     except ValueError:
-        return None
+        return DateParse(None, NullReason.INVALID_DATE, raw)
 
 
-def parse_date(raw: Optional[str], day_first: Optional[bool] = None) -> ParsedDate:
+def parse_date(raw: object, order: DateOrder | None = None) -> DateParse:
     """Parse one date cell.
 
-    ``day_first`` mirrors the money locale contract: True/False is evidenced
-    (document-level inference via ``infer_date_order`` or a confirmed
-    profile); None means no evidence, so an ambiguous numeric date returns
-    ``AMBIGUOUS_DATE_ORDER`` instead of a guess.
+    ``order`` is the document-level day/month order once established, or
+    ``None``.  Tokens that resolve themselves (a component above 12, a spelled
+    month, an ISO year) never need it.
     """
-    if raw is None:
-        return ParsedDate(None, NullReason.BLANK)
-    s = str(raw).strip()
-    if not s:
-        return ParsedDate(None, NullReason.BLANK)
-    if s.upper() in _NA_TOKENS:
-        return ParsedDate(None, NullReason.NA_TOKEN)
+    original = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+    if isinstance(raw, date):
+        return DateParse(raw, None, original)
 
-    m = _MONTH_NAME_MDY_RE.match(s)
-    if m:
-        month = _MONTHS.get(m.group(1).upper())
+    text = clean_text(raw)
+    if not text:
+        return DateParse(None, NullReason.EMPTY, original)
+    if text.upper() in _NA_TOKENS or re.fullmatch(r"-+", text):
+        return DateParse(None, NullReason.NOT_APPLICABLE, original)
+
+    # Drop a trailing time component: "03/04/2024 00:00:00"
+    text = re.sub(r"\s+\d{1,2}:\d{2}(:\d{2})?(\s*[AaPp][Mm])?$", "", text).strip()
+
+    # Spelled month: 4-Mar-24, March 4, 2024, Mar 04 2024
+    spelled = re.match(
+        r"^(\d{1,2})[\s\-/.]+([A-Za-z]{3,9})\.?[\s\-/.,]+(\d{2,4})$", text
+    ) or re.match(r"^([A-Za-z]{3,9})\.?[\s\-/.,]+(\d{1,2})[\s\-/.,]+(\d{2,4})$", text)
+    if spelled:
+        groups = spelled.groups()
+        if groups[0].isdigit():
+            day_text, month_text, year_text = groups
+        else:
+            month_text, day_text, year_text = groups
+        month = _MONTH_NAMES.get(month_text.lower())
         if month is None:
-            return ParsedDate(None, NullReason.UNPARSEABLE)
-        d = _make_date(int(m.group(3)), month, int(m.group(2)))
-        return ParsedDate(d) if d else ParsedDate(None, NullReason.INVALID_DATE)
+            return DateParse(None, NullReason.UNPARSEABLE, original)
+        return _build_date(_expand_year(int(year_text)), month, int(day_text), original)
 
-    m = _MONTH_NAME_DMY_RE.match(s)
-    if m:
-        month = _MONTHS.get(m.group(2).upper())
-        if month is None:
-            return ParsedDate(None, NullReason.UNPARSEABLE)
-        d = _make_date(int(m.group(3)), month, int(m.group(1)))
-        return ParsedDate(d) if d else ParsedDate(None, NullReason.INVALID_DATE)
+    # Compact ISO: 20240304
+    if re.fullmatch(r"\d{8}", text):
+        year = int(text[:4])
+        if 1900 <= year <= 2100:
+            return _build_date(year, int(text[4:6]), int(text[6:8]), original)
+        return DateParse(None, NullReason.UNPARSEABLE, original)
 
-    m = _NUMERIC_DATE_RE.match(s)
-    if not m:
-        return ParsedDate(None, NullReason.UNPARSEABLE)
-    a, b, c = (int(g) for g in m.groups())
+    parts = re.split(r"[\-/.\s]+", text)
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return DateParse(None, NullReason.UNPARSEABLE, original)
 
-    # ISO: a four-digit leading component is always the year.
-    if len(m.group(1)) == 4:
-        d = _make_date(a, b, c)
-        return ParsedDate(d) if d else ParsedDate(None, NullReason.INVALID_DATE)
+    first, second, third = (int(part) for part in parts)
 
-    year = _expand_year(c)
-    month_first = _make_date(year, a, b)
-    day_first_reading = _make_date(year, b, a)
+    # ISO ordering is self-identifying.
+    if len(parts[0]) == 4:
+        return _build_date(first, second, third, original)
 
-    if month_first is None and day_first_reading is None:
-        return ParsedDate(None, NullReason.INVALID_DATE)
-    if month_first is not None and day_first_reading is None:
-        return ParsedDate(month_first)
-    if day_first_reading is not None and month_first is None:
-        return ParsedDate(day_first_reading)
-    # Both readings are valid dates — genuinely ambiguous (03/04/2024).
-    if month_first == day_first_reading:  # e.g. 03/03/2024
-        return ParsedDate(month_first)
-    if day_first is None:
-        return ParsedDate(None, NullReason.AMBIGUOUS_DATE_ORDER)
-    return ParsedDate(day_first_reading if day_first else month_first)
+    if first > 31 or second > 31:
+        return DateParse(None, NullReason.INVALID_DATE, original)
 
+    # A component above 12 settles the order on its own.
+    if first > 12 and second <= 12:
+        return _build_date(_expand_year(third), second, first, original)
+    if second > 12 and first <= 12:
+        return _build_date(_expand_year(third), first, second, original)
+    if first > 12 and second > 12:
+        return DateParse(None, NullReason.INVALID_DATE, original)
 
-def classify_token_date_order(raw: Optional[str]) -> Optional[bool]:
-    """True (day-first) / False (month-first) when one numeric date betrays
-    its order, else None."""
-    if raw is None:
-        return None
-    m = _NUMERIC_DATE_RE.match(str(raw).strip())
-    if not m or len(m.group(1)) == 4:
-        return None
-    a, b = int(m.group(1)), int(m.group(2))
-    if a > 12 and b <= 12:
-        return True
-    if b > 12 and a <= 12:
-        return False
-    return None
+    if order == "dmy":
+        return _build_date(_expand_year(third), second, first, original)
+    if order in ("mdy", "ymd"):
+        return _build_date(_expand_year(third), first, second, original)
+
+    return DateParse(None, NullReason.AMBIGUOUS_DATE_ORDER, original, ambiguous=True)
 
 
-def infer_date_order(tokens: Iterable[Optional[str]]) -> Optional[bool]:
-    """Document-level date-order inference (§4). All evidence must agree."""
-    verdicts = {
-        v for v in (classify_token_date_order(t) for t in tokens) if v is not None
-    }
-    if len(verdicts) == 1:
-        return verdicts.pop()
-    return None
+@dataclass(frozen=True)
+class DateOrderInference:
+    order: DateOrder = "mdy"
+    confident: bool = False
+    evidence: str | None = None
+    mdy_votes: int = 0
+    dmy_votes: int = 0
+
+    @property
+    def for_parsing(self) -> DateOrder | None:
+        return self.order if self.confident else None
+
+
+def infer_date_order(
+    tokens: Iterable[object],
+    locale: Locale | None = None,
+    default: DateOrder = "mdy",
+) -> DateOrderInference:
+    """Find a date in the document whose first component is above 12.
+
+    Falls back to the locale convention (``eu`` implies day-first) and, failing
+    that, to ``default`` — flagged as unproven either way.
+    """
+    mdy = dmy = 0
+    mdy_evidence = dmy_evidence = None
+    for token in tokens:
+        text = clean_text(token)
+        parts = re.split(r"[\-/.\s]+", text)
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            continue
+        if len(parts[0]) == 4:
+            continue
+        first, second = int(parts[0]), int(parts[1])
+        if first > 31 or second > 31:
+            continue
+        if first > 12 and second <= 12:
+            dmy += 1
+            dmy_evidence = dmy_evidence or text
+        elif second > 12 and first <= 12:
+            mdy += 1
+            mdy_evidence = mdy_evidence or text
+
+    if dmy and not mdy:
+        return DateOrderInference("dmy", True, dmy_evidence, mdy, dmy)
+    if mdy and not dmy:
+        return DateOrderInference("mdy", True, mdy_evidence, mdy, dmy)
+    if not mdy and not dmy and locale is not None:
+        order: DateOrder = "dmy" if locale == "eu" else "mdy"
+        return DateOrderInference(order, False, None, mdy, dmy)
+    return DateOrderInference(default, False, mdy_evidence or dmy_evidence, mdy, dmy)
 
 
 # --------------------------------------------------------------------------
 # Status vocabulary
 # --------------------------------------------------------------------------
 
-_STATUS_EXACT = {
-    "O": ClaimStatus.OPEN,
-    "OP": ClaimStatus.OPEN,
-    "OPEN": ClaimStatus.OPEN,
-    "C": ClaimStatus.CLOSED,
-    "CL": ClaimStatus.CLOSED,
-    "CLSD": ClaimStatus.CLOSED,
-    "CLOSED": ClaimStatus.CLOSED,
-    "R": ClaimStatus.REOPENED,
-    "RO": ClaimStatus.REOPENED,
-    "REOPEN": ClaimStatus.REOPENED,
-    "REOPENED": ClaimStatus.REOPENED,
-    "RE-OPEN": ClaimStatus.REOPENED,
-    "RE-OPENED": ClaimStatus.REOPENED,
+_STATUS_VOCAB: dict[str, ClaimStatus] = {
+    "o": ClaimStatus.OPEN,
+    "op": ClaimStatus.OPEN,
+    "opn": ClaimStatus.OPEN,
+    "open": ClaimStatus.OPEN,
+    "active": ClaimStatus.OPEN,
+    "pending": ClaimStatus.OPEN,
+    "c": ClaimStatus.CLOSED,
+    "cl": ClaimStatus.CLOSED,
+    "cld": ClaimStatus.CLOSED,
+    "clsd": ClaimStatus.CLOSED,
+    "closed": ClaimStatus.CLOSED,
+    "close": ClaimStatus.CLOSED,
+    "final": ClaimStatus.CLOSED,
+    "settled": ClaimStatus.CLOSED,
+    "r": ClaimStatus.REOPENED,
+    "ro": ClaimStatus.REOPENED,
+    "reop": ClaimStatus.REOPENED,
+    "reopen": ClaimStatus.REOPENED,
+    "reopened": ClaimStatus.REOPENED,
+    "re open": ClaimStatus.REOPENED,
+    "re opened": ClaimStatus.REOPENED,
 }
 
 
-def normalize_status(raw: Optional[str]) -> ClaimStatus:
-    if raw is None:
+def parse_status(raw: object) -> ClaimStatus:
+    """Fold a carrier's status vocabulary onto the canonical four."""
+    text = normalize_label(raw)
+    if not text:
         return ClaimStatus.UNKNOWN
-    s = str(raw).strip().upper()
-    if not s:
-        return ClaimStatus.UNKNOWN
-    if s in _STATUS_EXACT:
-        return _STATUS_EXACT[s]
-    if s.startswith(("REOP", "RE-OP", "RE OP")):
-        return ClaimStatus.REOPENED
-    if s.startswith("OPEN"):
-        return ClaimStatus.OPEN
-    if s.startswith(("CLOSED", "CLSD", "CLOSE")):
-        return ClaimStatus.CLOSED
-    return ClaimStatus.UNKNOWN
+    return _STATUS_VOCAB.get(text, ClaimStatus.UNKNOWN)
 
 
-def parse_count(raw: Optional[str]) -> Optional[int]:
-    """Parse a printed claim count ("Total Claims: 12" style values arrive
-    here already reduced to their numeric token)."""
-    if raw is None:
+_TRUE_TOKENS = frozenset({"y", "yes", "true", "t", "1", "lit", "litigated", "in suit", "suit"})
+_FALSE_TOKENS = frozenset({"n", "no", "false", "f", "0", "none", "not litigated"})
+
+
+def parse_bool(raw: object) -> bool | None:
+    """Carrier litigation flags: Y/N, Yes/No, True/False, 1/0."""
+    if isinstance(raw, bool):
+        return raw
+    text = normalize_label(raw)
+    if not text:
         return None
-    s = str(raw).strip().replace(",", "")
-    if not s.isdigit():
+    if text in _TRUE_TOKENS:
+        return True
+    if text in _FALSE_TOKENS:
+        return False
+    return None
+
+
+def parse_text(raw: object) -> str | None:
+    """Trim a text cell; blank and N/A come back as ``None``, never ``""``."""
+    text = clean_text(raw)
+    if not text or text.upper() in _NA_TOKENS or re.fullmatch(r"-+", text):
         return None
-    return int(s)
+    return text

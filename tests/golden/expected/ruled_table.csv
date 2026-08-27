@@ -1,0 +1,7 @@
+claim_number,date_of_loss,date_reported,claim_status,claimant_name,loss_description,paid_total,reserve_total,recovery_total,incurred_total
+GL-2024-0001,2024-01-17,2024-01-22,OPEN,"Alvarez, Marisol",Slip and fall in lobby,15700.50,47500.00,,63200.50
+GL-2024-0002,2024-02-03,2024-02-05,CLOSED,"Bennett, Ray",Product defect claim,5640.25,,1250.00,4390.25
+GL-2024-0003,2024-03-28,2024-04-02,OPEN,"Chen, Wei",Water damage to tenant space,1425.75,31000.00,,32425.75
+GL-2024-0004,2024-05-14,2024-05-14,CLOSED,"Dubois, Henri",Vehicle struck storefront,24500.40,,,24500.40
+GL-2024-0005,2024-07-09,2024-07-30,REOPENED,"Egan, Patricia",Alleged premises defect,2650.00,17500.00,,20150.00
+GL-2024-0006,2024-09-21,2024-10-01,OPEN,"Fitzgerald, Dana",Trip on uneven pavement,875.00,11300.00,500.00,11675.00

@@ -1,11 +1,12 @@
-"""Reconciliation rule engine (CLAUDE.md §6) — the product's moat.
+"""The reconciliation engine (spec section 6) — the moat.
 
-Every rule takes a ``LossRunDocument`` and returns zero or more ``Finding``s.
-R-04 and R-05 are the rules that sell the product: they are the only ones that
-check our extraction against something the *carrier printed* rather than
-something the app computed.
+Sixteen rules, each returning zero or more :class:`~core.schema.Finding`
+objects.  R-04 and R-05 are the ones that sell the product: they are the only
+rules that check the extraction against something the *carrier* printed rather
+than something this app computed.
 
-Rules never mutate the document and never repair data. They report.
+Rules never mutate the document.  Reconciliation is pure so the review screen
+can re-run it on every cell edit.
 """
 
 from __future__ import annotations
@@ -13,281 +14,256 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass, field
 from decimal import Decimal
-from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Iterable, Sequence
 
 from core.schema import (
     MONEY_FIELDS,
-    ClaimRecord,
+    PAID_COMPONENT_FIELDS,
+    RESERVE_COMPONENT_FIELDS,
+    REVIEW_REASONS,
+    Claim,
     ClaimStatus,
+    DocumentStatus,
+    Finding,
     LossRunDocument,
     NullReason,
-    SourceMethod,
+    ReconciliationResult,
+    Severity,
+    sum_present,
 )
 
-DEFAULT_MONEY_TOLERANCE = Decimal("0.01")
+DEFAULT_TOLERANCE = Decimal("0.01")
 
-# Reasons that mean "parsing gave up and a human must look" (R-15). A field
-# that is simply absent from the carrier's layout is not an exception.
-_REVIEW_REASONS = {
-    NullReason.AMBIGUOUS_SEPARATOR,
-    NullReason.AMBIGUOUS_DATE_ORDER,
-    NullReason.DOUBLE_DASH,
-    NullReason.INVALID_DATE,
-    NullReason.UNPARSEABLE,
-}
-
-
-class Severity(str, Enum):
-    ERROR = "ERROR"
-    WARN = "WARN"
-    INFO = "INFO"
-
-
-class DocumentStatus(str, Enum):
-    CLEAN = "CLEAN"
-    NEEDS_REVIEW = "NEEDS_REVIEW"
+#: R-13: a value this many times the column median is almost always a
+#: mis-parse (a stray thousands separator, a merged cell).
+OUTLIER_MULTIPLE = Decimal("100")
 
 
 @dataclass(frozen=True)
-class Finding:
-    rule_id: str
-    severity: Severity
-    message: str
-    claim_number: Optional[str] = None
-    field: Optional[str] = None
-    expected: Optional[Decimal | int | str] = None
-    actual: Optional[Decimal | int | str] = None
-    delta: Optional[Decimal] = None
-    # Row index within document.claims, so the UI can scroll to the row even
-    # when claim_number itself is the thing that's missing.
-    row_index: Optional[int] = None
-
-
-@dataclass
 class ReconcileConfig:
-    money_tolerance: Decimal = DEFAULT_MONEY_TOLERANCE
-    # R-13 sensitivity: flag values above this multiple of the column median.
-    outlier_multiple: Decimal = Decimal("100")
+    """Per-profile reconciliation settings.
 
-    def __post_init__(self) -> None:
-        self.money_tolerance = Decimal(str(self.money_tolerance))
-        self.outlier_multiple = Decimal(str(self.outlier_multiple))
+    Some carriers round to whole units, so the money tolerance is configurable
+    rather than hard-coded.
+    """
 
+    money_tolerance: Decimal = DEFAULT_TOLERANCE
+    outlier_multiple: Decimal = OUTLIER_MULTIPLE
+    review_reasons: frozenset[NullReason] = REVIEW_REASONS
+    #: Rule IDs to skip entirely, for carriers whose format makes one moot.
+    disabled_rules: frozenset[str] = frozenset()
 
-@dataclass
-class ReconcileResult:
-    findings: list[Finding] = field(default_factory=list)
-
-    @property
-    def status(self) -> DocumentStatus:
-        return (
-            DocumentStatus.NEEDS_REVIEW
-            if any(f.severity is Severity.ERROR for f in self.findings)
-            else DocumentStatus.CLEAN
-        )
-
-    @property
-    def errors(self) -> list[Finding]:
-        return [f for f in self.findings if f.severity is Severity.ERROR]
-
-    @property
-    def warnings(self) -> list[Finding]:
-        return [f for f in self.findings if f.severity is Severity.WARN]
-
-    @property
-    def infos(self) -> list[Finding]:
-        return [f for f in self.findings if f.severity is Severity.INFO]
-
-    def for_claim(self, claim_number: Optional[str]) -> list[Finding]:
-        return [f for f in self.findings if f.claim_number == claim_number]
-
-    def rule_ids(self) -> list[str]:
-        return [f.rule_id for f in self.findings]
+    def within_tolerance(self, delta: Decimal) -> bool:
+        return abs(delta) <= self.money_tolerance
 
 
-def _label(claim: ClaimRecord, index: int) -> str:
-    return claim.claim_number or f"row {index + 1}"
+RuleFn = Callable[[LossRunDocument, ReconcileConfig], list[Finding]]
+
+_RULES: list[tuple[str, RuleFn]] = []
 
 
-def _within(a: Decimal, b: Decimal, tolerance: Decimal) -> bool:
-    return abs(a - b) <= tolerance
+def rule(rule_id: str) -> Callable[[RuleFn], RuleFn]:
+    """Register a rule so ``reconcile`` runs it in ID order."""
+
+    def register(fn: RuleFn) -> RuleFn:
+        _RULES.append((rule_id, fn))
+        _RULES.sort(key=lambda pair: pair[0])
+        return fn
+
+    return register
 
 
-# ---------------------------------------------------------------------------
-# Row arithmetic — R-01, R-02, R-03
-# ---------------------------------------------------------------------------
+def _money(value: Decimal | None) -> Decimal:
+    return Decimal("0") if value is None else value
 
 
-def rule_r01(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
+def _fmt(value: Decimal | None) -> str:
+    return "null" if value is None else f"{value:,.2f}"
+
+
+def _label(field_name: str) -> str:
+    return field_name.replace("_", " ")
+
+
+# --------------------------------------------------------------------------
+# Row arithmetic
+# --------------------------------------------------------------------------
+
+
+@rule("R-01")
+def r01_incurred_identity(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
     """paid_total + reserve_total - recovery_total == incurred_total."""
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        if c.paid_total is None or c.reserve_total is None or c.incurred_total is None:
-            continue  # missing inputs are R-07/R-15's business, not an arithmetic failure
-        recovery = c.recovery_total or Decimal("0")
-        expected = c.paid_total + c.reserve_total - recovery
-        if not _within(expected, c.incurred_total, cfg.money_tolerance):
-            out.append(
-                Finding(
-                    rule_id="R-01",
-                    severity=Severity.ERROR,
-                    claim_number=c.claim_number,
-                    row_index=i,
-                    field="incurred_total",
-                    message=(
-                        f"Claim {_label(c, i)}: paid + reserve - recovery does not equal "
-                        f"incurred total."
-                    ),
-                    expected=expected,
-                    actual=c.incurred_total,
-                    delta=c.incurred_total - expected,
-                )
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        if claim.incurred_total is None:
+            continue
+        if claim.paid_total is None and claim.reserve_total is None:
+            continue
+        expected = (
+            _money(claim.paid_total)
+            + _money(claim.reserve_total)
+            - _money(claim.recovery_total)
+        )
+        delta = claim.incurred_total - expected
+        if config.within_tolerance(delta):
+            continue
+        findings.append(
+            Finding(
+                rule_id="R-01",
+                severity=Severity.ERROR,
+                claim_number=claim.claim_number,
+                field="incurred_total",
+                message=(
+                    f"Incurred does not equal paid + reserve - recovery: "
+                    f"{_fmt(claim.paid_total)} + {_fmt(claim.reserve_total)} - "
+                    f"{_fmt(claim.recovery_total)} = {_fmt(expected)}, "
+                    f"but the document shows {_fmt(claim.incurred_total)}."
+                ),
+                expected=expected,
+                actual=claim.incurred_total,
+                delta=delta,
+                page=claim.source_page,
             )
-    return out
+        )
+    return findings
 
 
 def _component_sum_rule(
     doc: LossRunDocument,
-    cfg: ReconcileConfig,
+    config: ReconcileConfig,
     rule_id: str,
-    components: tuple[str, ...],
+    components: Sequence[str],
     total_field: str,
-    noun: str,
 ) -> list[Finding]:
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        total = getattr(c, total_field)
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        total = getattr(claim, total_field)
         if total is None:
             continue
-        present = [getattr(c, f) for f in components if getattr(c, f) is not None]
-        if not present:
-            continue  # carrier doesn't break this total down
-        expected = sum(present, Decimal("0"))
-        if not _within(expected, total, cfg.money_tolerance):
-            out.append(
-                Finding(
-                    rule_id=rule_id,
-                    severity=Severity.ERROR,
-                    claim_number=c.claim_number,
-                    row_index=i,
-                    field=total_field,
-                    message=(
-                        f"Claim {_label(c, i)}: {noun} components do not sum to "
-                        f"{total_field.replace('_', ' ')}."
-                    ),
-                    expected=expected,
-                    actual=total,
-                    delta=total - expected,
-                )
+        parts = [getattr(claim, name) for name in components]
+        expected = sum_present(parts)
+        if expected is None:
+            continue  # no components on this carrier's format
+        delta = total - expected
+        if config.within_tolerance(delta):
+            continue
+        breakdown = " + ".join(
+            f"{_label(name)} {_fmt(getattr(claim, name))}" for name in components
+        )
+        findings.append(
+            Finding(
+                rule_id=rule_id,
+                severity=Severity.ERROR,
+                claim_number=claim.claim_number,
+                field=total_field,
+                message=(
+                    f"{_label(total_field).capitalize()} does not equal its parts: "
+                    f"{breakdown} = {_fmt(expected)}, "
+                    f"but the document shows {_fmt(total)}."
+                ),
+                expected=expected,
+                actual=total,
+                delta=delta,
+                page=claim.source_page,
             )
-    return out
+        )
+    return findings
 
 
-def rule_r02(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
+@rule("R-02")
+def r02_paid_components(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """paid_indemnity + paid_medical + paid_expense == paid_total."""
+    return _component_sum_rule(doc, config, "R-02", PAID_COMPONENT_FIELDS, "paid_total")
+
+
+@rule("R-03")
+def r03_reserve_components(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """reserve_indemnity + reserve_medical + reserve_expense == reserve_total."""
     return _component_sum_rule(
-        doc,
-        cfg,
-        "R-02",
-        ("paid_indemnity", "paid_medical", "paid_expense"),
-        "paid_total",
-        "paid",
+        doc, config, "R-03", RESERVE_COMPONENT_FIELDS, "reserve_total"
     )
 
 
-def rule_r03(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    return _component_sum_rule(
-        doc,
-        cfg,
-        "R-03",
-        ("reserve_indemnity", "reserve_medical", "reserve_expense"),
-        "reserve_total",
-        "reserve",
-    )
+# --------------------------------------------------------------------------
+# The two rules that check against what the carrier printed
+# --------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# The rules that sell the product — R-04, R-05
-# ---------------------------------------------------------------------------
-
-
-def rule_r04(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Column sum ties to the printed footer total, per money column."""
-    out: list[Finding] = []
-    for money_field, printed in doc.printed_totals.items():
-        if printed is None:
+@rule("R-04")
+def r04_footer_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """Column sum equals the printed footer total, per money column."""
+    findings: list[Finding] = []
+    for field_name, printed in sorted(doc.printed_totals.items()):
+        if printed is None or field_name not in MONEY_FIELDS:
             continue
-        values = [getattr(c, money_field) for c in doc.claims]
-        if any(v is None for v in values):
-            # A null in the column makes the column sum meaningless — say so
-            # rather than summing what's left and reporting a false delta.
-            missing = [
-                _label(c, i)
-                for i, c in enumerate(doc.claims)
-                if getattr(c, money_field) is None
-            ]
-            out.append(
-                Finding(
-                    rule_id="R-04",
-                    severity=Severity.ERROR,
-                    field=money_field,
-                    message=(
-                        f"Cannot tie {money_field.replace('_', ' ')} to the printed total: "
-                        f"{len(missing)} row(s) have no value ({', '.join(missing[:5])}"
-                        f"{'…' if len(missing) > 5 else ''})."
-                    ),
-                    expected=printed,
-                    actual=None,
-                )
-            )
+        extracted = doc.column_total(field_name)
+        delta = extracted - printed
+        if config.within_tolerance(delta):
             continue
-        extracted = sum(values, Decimal("0"))
-        if not _within(extracted, printed, cfg.money_tolerance):
-            out.append(
-                Finding(
-                    rule_id="R-04",
-                    severity=Severity.ERROR,
-                    field=money_field,
-                    message=(
-                        f"Extracted {money_field.replace('_', ' ')} does not tie to the "
-                        f"total printed on the document."
-                    ),
-                    expected=printed,
-                    actual=extracted,
-                    delta=extracted - printed,
-                )
+        missing = sum(
+            1 for claim in doc.claims if getattr(claim, field_name, None) is None
+        )
+        hint = (
+            f" {missing} row(s) have no value in this column."
+            if missing
+            else ""
+        )
+        findings.append(
+            Finding(
+                rule_id="R-04",
+                severity=Severity.ERROR,
+                field=field_name,
+                message=(
+                    f"Extracted {_label(field_name)} sums to {_fmt(extracted)}, "
+                    f"but the document's printed total is {_fmt(printed)} "
+                    f"(off by {_fmt(delta)}).{hint}"
+                ),
+                expected=printed,
+                actual=extracted,
+                delta=delta,
             )
-    return out
+        )
+    return findings
 
 
-def rule_r05(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
+@rule("R-05")
+def r05_claim_count(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
     """Extracted row count equals the printed claim count."""
-    if doc.printed_claim_count is None:
+    printed = doc.printed_claim_count
+    if printed is None:
         return []
     extracted = len(doc.claims)
-    if extracted == doc.printed_claim_count:
+    if extracted == printed:
         return []
+    direction = "more" if extracted > printed else "fewer"
     return [
         Finding(
             rule_id="R-05",
             severity=Severity.ERROR,
+            field="claim_count",
             message=(
-                f"Extracted {extracted} claim(s) but the document states "
-                f"{doc.printed_claim_count}."
+                f"Extracted {extracted} claims but the document says {printed}. "
+                f"That is {abs(extracted - printed)} {direction} row(s) than expected."
             ),
-            expected=doc.printed_claim_count,
+            expected=printed,
             actual=extracted,
-            delta=Decimal(extracted - doc.printed_claim_count),
+            delta=Decimal(extracted - printed),
         )
     ]
 
 
-# ---------------------------------------------------------------------------
-# Completeness — R-06, R-07
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Required fields
+# --------------------------------------------------------------------------
 
 
-def rule_r06(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
+@rule("R-06")
+def r06_valuation_date(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """A loss run without a valuation date is unusable."""
     if doc.valuation_date is not None:
         return []
     return [
@@ -296,332 +272,381 @@ def rule_r06(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
             severity=Severity.ERROR,
             field="valuation_date",
             message=(
-                "No valuation date found. A loss run without one cannot be used for "
-                "underwriting — set it in the review screen."
+                "No valuation date found. Set it on the review screen — without "
+                "one the loss run cannot be used for pricing."
             ),
+            expected="a date",
+            actual=None,
         )
     ]
 
 
-def rule_r07(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        for field_name in ("claim_number", "date_of_loss", "incurred_total"):
-            if getattr(c, field_name) is None:
-                reason = c.field_issues.get(field_name)
-                detail = f" ({reason})" if reason else ""
-                out.append(
-                    Finding(
-                        rule_id="R-07",
-                        severity=Severity.ERROR,
-                        claim_number=c.claim_number,
-                        row_index=i,
-                        field=field_name,
-                        message=(
-                            f"Claim {_label(c, i)}: {field_name.replace('_', ' ')} is "
-                            f"missing{detail}."
-                        ),
-                    )
-                )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Plausibility — R-08 … R-16
-# ---------------------------------------------------------------------------
-
-
-def rule_r08(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Closed claim carrying a non-zero reserve."""
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        if c.claim_status is not ClaimStatus.CLOSED or c.reserve_total is None:
-            continue
-        if abs(c.reserve_total) > cfg.money_tolerance:
-            out.append(
+@rule("R-07")
+def r07_required_claim_fields(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """claim_number, date_of_loss and incurred_total must be present."""
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        for field_name in ("date_of_loss", "incurred_total"):
+            if getattr(claim, field_name) is not None:
+                continue
+            reason = claim.issue(field_name)
+            because = f" ({reason.value})" if reason else ""
+            findings.append(
                 Finding(
-                    rule_id="R-08",
-                    severity=Severity.WARN,
-                    claim_number=c.claim_number,
-                    row_index=i,
-                    field="reserve_total",
-                    message=f"Claim {_label(c, i)} is closed but still carries a reserve.",
-                    expected=Decimal("0"),
-                    actual=c.reserve_total,
-                    delta=c.reserve_total,
+                    rule_id="R-07",
+                    severity=Severity.ERROR,
+                    claim_number=claim.claim_number,
+                    field=field_name,
+                    message=(
+                        f"{_label(field_name).capitalize()} is missing{because}. "
+                        f"Fill it in on the review screen."
+                    ),
+                    expected="a value",
+                    actual=None,
+                    page=claim.source_page,
                 )
             )
-    return out
+    return findings
 
 
-def rule_r09(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """date_of_loss outside the policy period."""
-    if doc.policy_period_start is None and doc.policy_period_end is None:
-        return []
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        if c.date_of_loss is None:
+# --------------------------------------------------------------------------
+# Warnings
+# --------------------------------------------------------------------------
+
+
+@rule("R-08")
+def r08_closed_with_reserve(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A closed claim holding reserve is usually a stale row."""
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        if claim.claim_status is not ClaimStatus.CLOSED:
             continue
-        start, end = doc.policy_period_start, doc.policy_period_end
-        if (start and c.date_of_loss < start) or (end and c.date_of_loss > end):
+        if claim.reserve_total is None or config.within_tolerance(claim.reserve_total):
+            continue
+        findings.append(
+            Finding(
+                rule_id="R-08",
+                severity=Severity.WARN,
+                claim_number=claim.claim_number,
+                field="reserve_total",
+                message=(
+                    f"Claim is closed but still carries reserve of "
+                    f"{_fmt(claim.reserve_total)}."
+                ),
+                expected=Decimal("0"),
+                actual=claim.reserve_total,
+                delta=claim.reserve_total,
+                page=claim.source_page,
+            )
+        )
+    return findings
+
+
+@rule("R-09")
+def r09_loss_outside_policy_period(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Date of loss outside the policy period."""
+    start, end = doc.policy_period_start, doc.policy_period_end
+    if start is None and end is None:
+        return []
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        loss = claim.date_of_loss
+        if loss is None:
+            continue
+        if (start and loss < start) or (end and loss > end):
             window = f"{start or '?'} to {end or '?'}"
-            out.append(
+            findings.append(
                 Finding(
                     rule_id="R-09",
                     severity=Severity.WARN,
-                    claim_number=c.claim_number,
-                    row_index=i,
+                    claim_number=claim.claim_number,
                     field="date_of_loss",
                     message=(
-                        f"Claim {_label(c, i)}: date of loss falls outside the policy "
-                        f"period ({window})."
+                        f"Date of loss {loss} falls outside the policy period "
+                        f"({window})."
                     ),
                     expected=window,
-                    actual=str(c.date_of_loss),
+                    actual=str(loss),
+                    page=claim.source_page,
                 )
             )
-    return out
+    return findings
 
 
-def rule_r10(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
+@rule("R-10")
+def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
     """date_of_loss <= date_reported <= valuation_date."""
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        if c.date_of_loss and c.date_reported and c.date_reported < c.date_of_loss:
-            out.append(
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        loss, reported = claim.date_of_loss, claim.date_reported
+        if loss and reported and reported < loss:
+            findings.append(
                 Finding(
                     rule_id="R-10",
                     severity=Severity.WARN,
-                    claim_number=c.claim_number,
-                    row_index=i,
+                    claim_number=claim.claim_number,
                     field="date_reported",
                     message=(
-                        f"Claim {_label(c, i)}: reported before the loss occurred."
+                        f"Reported {reported} is before the loss date {loss}."
                     ),
-                    expected=f"on or after {c.date_of_loss}",
-                    actual=str(c.date_reported),
+                    expected=f"on or after {loss}",
+                    actual=str(reported),
+                    page=claim.source_page,
                 )
             )
         if doc.valuation_date:
-            for field_name in ("date_of_loss", "date_reported"):
-                value = getattr(c, field_name)
+            for field_name, value in (("date_reported", reported), ("date_of_loss", loss)):
                 if value and value > doc.valuation_date:
-                    out.append(
+                    findings.append(
                         Finding(
                             rule_id="R-10",
                             severity=Severity.WARN,
-                            claim_number=c.claim_number,
-                            row_index=i,
+                            claim_number=claim.claim_number,
                             field=field_name,
                             message=(
-                                f"Claim {_label(c, i)}: {field_name.replace('_', ' ')} is "
-                                f"after the valuation date."
+                                f"{_label(field_name).capitalize()} {value} is after "
+                                f"the valuation date {doc.valuation_date}."
                             ),
                             expected=f"on or before {doc.valuation_date}",
                             actual=str(value),
+                            page=claim.source_page,
                         )
                     )
-    return out
+                    break
+    return findings
 
 
-def rule_r11(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Duplicate claim_number within one policy period."""
-    seen: dict[str, list[int]] = {}
-    for i, c in enumerate(doc.claims):
-        if c.claim_number:
-            seen.setdefault(c.claim_number, []).append(i)
-    out: list[Finding] = []
-    for claim_number, rows in seen.items():
-        if len(rows) < 2:
+@rule("R-11")
+def r11_duplicate_claim_numbers(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """The same claim number twice in one policy period."""
+    findings: list[Finding] = []
+    for number, claims in doc.claims_by_number().items():
+        if len(claims) < 2:
             continue
-        pages = {doc.claims[i].source_page for i in rows}
+        pages = sorted({claim.source_page for claim in claims})
         if len(pages) > 1:
-            continue  # cross-page repetition is R-12's finding, not a duplicate row
-        out.append(
+            continue  # R-12 owns the cross-page case
+        findings.append(
             Finding(
                 rule_id="R-11",
                 severity=Severity.WARN,
-                claim_number=claim_number,
-                row_index=rows[1],
+                claim_number=number,
                 field="claim_number",
                 message=(
-                    f"Claim {claim_number} appears {len(rows)} times on page "
-                    f"{pages.pop()}."
+                    f"Claim number appears {len(claims)} times on page {pages[0]}. "
+                    f"Delete the duplicate row or correct the number."
                 ),
                 expected=1,
-                actual=len(rows),
+                actual=len(claims),
+                page=pages[0],
             )
         )
-    return out
+    return findings
 
 
-def rule_r12(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Same claim on two pages — usually a continuation-header artifact."""
-    pages_by_claim: dict[str, set[int]] = {}
-    rows_by_claim: dict[str, list[int]] = {}
-    for i, c in enumerate(doc.claims):
-        if c.claim_number:
-            pages_by_claim.setdefault(c.claim_number, set()).add(c.source_page)
-            rows_by_claim.setdefault(c.claim_number, []).append(i)
-    out: list[Finding] = []
-    for claim_number, pages in pages_by_claim.items():
-        if len(pages) < 2:
+@rule("R-12")
+def r12_cross_page_duplicate(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """The same claim on two pages — usually a repeated continuation header."""
+    findings: list[Finding] = []
+    for number, claims in doc.claims_by_number().items():
+        pages = sorted({claim.source_page for claim in claims})
+        if len(claims) < 2 or len(pages) < 2:
             continue
-        listed = ", ".join(str(p) for p in sorted(pages))
-        out.append(
+        findings.append(
             Finding(
                 rule_id="R-12",
                 severity=Severity.WARN,
-                claim_number=claim_number,
-                row_index=rows_by_claim[claim_number][1],
+                claim_number=number,
                 field="claim_number",
                 message=(
-                    f"Claim {claim_number} appears on pages {listed}; it may have been "
-                    f"counted twice across a page break."
+                    f"Claim appears on pages {', '.join(str(p) for p in pages)}. "
+                    f"This is usually a row continued across a page break — keep "
+                    f"one row and delete the other."
                 ),
-                actual=len(pages),
+                expected=1,
+                actual=len(claims),
+                page=pages[0],
             )
         )
-    return out
+    return findings
 
 
-def rule_r13(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Value exceeds outlier_multiple × the column median — usually a decimal
-    misread (12,345.67 read as 1234567)."""
-    out: list[Finding] = []
-    for money_field in MONEY_FIELDS:
+@rule("R-13")
+def r13_outliers(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """A value far above the column median is usually a mis-parse."""
+    findings: list[Finding] = []
+    for field_name in MONEY_FIELDS:
         values = [
-            (i, v)
-            for i, c in enumerate(doc.claims)
-            if (v := getattr(c, money_field)) is not None and v != 0
+            abs(getattr(claim, field_name))
+            for claim in doc.claims
+            if getattr(claim, field_name) is not None
         ]
-        if len(values) < 3:
-            continue  # a median over one or two rows says nothing
-        magnitudes = sorted(abs(v) for _, v in values)
-        median = Decimal(str(statistics.median(magnitudes)))
+        non_zero = [value for value in values if value > 0]
+        if len(non_zero) < 3:
+            continue  # too few rows for a median to mean anything
+        median = Decimal(str(statistics.median(sorted(non_zero))))
         if median <= 0:
             continue
-        threshold = median * cfg.outlier_multiple
-        for i, v in values:
-            if abs(v) > threshold:
-                c = doc.claims[i]
-                out.append(
-                    Finding(
-                        rule_id="R-13",
-                        severity=Severity.WARN,
-                        claim_number=c.claim_number,
-                        row_index=i,
-                        field=money_field,
-                        message=(
-                            f"Claim {_label(c, i)}: {money_field.replace('_', ' ')} is far "
-                            f"above the column median — check for a misread decimal."
-                        ),
-                        expected=f"near {median}",
-                        actual=v,
-                    )
-                )
-    return out
-
-
-def rule_r14(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Negative paid_total — legitimate when a recovery exceeds payments."""
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        if c.paid_total is not None and c.paid_total < 0:
-            out.append(
+        ceiling = median * config.outlier_multiple
+        for claim in doc.claims:
+            value = getattr(claim, field_name)
+            if value is None or abs(value) <= ceiling:
+                continue
+            findings.append(
                 Finding(
-                    rule_id="R-14",
-                    severity=Severity.INFO,
-                    claim_number=c.claim_number,
-                    row_index=i,
-                    field="paid_total",
+                    rule_id="R-13",
+                    severity=Severity.WARN,
+                    claim_number=claim.claim_number,
+                    field=field_name,
                     message=(
-                        f"Claim {_label(c, i)}: paid total is negative, which usually "
-                        f"means a recovery exceeded payments."
+                        f"{_label(field_name).capitalize()} {_fmt(value)} is more than "
+                        f"{config.outlier_multiple:g}x the column median "
+                        f"({_fmt(median)}). Check the decimal separator."
                     ),
-                    actual=c.paid_total,
+                    expected=f"<= {_fmt(ceiling)}",
+                    actual=value,
+                    page=claim.source_page,
                 )
             )
-    return out
+    return findings
 
 
-def rule_r15(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Any field that parsing gave up on."""
-    out: list[Finding] = []
-    for i, c in enumerate(doc.claims):
-        for field_name, reason in sorted(c.field_issues.items()):
-            if reason not in _REVIEW_REASONS:
+@rule("R-14")
+def r14_negative_paid(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """Negative paid total — legitimate after a recovery, worth noting."""
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        if claim.paid_total is None or claim.paid_total >= 0:
+            continue
+        findings.append(
+            Finding(
+                rule_id="R-14",
+                severity=Severity.INFO,
+                claim_number=claim.claim_number,
+                field="paid_total",
+                message=(
+                    f"Paid total is negative ({_fmt(claim.paid_total)}). This is "
+                    f"normal after a recovery."
+                ),
+                actual=claim.paid_total,
+                page=claim.source_page,
+            )
+        )
+    return findings
+
+
+@rule("R-15")
+def r15_unresolved_fields(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Anything the parser could not resolve, surfaced for a human."""
+    findings: list[Finding] = []
+    for field_name, reason in sorted(doc.document_issues.items()):
+        if reason not in config.review_reasons:
+            continue
+        findings.append(
+            Finding(
+                rule_id="R-15",
+                severity=Severity.WARN,
+                field=field_name,
+                message=(
+                    f"{_label(field_name).capitalize()} could not be read "
+                    f"({reason.value}). Enter it by hand."
+                ),
+                actual=reason.value,
+            )
+        )
+    for claim in doc.claims:
+        for field_name, reason in sorted(claim.field_issues.items()):
+            if reason not in config.review_reasons:
                 continue
-            out.append(
+            raw = claim.raw_cells.get(field_name)
+            shown = f" The document shows {raw!r}." if raw else ""
+            findings.append(
                 Finding(
                     rule_id="R-15",
                     severity=Severity.WARN,
-                    claim_number=c.claim_number,
-                    row_index=i,
+                    claim_number=claim.claim_number,
                     field=field_name,
                     message=(
-                        f"Claim {_label(c, i)}: {field_name.replace('_', ' ')} could not be "
-                        f"read with confidence ({reason}). Enter it to clear this."
+                        f"{_label(field_name).capitalize()} could not be read "
+                        f"({reason.value}).{shown} Enter it by hand."
                     ),
-                    actual=reason,
+                    actual=reason.value,
+                    page=claim.source_page,
                 )
             )
-    return out
+    return findings
 
 
-def rule_r16(doc: LossRunDocument, cfg: ReconcileConfig) -> list[Finding]:
-    """Mixed currency symbols within one document."""
-    symbols = sorted(set(doc.currency_symbols_seen))
-    if len(symbols) < 2:
+@rule("R-16")
+def r16_mixed_currency(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """More than one currency symbol in a single document."""
+    seen = {code for code in doc.currencies_seen if code}
+    seen.update(claim.currency for claim in doc.claims if claim.currency)
+    if len(seen) < 2:
         return []
+    listed = ", ".join(sorted(seen))
     return [
         Finding(
             rule_id="R-16",
             severity=Severity.WARN,
             field="currency",
             message=(
-                f"The document mixes currency symbols ({', '.join(symbols)}). Totals "
-                f"across different currencies do not add up."
+                f"More than one currency appears in this document ({listed}). "
+                f"Totals across mixed currencies do not mean anything — split the "
+                f"document or correct the rows."
             ),
-            actual=", ".join(symbols),
+            expected=doc.currency,
+            actual=listed,
         )
     ]
 
 
-RULES: tuple[Callable[[LossRunDocument, ReconcileConfig], list[Finding]], ...] = (
-    rule_r01,
-    rule_r02,
-    rule_r03,
-    rule_r04,
-    rule_r05,
-    rule_r06,
-    rule_r07,
-    rule_r08,
-    rule_r09,
-    rule_r10,
-    rule_r11,
-    rule_r12,
-    rule_r13,
-    rule_r14,
-    rule_r15,
-    rule_r16,
-)
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
+
+#: Findings sort by severity first so the exceptions panel leads with errors.
+_SEVERITY_ORDER = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
 
 
 def reconcile(
-    doc: LossRunDocument, config: Optional[ReconcileConfig] = None
-) -> ReconcileResult:
-    """Run every rule. Ordered ERROR first, then WARN, then INFO, so the
-    exceptions panel leads with what blocks a clean export."""
-    cfg = config or ReconcileConfig()
+    doc: LossRunDocument, config: ReconcileConfig | None = None
+) -> ReconciliationResult:
+    """Run every rule and return the findings plus the document badge."""
+    config = config or ReconcileConfig()
     findings: list[Finding] = []
-    for rule in RULES:
-        findings.extend(rule(doc, cfg))
-    order = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
-    findings.sort(key=lambda f: (order[f.severity], f.rule_id, f.row_index or 0))
-    return ReconcileResult(findings)
+    for rule_id, fn in _RULES:
+        if rule_id in config.disabled_rules:
+            continue
+        findings.extend(fn(doc, config))
+
+    findings.sort(
+        key=lambda f: (
+            _SEVERITY_ORDER[f.severity],
+            f.rule_id,
+            f.claim_number or "",
+            f.field or "",
+        )
+    )
+    status = (
+        DocumentStatus.NEEDS_REVIEW
+        if any(f.severity is Severity.ERROR for f in findings)
+        else DocumentStatus.CLEAN
+    )
+    return ReconciliationResult(status=status, findings=findings)
 
 
-def vision_fields(doc: LossRunDocument) -> int:
-    """Count of claims extracted by vision — the UI marks these subtly."""
-    return sum(1 for c in doc.claims if c.source_method is SourceMethod.VISION)
+def registered_rule_ids() -> list[str]:
+    return [rule_id for rule_id, _ in _RULES]

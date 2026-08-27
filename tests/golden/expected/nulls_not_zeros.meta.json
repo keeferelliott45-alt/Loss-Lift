@@ -1,0 +1,29 @@
+{
+  "name": "nulls_not_zeros",
+  "description": "N/A and blank cells that must stay null, plus -0- true zeros",
+  "carrier": "Keystone Regional Insurance",
+  "named_insured": "Lakeshore Equipment Rental",
+  "policy_number": "GL-224417-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 4,
+  "printed_claim_count": 4,
+  "printed_totals": {},
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

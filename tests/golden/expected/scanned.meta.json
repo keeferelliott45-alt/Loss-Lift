@@ -1,0 +1,34 @@
+{
+  "name": "scanned",
+  "description": "Image-only page: no text layer, must classify as scanned",
+  "carrier": "Union Standard Insurance Group",
+  "named_insured": "Delta Fabrication LLC",
+  "policy_number": "GL-660812-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 4,
+  "printed_claim_count": 4,
+  "printed_totals": {
+    "paid_total": "47266.90",
+    "reserve_total": "78500.00",
+    "recovery_total": "1250.00",
+    "incurred_total": "124516.90"
+  },
+  "scanned": true,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}
