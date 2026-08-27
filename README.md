@@ -14,15 +14,54 @@ Not yet validated against real carrier documents — see [Before this ships](#be
 
 ## Quick start
 
+Python 3.11 or newer.
+
 ```bash
+git clone https://github.com/keeferelliott45-alt/Loss-Lift.git
+cd Loss-Lift
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+That opens the app at http://localhost:8501.
 
 No API key is needed for digital PDFs, which is most loss runs. A Gemini key
 is used only for two things: mapping column headers the built-in vocabulary
 does not recognise, and reading scanned pages. Copy `.env.example` to `.env`
 to configure it.
+
+## Try it
+
+A fresh clone has no PDFs to open — fixture documents are generated rather
+than committed, so no loss run ever lands in this repository. Make yourself a
+set of realistic ones:
+
+```bash
+python -m tests.golden.generate --pdf-dir samples
+```
+
+That writes eleven synthetic loss runs to `samples/` (git-ignored). Drag any
+of them onto the upload screen. Each one is built to exercise something
+different:
+
+| File | What it shows |
+|---|---|
+| `us_basic.pdf` | The ordinary case. Should come back green. |
+| `arithmetic_error.pdf` | One row's incurred is overstated by 10,000. R-01 catches it, the badge goes amber, and editing the cell turns it green. |
+| `eu_format.pdf` | `1.234,56` and `dd/mm/yyyy`. Same claims as `us_basic`, same answers. |
+| `mainframe_trailing_minus.pdf` | `3,500.00-` negatives and `-0-` zeros. |
+| `accounting_negatives.pdf` | `(1,234.56)` negatives, and a claim where subrogation recovered more than was paid. |
+| `wc_medical.pdf` | Workers comp, fourteen columns including medical. |
+| `multipage_repeat_header.pdf` | Three pages with the header repeated on each. |
+| `nulls_not_zeros.pdf` | `N/A`, a blank cell and a true `-0-` in the same column. They must not come back the same. |
+| `unknown_format.pdf` | Headers the vocabulary cannot place, so the mapping screen appears. Map them once and re-upload: it maps itself. |
+| `ruled_table.pdf` | A ruled grid, which takes the other extraction path. |
+| `scanned.pdf` | No text layer. Needs a Gemini key, or it reports the pages it skipped. |
+
+A quick tour: upload `arithmetic_error.pdf`, look at the amber badge and the
+exception underneath it, change that row's total incurred from `41400.00` to
+`31400.00`, and watch the badge turn green as the checks re-run. Then export
+and open the Exceptions and Source Info sheets.
 
 ## How it works
 
