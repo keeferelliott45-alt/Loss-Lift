@@ -36,6 +36,7 @@ from core.profiles import (
     load_profile,
     map_headers,
     page_top_text,
+    resolve_columns,
 )
 from core.reconcile import ReconcileConfig, reconcile
 from core.schema import (
@@ -112,31 +113,28 @@ def build_mapping(
     headers: Sequence[str],
     profile: CarrierProfile | None = None,
     fingerprint_value: str = "",
+    *,
+    samples: Sequence[Sequence[str]] = (),
+    use_llm: bool = False,
+    llm_client: Any | None = None,
 ) -> ColumnMapping:
-    """Resolve headers to fields: a saved profile first, heuristics second.
+    """Resolve headers to fields: saved profile, then vocabulary, then the LLM.
 
     A matching profile means zero LLM calls — the compounding moat in spec
-    section 2.  The LLM is only consulted by
-    :func:`core.profiles.llm_map_columns`, and only for what is left over.
+    section 2. The LLM is consulted only for headers the vocabulary could not
+    place, and only when the caller asks for it.
     """
-    if profile is not None:
-        fields: dict[int, str | None] = {}
-        for index, header in enumerate(headers):
-            fields[index] = profile.field_for(header)
-        mapping = ColumnMapping(
-            headers=list(headers),
-            fields=fields,
-            source="profile",
-            fingerprint=fingerprint_value,
-        )
-        if mapping.is_usable():
-            return mapping
-
-    guesses = map_headers(headers)
+    guesses, source = resolve_columns(
+        headers,
+        samples,
+        profile=profile,
+        use_llm=use_llm,
+        client=llm_client,
+    )
     return ColumnMapping(
         headers=list(headers),
         fields={index: guess.field for index, guess in guesses.items()},
-        source="heuristic",
+        source=source,
         fingerprint=fingerprint_value,
     )
 
@@ -372,6 +370,8 @@ def run_pipeline(
     reconcile_config: ReconcileConfig | None = None,
     use_vision: bool = True,
     vision_extractor: Any | None = None,
+    use_llm: bool = False,
+    llm_client: Any | None = None,
 ) -> ExtractionResult:
     """Run stages 0 through 5 and return everything the UI needs."""
     ingested = source if isinstance(source, IngestedFile) else ingest_path(source)
@@ -412,7 +412,14 @@ def run_pipeline(
     if profile is None:
         profile = load_profile(fingerprint_value, profiles_dir)
 
-    mapping = mapping_override or build_mapping(headers, profile, fingerprint_value)
+    mapping = mapping_override or build_mapping(
+        headers,
+        profile,
+        fingerprint_value,
+        samples=sample_rows(tables),
+        use_llm=use_llm,
+        llm_client=llm_client,
+    )
 
     # Number and date conventions, derived from the document itself.
     locale_inference = infer_locale(_money_tokens(tables, mapping))
@@ -517,3 +524,49 @@ def rerun_reconciliation(
 ) -> ReconciliationResult:
     """Re-run the rules after a human edits a cell (spec section 11)."""
     return reconcile(document, config or ReconcileConfig())
+
+
+def save_confirmed_mapping(
+    result: ExtractionResult,
+    mapping: ColumnMapping | None = None,
+    *,
+    profiles_dir: Path | None = None,
+    confirmed_by_human: bool = True,
+) -> CarrierProfile:
+    """Save the mapping screen's choices as a reusable carrier profile.
+
+    Everything saved is format structure. The whitelist in
+    :func:`core.profiles.sanitise_profile` refuses anything else, so a claimant
+    name cannot reach disk through this path.
+    """
+    from core.profiles import profile_from_mapping, save_profile
+
+    mapping = mapping or result.mapping
+    document = result.document
+    profile = profile_from_mapping(
+        document.profile_fingerprint or mapping.fingerprint,
+        mapping.headers,
+        dict(mapping.fields),
+        carrier=document.carrier,
+        date_order=result.date_order.order if result.date_order.confident else None,
+        number_locale=result.locale.locale if result.locale.confident else None,
+        currency=document.currency,
+        line_of_business=(
+            document.line_of_business.value if document.line_of_business else None
+        ),
+        confirmed_by_human=confirmed_by_human,
+    )
+    profile.times_used = (result.profile.times_used + 1) if result.profile else 1
+    save_profile(profile, profiles_dir)
+    return profile
+
+
+def sample_rows(tables: Sequence[RawTable], count: int = 3) -> list[list[str]]:
+    """The first few data rows, for the mapping screen and the LLM prompt."""
+    rows: list[list[str]] = []
+    for table in tables:
+        for row in table.rows:
+            rows.append(list(row.cells))
+            if len(rows) >= count:
+                return rows
+    return rows

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -205,10 +206,12 @@ def looks_like_header(cells: Sequence[str], minimum: int = 3) -> bool:
 # --------------------------------------------------------------------------
 
 _CARRIER_SUFFIXES = (
-    "insurance", "assurance", "casualty", "indemnity", "mutual", "underwriters",
-    "company", "corp", "group", "marine", "fire", "specialty", "exchange",
-    "reciprocal", "syndicate", "lloyds", "reinsurance", "versicherung",
-    "assurances", "ins", "co", "ag", "se", "plc", "ltd", "llc", "inc",
+    "insurance", "insurances", "assurance", "assurances", "casualty",
+    "indemnity", "mutual", "underwriters", "company", "companies", "corp",
+    "corporation", "group", "marine", "fire", "specialty", "speciality",
+    "exchange", "reciprocal", "syndicate", "lloyds", "reinsurance",
+    "versicherung", "versicherungen", "limited", "ins", "co", "ag", "se",
+    "plc", "ltd", "llc", "inc", "nv", "sa",
 )
 
 _CARRIER_SUFFIX_RE = re.compile(
@@ -224,20 +227,34 @@ _NOT_A_CARRIER = re.compile(
     flags=re.IGNORECASE,
 )
 
+#: The rare document that labels its carrier explicitly.
+_CARRIER_LABEL = re.compile(
+    r"^(?:carrier|insurer|underwriter|issuing\s+company)\s*[:\-]\s*(.+)",
+    flags=re.IGNORECASE,
+)
+
 _PAGE_MARKER = re.compile(r"\s*page\s+\d+\s*(?:of\s*\d+)?\s*$", re.IGNORECASE)
 
 
 def detect_carrier(text: str) -> str | None:
     """Best-effort carrier name from the letterhead.
 
-    Loss runs put the carrier on the first line.  A suffix match ("… Casualty
-    Company") is preferred; failing that, the first line that is not a label,
-    a title or page furniture is taken.
+    Lines carrying a label are skipped entirely. "Named Insured: Whitfield
+    Engineering Ltd" ends in a company suffix but names the *customer*, and
+    mistaking it for the carrier would file every customer under its own
+    carrier profile.
     """
+    lines = text.splitlines()[:8]
+
+    for line in lines:
+        labelled = _CARRIER_LABEL.match(line.strip())
+        if labelled:
+            return " ".join(_PAGE_MARKER.sub("", labelled.group(1)).split())
+
     candidates: list[str] = []
-    for line in text.splitlines()[:8]:
+    for line in lines:
         candidate = _PAGE_MARKER.sub("", line.strip())
-        if not candidate or len(candidate) > 80:
+        if not candidate or len(candidate) > 80 or ":" in candidate:
             continue
         if _NOT_A_CARRIER.match(candidate):
             continue
@@ -247,36 +264,42 @@ def detect_carrier(text: str) -> str | None:
         match = _CARRIER_SUFFIX_RE.search(candidate)
         if match:
             return " ".join(match.group(1).split())
-
-    for candidate in candidates:
-        if ":" in candidate:
-            continue  # a labelled field, not a letterhead
-        return " ".join(candidate.split())
-    return None
+    return " ".join(candidates[0].split()) if candidates else None
 
 
-def _normalise_fingerprint_text(text: str) -> str:
-    """Strip everything that varies between documents from the same carrier."""
-    lowered = text.lower()
-    lowered = re.sub(r"\d", "#", lowered)          # dates, policy numbers, amounts
-    lowered = re.sub(r"[^a-z#\s]", " ", lowered)   # punctuation
-    lowered = re.sub(r"#+", "#", lowered)
-    return " ".join(lowered.split())
+#: Header-block labels a loss run prints. Their *presence* identifies a
+#: carrier's template; their values identify a customer, so only the labels
+#: are ever hashed.
+_TEMPLATE_LABELS = (
+    "named insured", "insured", "policy number", "policy no", "policy period",
+    "policy term", "valuation date", "valued as of", "evaluation date",
+    "as of date", "line of business", "coverage", "currency", "loss run",
+    "claims listing", "claim detail", "report date", "run date", "producer",
+    "agent", "branch", "underwriter", "total claims", "number of claims",
+)
+
+
+def _template_labels(text: str) -> list[str]:
+    """Which known labels appear in the header block."""
+    lowered = " ".join(text.lower().split())
+    return sorted({label for label in _TEMPLATE_LABELS if label in lowered})
 
 
 def fingerprint(
     top_text: str, headers: Sequence[str] = (), carrier: str | None = None
 ) -> str:
-    """Hash the letterhead plus the column labels.
+    """Identify a carrier's *format*, not a customer's document.
 
-    Two loss runs from the same carrier in the same format hash the same; a
-    different format from the same carrier does not, because the header labels
-    are part of the hash.
+    Hashes the carrier name, the column labels, and which header-block labels
+    the template prints — never their values. Two loss runs from the same
+    carrier in the same format therefore match even though the insured, the
+    policy number and the valuation date all differ, which is the whole point:
+    the second document must cost zero LLM calls.
     """
     parts = [
-        _normalise_fingerprint_text(top_text),
-        "|".join(normalize_label(header) for header in headers),
         normalize_label(carrier or ""),
+        "|".join(normalize_label(header) for header in headers),
+        "|".join(_template_labels(top_text)),
     ]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:32]
 
@@ -497,3 +520,179 @@ def profile_from_mapping(
         line_of_business=line_of_business,
         confirmed_by_human=confirmed_by_human,
     )
+
+
+# --------------------------------------------------------------------------
+# LLM column mapping — structure only, never numbers
+# --------------------------------------------------------------------------
+
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "map_columns.md"
+
+#: How many sample rows the model is allowed to see (spec section 5, stage 3).
+LLM_SAMPLE_ROWS = 3
+
+DEFAULT_MODEL = "gemini-2.0-flash"
+
+
+class LLMUnavailable(RuntimeError):
+    """No API key, no client, or the call failed."""
+
+
+def llm_enabled() -> bool:
+    """The LLM is opt-in: without a key and the flag, mapping stays local."""
+    return bool(os.getenv("GEMINI_API_KEY")) and os.getenv(
+        "LOSSLIFT_ENABLE_LLM", "0"
+    ).strip().lower() in {"1", "true", "yes"}
+
+
+def build_mapping_prompt(
+    headers: Sequence[str], sample_rows: Sequence[Sequence[str]]
+) -> str:
+    """Fill the committed prompt template.
+
+    Only the header row and at most three sample rows are interpolated. The
+    rest of the table never leaves the machine.
+    """
+    template = PROMPT_PATH.read_text(encoding="utf-8")
+    body = template.split("### Input", 1)[-1]
+    instructions = template.split("### Input", 1)[0]
+
+    rows = []
+    for row in list(sample_rows)[:LLM_SAMPLE_ROWS]:
+        rows.append(" | ".join(str(cell) for cell in row))
+    return (
+        instructions.strip()
+        + "\n\n### Input\n\nHeaders: "
+        + json.dumps(list(headers))
+        + "\n\nSample rows:\n"
+        + ("\n".join(rows) if rows else "(none)")
+        + "\n"
+    )
+
+
+def parse_llm_mapping(
+    payload: str | dict[str, Any], headers: Sequence[str]
+) -> dict[int, FieldGuess]:
+    """Read the model's JSON, discarding anything that is not a real field.
+
+    The model is treated as a suggestion engine, not an authority: an unknown
+    field name, a duplicate, or an out-of-range index is dropped rather than
+    trusted.
+    """
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.IGNORECASE)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise LLMUnavailable(f"the model did not return JSON: {error}") from error
+    else:
+        data = payload
+
+    columns = data.get("columns") if isinstance(data, dict) else None
+    if not isinstance(columns, list):
+        raise LLMUnavailable("the model's JSON has no 'columns' list")
+
+    guesses: dict[int, FieldGuess] = {
+        index: FieldGuess(None, 0.0, "unmapped") for index in range(len(headers))
+    }
+    claimed: set[str] = set()
+    for entry in columns:
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("index")
+        field_name = entry.get("field")
+        if not isinstance(index, int) or not 0 <= index < len(headers):
+            continue
+        if field_name is None:
+            continue
+        if field_name not in CANONICAL_FIELDS or field_name in claimed:
+            continue
+        try:
+            confidence = float(entry.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        claimed.add(field_name)
+        guesses[index] = FieldGuess(field_name, min(max(confidence, 0.0), 1.0), "llm")
+    return guesses
+
+
+def llm_map_columns(
+    headers: Sequence[str],
+    sample_rows: Sequence[Sequence[str]] = (),
+    *,
+    client: Any | None = None,
+    model: str | None = None,
+) -> dict[int, FieldGuess]:
+    """Ask Gemini to map the headers the vocabulary could not place.
+
+    Raises :class:`LLMUnavailable` rather than returning a bad mapping, so the
+    caller falls back to the mapping screen.
+    """
+    if client is None:
+        if not llm_enabled():
+            raise LLMUnavailable(
+                "The LLM is switched off. Set GEMINI_API_KEY and "
+                "LOSSLIFT_ENABLE_LLM=1, or map the columns on the mapping screen."
+            )
+        try:
+            from google import genai
+        except ImportError as error:  # pragma: no cover - dependency missing
+            raise LLMUnavailable("google-genai is not installed") from error
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+    prompt = build_mapping_prompt(headers, sample_rows)
+    target = model or os.getenv("LOSSLIFT_GEMINI_MODEL", DEFAULT_MODEL)
+    try:
+        response = client.models.generate_content(model=target, contents=prompt)
+        text = getattr(response, "text", None) or ""
+    except Exception as error:  # noqa: BLE001 - any transport failure is the same
+        raise LLMUnavailable(f"the mapping call failed: {error}") from error
+    return parse_llm_mapping(text, headers)
+
+
+def resolve_columns(
+    headers: Sequence[str],
+    sample_rows: Sequence[Sequence[str]] = (),
+    *,
+    profile: CarrierProfile | None = None,
+    use_llm: bool = False,
+    client: Any | None = None,
+) -> tuple[dict[int, FieldGuess], str]:
+    """Map headers by profile, then vocabulary, then — only if asked — the LLM.
+
+    Returns the guesses and which source settled it.  A saved profile short
+    circuits everything, which is the point: the fortieth document from a
+    carrier costs nothing.
+    """
+    if profile is not None:
+        guesses = {
+            index: (
+                FieldGuess(profile.field_for(header), 1.0, "profile")
+                if profile.field_for(header)
+                else FieldGuess(None, 0.0, "unmapped")
+            )
+            for index, header in enumerate(headers)
+        }
+        if any(guess.field for guess in guesses.values()):
+            return guesses, "profile"
+
+    guesses = map_headers(headers)
+    unmapped = [index for index, guess in guesses.items() if guess.field is None]
+    if not unmapped or not use_llm:
+        return guesses, "heuristic"
+
+    try:
+        llm_guesses = llm_map_columns(headers, sample_rows, client=client)
+    except LLMUnavailable:
+        return guesses, "heuristic"
+
+    # The vocabulary is deterministic and reviewed; it wins any disagreement.
+    claimed = {guess.field for guess in guesses.values() if guess.field}
+    for index in unmapped:
+        candidate = llm_guesses.get(index)
+        if candidate and candidate.field and candidate.field not in claimed:
+            guesses[index] = candidate
+            claimed.add(candidate.field)
+    return guesses, "llm"

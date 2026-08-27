@@ -51,6 +51,7 @@ class Fixture:
     font_size: float = 7.5
     rows_per_page: int = 40
     scanned: bool = False
+    needs_mapping: bool = False
     print_totals: bool = True
     print_claim_count: bool = True
     total_label: str = "TOTALS"
@@ -518,6 +519,35 @@ SCANNED = Fixture(
 )
 
 
+
+_UNKNOWN_COLUMNS = (
+    Column("Ref No", "claim_number", width=72),
+    Column("Occurrence Dt", "date_of_loss", width=66),
+    Column("Ntfn Dt", "date_reported", width=62),
+    Column("Cond", "claim_status", width=44),
+    Column("Pty", "claimant_name", width=94),
+    Column("Net Pd", "paid_total", align="right", width=66),
+    Column("O/S", "reserve_total", align="right", width=66),
+    Column("Recovered", "recovery_total", align="right", width=66),
+    Column("Gross Inc", "incurred_total", align="right", width=70),
+)
+
+
+UNKNOWN_FORMAT = Fixture(
+    name="unknown_format",
+    description="Headers the built-in vocabulary cannot place — needs mapping",
+    carrier="Ardmore Speciality Lines Limited",
+    named_insured="Whitfield Engineering Ltd",
+    policy_number="ASL/2024/00918",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    columns=_UNKNOWN_COLUMNS,
+    claims=_gl_claims(),
+    needs_mapping=True,
+)
+
+
 ALL_FIXTURES: tuple[Fixture, ...] = (
     US_BASIC,
     EU_FORMAT,
@@ -528,12 +558,16 @@ ALL_FIXTURES: tuple[Fixture, ...] = (
     RULED_TABLE,
     ARITHMETIC_ERROR,
     NULLS_NOT_ZEROS,
+    UNKNOWN_FORMAT,
     SCANNED,
 )
 
 BY_NAME: dict[str, Fixture] = {fixture.name: fixture for fixture in ALL_FIXTURES}
 
-#: Fixtures with a real text layer — the digital accuracy target applies here.
+#: Fixtures with a real text layer whose columns the vocabulary can place —
+#: the digital accuracy target applies to these.
 DIGITAL_FIXTURES: tuple[Fixture, ...] = tuple(
-    fixture for fixture in ALL_FIXTURES if not fixture.scanned
+    fixture
+    for fixture in ALL_FIXTURES
+    if not fixture.scanned and not fixture.needs_mapping
 )
