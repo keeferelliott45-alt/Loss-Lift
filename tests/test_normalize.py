@@ -12,8 +12,6 @@ from decimal import Decimal
 import pytest
 
 from core.normalize import (
-    DateOrderInference,
-    LocaleInference,
     NumberParse,
     clean_text,
     infer_date_order,

@@ -6,7 +6,6 @@ These are the numbers that decide whether the product may be charged for.
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 

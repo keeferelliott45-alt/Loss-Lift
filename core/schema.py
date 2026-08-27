@@ -449,6 +449,11 @@ class RawTable(BaseModel):
     header_line_index: int | None = None
     column_bounds: list[tuple[float, float]] = Field(default_factory=list)
 
+    #: Facts printed on the page itself. A fully scanned document has no text
+    #: layer to read these from, so the vision pass reports them here.
+    printed_claim_count: int | None = None
+    valuation_date_text: str | None = None
+
     @property
     def column_count(self) -> int:
         return len(self.headers)

@@ -22,7 +22,7 @@ from typing import Any, Sequence
 
 import pymupdf
 
-from tests.golden.fixtures import ALL_FIXTURES, BY_NAME, Column, Fixture
+from tests.golden.fixtures import ALL_FIXTURES, Column, Fixture
 
 EXPECTED_DIR = Path(__file__).parent / "expected"
 
@@ -230,7 +230,6 @@ def render(fixture: Fixture, path: Path) -> Path:
         )
         y += LINE_HEIGHT + 3
 
-        first_row_y = y
         for claim in chunk:
             _draw_row(
                 page, fixture,

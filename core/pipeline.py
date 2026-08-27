@@ -11,12 +11,12 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
-from core.extract_digital import DigitalExtraction, DocumentMetadata
-from core.ingest import IngestedFile, ingest, ingest_path
+from core.extract_digital import DocumentMetadata
+from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -31,10 +31,8 @@ from core.normalize import (
 )
 from core.profiles import (
     CarrierProfile,
-    FieldGuess,
     fingerprint,
     load_profile,
-    map_headers,
     page_top_text,
     resolve_columns,
 )
@@ -44,7 +42,6 @@ from core.schema import (
     MONEY_FIELDS,
     Claim,
     ClaimStatus,
-    ExtractionMethod,
     LineOfBusiness,
     LossRunDocument,
     NullReason,
@@ -401,6 +398,15 @@ def run_pipeline(
         )
 
     # Fingerprint the letterhead plus the header labels.
+    # A scanned page prints its valuation date and claim count like any other,
+    # but there is no text layer to read them from, so the vision pass reports
+    # them and they are used only where the digital pass found nothing.
+    for table in vision_tables:
+        if metadata.valuation_date_text is None and table.valuation_date_text:
+            metadata.valuation_date_text = table.valuation_date_text
+        if metadata.printed_claim_count is None and table.printed_claim_count:
+            metadata.printed_claim_count = table.printed_claim_count
+
     first_page_text = extraction.page_texts.get(
         min(extraction.page_texts), ""
     ) if extraction.page_texts else ""

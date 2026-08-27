@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -17,7 +15,7 @@ from core.extract_digital import (
     extract_pdf,
     split_cells,
 )
-from core.ingest import CACHE, ExtractionCache, IngestError, discard, ingest, ingest_path, sha256_bytes
+from core.ingest import ExtractionCache, IngestError, discard, ingest, ingest_path, sha256_bytes
 from core.schema import ExtractionMethod
 
 

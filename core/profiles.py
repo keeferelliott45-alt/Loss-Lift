@@ -23,10 +23,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
-from core.normalize import Locale, normalize_label
-from core.schema import CANONICAL_FIELDS, MONEY_FIELDS
+from core.normalize import normalize_label
+from core.schema import CANONICAL_FIELDS
 
 PROFILE_DIR = Path(__file__).resolve().parent.parent / "data" / "profiles"
 
@@ -554,12 +554,12 @@ def build_mapping_prompt(
     rest of the table never leaves the machine.
     """
     template = PROMPT_PATH.read_text(encoding="utf-8")
-    body = template.split("### Input", 1)[-1]
     instructions = template.split("### Input", 1)[0]
 
-    rows = []
-    for row in list(sample_rows)[:LLM_SAMPLE_ROWS]:
-        rows.append(" | ".join(str(cell) for cell in row))
+    rows = [
+        " | ".join(str(cell) for cell in row)
+        for row in list(sample_rows)[:LLM_SAMPLE_ROWS]
+    ]
     return (
         instructions.strip()
         + "\n\n### Input\n\nHeaders: "

@@ -12,16 +12,15 @@ can re-run it on every cell edit.
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 from core.schema import (
     MONEY_FIELDS,
     PAID_COMPONENT_FIELDS,
     RESERVE_COMPONENT_FIELDS,
     REVIEW_REASONS,
-    Claim,
     ClaimStatus,
     DocumentStatus,
     Finding,

@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal
 
 from core.schema import ClaimStatus, NullReason
 

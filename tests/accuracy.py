@@ -19,7 +19,7 @@ from typing import Any, Iterable, Sequence
 
 from core.pipeline import ExtractionResult, run_pipeline
 from core.schema import Claim, LossRunDocument, MONEY_FIELDS
-from tests.golden.generate import load_expected, load_meta
+from tests.golden.generate import load_expected
 
 
 @dataclass

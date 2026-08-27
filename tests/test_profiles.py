@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from pathlib import Path
 
 import pytest
 
-from core.pipeline import build_mapping, run_pipeline, sample_rows, save_confirmed_mapping
+from core.pipeline import run_pipeline, save_confirmed_mapping
 from core.profiles import (
     CarrierProfile,
-    FieldGuess,
     LLMUnavailable,
     ProfileError,
     build_mapping_prompt,

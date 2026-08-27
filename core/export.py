@@ -19,7 +19,7 @@ import io
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -32,7 +32,6 @@ from core.schema import (
     REDACTED_FIELDS,
     Claim,
     DocumentStatus,
-    Finding,
     LossRunDocument,
     ReconciliationResult,
     Severity,

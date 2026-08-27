@@ -8,7 +8,6 @@ Streamlit (spec section 7).
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
