@@ -137,6 +137,10 @@ def _result(document_id: str) -> ExtractionResult | None:
     return _state()["documents"].get(document_id)
 
 
+def _is_reviewed(document_id: str) -> bool:
+    return bool(st.session_state.get(f"reviewed-{document_id}"))
+
+
 def _store(result: ExtractionResult) -> None:
     """Register or refresh one document. Never touches any other document."""
     state = _state()
@@ -473,15 +477,17 @@ def _queue_summary() -> None:
     state = _state()
     results = [state["documents"][did] for did in state["order"]]
     statuses = [_status_of(result) for result in results]
+    reviewed_count = sum(1 for did in state["order"] if _is_reviewed(did))
 
     if state.pop("last_added", None):
         st.success(f"Added {len(results)} total document(s) to the queue.")
 
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("Documents", len(results))
     cols[1].metric("Needs mapping", statuses.count("mapping"))
     cols[2].metric("Needs review", statuses.count("needs_review"))
     cols[3].metric("Reconciled", statuses.count("clean"))
+    cols[4].metric("Reviewed", f"{reviewed_count} / {len(results)}")
 
 
 _SORT_OPTIONS = {
@@ -514,11 +520,19 @@ def _queue_toolbar_and_list() -> None:
     sort_choice = sort_by.selectbox(
         "Sort by", list(_SORT_OPTIONS), label_visibility="collapsed"
     )
+    hide_reviewed = st.checkbox(
+        "Hide reviewed",
+        key="hide_reviewed",
+        help="Already looked at these? Hide them so what's left to do is all "
+             "that's on screen.",
+    )
 
     visible_ids = []
     for document_id in state["order"]:
         result = _result(document_id)
         if result is None:
+            continue
+        if hide_reviewed and _is_reviewed(document_id):
             continue
         status = _status_of(result)
         if _STATUS_FILTERS[status_choice] not in (None, status):
@@ -538,15 +552,18 @@ def _queue_toolbar_and_list() -> None:
     visible_ids.sort(key=lambda did: _SORT_OPTIONS[sort_choice](_result(did)))
 
     if not visible_ids:
-        st.caption("No documents match this filter.")
+        st.caption(
+            "Nothing left to review." if hide_reviewed else "No documents match this filter."
+        )
         return
 
     _batch_export_bar(visible_ids)
     st.divider()
 
-    header = st.columns([0.4, 3, 1.5, 0.9, 1.3, 1.2, 0.8])
+    header = st.columns([0.4, 0.9, 2.6, 1.4, 0.9, 1.3, 1.1, 0.8])
     for col, title in zip(
-        header, ["", "Document", "Status", "Claims", "Total incurred", "Valuation", ""]
+        header,
+        ["", "Reviewed", "Document", "Status", "Claims", "Total incurred", "Valuation", ""],
     ):
         col.markdown(f"**{title}**")
 
@@ -557,16 +574,21 @@ def _queue_toolbar_and_list() -> None:
 def _queue_row(document_id: str) -> None:
     result = _result(document_id)
     document = result.document
+    reviewed = _is_reviewed(document_id)
 
     with st.container():
-        check, name, status_col, claims, incurred, valuation, action = st.columns(
-            [0.4, 3, 1.5, 0.9, 1.3, 1.2, 0.8]
+        check, done, name, status_col, claims, incurred, valuation, action = st.columns(
+            [0.4, 0.9, 2.6, 1.4, 0.9, 1.3, 1.1, 0.8]
         )
         check.checkbox("Select", key=f"select-{document_id}", label_visibility="collapsed")
+        done.checkbox(
+            "Reviewed", key=f"reviewed-{document_id}", label_visibility="collapsed"
+        )
+        filename_style = "opacity: 0.55;" if reviewed else ""
         name.markdown(
-            f"📄 **{document.source_filename}**  \n"
+            f"<div style='{filename_style}'>📄 <b>{document.source_filename}</b><br>"
             f"<span style='color: gray; font-size: 0.85rem;'>"
-            f"{document.carrier or 'Carrier unknown'}</span>",
+            f"{document.carrier or 'Carrier unknown'}</span></div>",
             unsafe_allow_html=True,
         )
         status_col.markdown(_status_pill(result), unsafe_allow_html=True)
@@ -679,20 +701,22 @@ def screen_workspace(document_id: str) -> None:
         )
     st.divider()
 
-    if result.needs_mapping:
-        screen_mapping(document_id, result)
-        return
+    # Streamlit's default rerun dimming reads as a stall on a heavy table, inviting re-clicks.
+    with st.spinner(f"Opening {result.document.source_filename}…"):
+        if result.needs_mapping:
+            screen_mapping(document_id, result)
+            return
 
-    stage = st.radio(
-        "Stage", [REVIEW, EXPORT],
-        format_func=lambda s: {"review": "Review", "export": "Export"}[s],
-        horizontal=True, label_visibility="collapsed",
-        key=f"stage-{document_id}",
-    )
-    if stage == REVIEW:
-        screen_review(document_id, result)
-    else:
-        screen_export(document_id, result)
+        stage = st.radio(
+            "Stage", [REVIEW, EXPORT],
+            format_func=lambda s: {"review": "Review", "export": "Export"}[s],
+            horizontal=True, label_visibility="collapsed",
+            key=f"stage-{document_id}",
+        )
+        if stage == REVIEW:
+            screen_review(document_id, result)
+        else:
+            screen_export(document_id, result)
 
 
 def screen_mapping(document_id: str, result: ExtractionResult) -> None:
