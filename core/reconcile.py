@@ -482,7 +482,12 @@ def r12_cross_page_duplicate(
 
 @rule("R-13")
 def r13_outliers(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
-    """A value far above the column median is usually a mis-parse."""
+    """A value far above the column median: a large loss, or a mis-parse.
+
+    Both readings are common — a book of medical-only claims with two serious
+    indemnity losses trips this legitimately — so the finding asks for a look
+    rather than asserting the number is wrong.
+    """
     findings: list[Finding] = []
     for field_name in MONEY_FIELDS:
         values = [
@@ -508,9 +513,11 @@ def r13_outliers(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]
                     claim_number=claim.claim_number,
                     field=field_name,
                     message=(
-                        f"{_label(field_name).capitalize()} {_fmt(value)} is more than "
-                        f"{config.outlier_multiple:g}x the column median "
-                        f"({_fmt(median)}). Check the decimal separator."
+                        f"{_label(field_name).capitalize()} {_fmt(value)} is far "
+                        f"above the rest of the book — over "
+                        f"{config.outlier_multiple:g}x the median of "
+                        f"{_fmt(median)}. Confirm it is a large loss and not a "
+                        f"misread amount."
                     ),
                     expected=f"<= {_fmt(ceiling)}",
                     actual=value,
