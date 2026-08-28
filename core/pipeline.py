@@ -7,6 +7,7 @@ UI does any of this work.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -51,6 +52,12 @@ from core.schema import (
     RawTable,
     ReconciliationResult,
     SourceMethod,
+)
+
+
+#: Labels that mark the one total covering every claim, not a section subtotal.
+GRAND_TOTAL_PATTERN = re.compile(
+    r"\b(?:grand|report|overall|final)\s+totals?\b", re.IGNORECASE
 )
 
 
@@ -246,6 +253,21 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     return text or None
 
 
+def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
+    """True for section headings and page furniture, not claims.
+
+    Documents grouped by policy period interleave "Policy Period: …" headings
+    between claims, and page footers add lines like "Report: LossRunSummary".
+    Both land in the claim-number column, where a trailing colon marks printed
+    label text — a real claim number never ends in one.
+    """
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return False
+    cell = row.cell(index).strip()
+    return bool(cell) and cell.endswith(":")
+
+
 def build_claims(
     tables: Sequence[RawTable],
     mapping: ColumnMapping,
@@ -266,6 +288,8 @@ def build_claims(
             table_mapping = build_mapping(table.headers, None, mapping.fingerprint)
 
         for row in table.rows:
+            if is_structural_row(row, table_mapping):
+                continue
             claim = build_claim(
                 row, table_mapping, locale, date_order,
                 dash_means_zero=dash_means_zero,
@@ -296,7 +320,7 @@ def collect_printed_totals(
 ) -> dict[str, Decimal | None]:
     """Read the footer totals row — the numbers R-04 checks against."""
     best: dict[str, Decimal | None] = {}
-    best_count = 0
+    best_rank = (0, 0)
     for table in tables:
         for row in table.total_rows:
             totals: dict[str, Decimal | None] = {}
@@ -309,8 +333,12 @@ def collect_printed_totals(
                 parsed = parse_money(cell, locale)
                 if parsed.value is not None:
                     totals[field_name] = parsed.value
-            if len(totals) > best_count:
-                best, best_count = totals, len(totals)
+            # Documents grouped by policy period print a subtotal per section
+            # and one grand total. Only the grand total covers every claim, so
+            # it outranks a subtotal no matter which was seen first.
+            rank = (1 if GRAND_TOTAL_PATTERN.search(row.text()) else 0, len(totals))
+            if totals and rank > best_rank:
+                best, best_rank = totals, rank
     return best
 
 

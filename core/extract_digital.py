@@ -27,6 +27,12 @@ from core.schema import RawRow, RawTable
 #: A line whose leading words say "total" closes the table.
 TOTAL_ROW_PATTERN = re.compile(r"\b(?:grand\s+)?(?:report\s+)?totals?\b", re.IGNORECASE)
 
+#: Carriers that group claims by policy period label each subtotal with the
+#: period first — "01/01/2018 - 12/31/2018 Totals:" — pushing the keyword past
+#: the leading cell. A trailing "Total(s):" is specific enough to catch those
+#: without matching a loss description that merely mentions a total.
+TRAILING_TOTAL_LABEL = re.compile(r"\btotals?\s*:", re.IGNORECASE)
+
 #: Minimum blank width, in points, that counts as a column gutter.
 MIN_GUTTER = 4.0
 
@@ -221,7 +227,69 @@ def assign_to_columns(
 
 
 def _is_total_line(line: Line) -> bool:
-    return bool(TOTAL_ROW_PATTERN.search(line.leading_text(3)))
+    if TOTAL_ROW_PATTERN.search(line.leading_text(3)):
+        return True
+    return bool(TRAILING_TOTAL_LABEL.search(line.leading_text(8)))
+
+
+def _merge_total_row(label: RawRow, values: Sequence[str]) -> RawRow:
+    """Fold a totals label and the amounts line beneath it into one row."""
+    width = max(len(label.cells), len(values))
+    merged = [
+        (values[index] if index < len(values) and values[index] else "")
+        or (label.cells[index] if index < len(label.cells) else "")
+        for index in range(width)
+    ]
+    return RawRow(
+        cells=merged,
+        page=label.page,
+        line_index=label.line_index,
+        bbox=label.bbox,
+        kind="total",
+    )
+
+
+def _money_token_count(line: Line) -> int:
+    """Words that look like printed amounts rather than labels or dates."""
+    return sum(
+        1
+        for word in line.words
+        if any(char.isdigit() for char in word.text)
+        and any(char in word.text for char in "$€£")
+    )
+
+
+def _merge_header_fragments(
+    lines: Sequence[Line], header_index: int, char_width: float
+) -> Line | None:
+    """Fold a wrapped header's upper half into the line that scored as header.
+
+    Loss runs routinely stack a column label across two lines — "Date of" above
+    "Loss", "Outstanding" above "Reserves". Only the lower line scores as the
+    header, so without this the labels arrive truncated and map to nothing.
+    Returns None unless merging makes the header more recognisable, so a layout
+    that simply has text above its header is left alone.
+    """
+    header = next((line for line in lines if line.index == header_index), None)
+    above = next((line for line in lines if line.index == header_index - 1), None)
+    if header is None or above is None or not above.words:
+        return None
+    if any(char.isdigit() for word in above.words for char in word.text):
+        return None
+
+    # Only a line sitting directly on top of the header can be its upper half.
+    gap = header.words[0].top - above.words[0].top
+    height = max(word.bottom - word.top for word in header.words)
+    if not 0 < gap <= height * 2:
+        return None
+
+    merged = Line(
+        words=tuple(sorted(above.words + header.words, key=lambda word: word.x0)),
+        index=header_index,
+    )
+    before = [text for text, _, _ in split_cells(header, char_width)]
+    after = [text for text, _, _ in split_cells(merged, char_width)]
+    return merged if header_score(after) > header_score(before) else None
 
 
 def find_header_line(
@@ -256,9 +324,16 @@ def extract_page_table(page: pdfplumber.page.Page, page_number: int) -> RawTable
     # A ruled grid usually stops above the footer, leaving the printed totals
     # outside the detected table. R-04 depends on those totals, so borrow them
     # from the word pass when the two agree on the column count.
-    if not ruled.total_rows and positioned is not None:
+    if not ruled.total_rows and positioned is not None and positioned.total_rows:
         if positioned.column_count == ruled.column_count:
             ruled.total_rows = positioned.total_rows
+        else:
+            # The two passes disagree on how many columns there are, so the
+            # totals cannot be transplanted by index without landing money in
+            # the wrong field — a wrong total is worse than no total. The word
+            # pass is at least internally consistent, and a table with no
+            # printed totals cannot run R-04, the check that sells the product.
+            return positioned
     return ruled
 
 
@@ -351,7 +426,10 @@ def _extract_positioned_table(
     # Assign the header's individual words, not the gap-split cells: splitting
     # first is what merged "Paid Total Recovery Total Incurred Total" into one
     # label, and re-using that merged blob would defeat the comparison below.
-    header_line = next(
+    wrapped = _merge_header_fragments(lines, header_index, char_width)
+    if wrapped is not None:
+        header_cells = split_cells(wrapped, char_width)
+    header_line = wrapped or next(
         (line for line in lines if line.index == header_index),
         Line(
             words=tuple(
@@ -380,23 +458,44 @@ def _extract_positioned_table(
 
     rows: list[RawRow] = []
     total_rows: list[RawRow] = []
+    # A totals label does not always sit on the same line as its amounts: real
+    # footers print "<period> Totals:" and drop the count and money onto the
+    # next line. Fold that pair back into one row so the amounts stay attached
+    # to the label that says which total they are.
+    pending_label: RawRow | None = None
     for line in body:
         cells = assign_to_columns(line, bounds)
+        is_total = _is_total_line(line)
+        money_here = _money_token_count(line)
+
+        if pending_label is not None:
+            if not is_total and money_here >= 2:
+                total_rows.append(_merge_total_row(pending_label, cells))
+                pending_label = None
+                continue
+            total_rows.append(pending_label)
+            pending_label = None
+
         row = RawRow(
             cells=cells,
             page=page_number,
             line_index=line.index,
             bbox=line.bbox,
-            kind="total" if _is_total_line(line) else "data",
+            kind="total" if is_total else "data",
         )
         if row.is_blank():
             continue
         if row.kind == "total":
-            total_rows.append(row)
+            if money_here < 2:
+                pending_label = row  # its amounts are on the line below
+            else:
+                total_rows.append(row)
         elif looks_like_header(cells):
             continue  # a header repeated mid-page
         else:
             rows.append(row)
+    if pending_label is not None:
+        total_rows.append(pending_label)
 
     if not rows and not total_rows:
         return None
@@ -449,6 +548,13 @@ _VALUATION_PATTERNS = (
 
 _PERIOD_PATTERN = re.compile(
     r"policy\s*(?:period|term|dates?)\s*[:\-]?\s*(.+?)\s*(?:to|through|thru|[-–])\s*(\S+)",
+    re.IGNORECASE,
+)
+
+#: A grand-total label and the claim count beneath it, e.g. "Report Totals:"
+#: on one line and "# Claims: 50" on the next.
+GRAND_COUNT_PATTERN = re.compile(
+    r"(?:grand|report|overall|final)\s+totals?\s*:?[\s#]*claims?\s*:?\s*(\d[\d,]*)",
     re.IGNORECASE,
 )
 
@@ -554,7 +660,22 @@ def extract_pdf(
 
     first_text = page_texts.get(min(page_texts), "") if page_texts else ""
     metadata = extract_metadata(first_text)
-    if metadata.printed_claim_count is None:
+
+    # A document grouped by policy period prints a claim count per section as
+    # well as one for the whole report. Page 1 carries the first section's
+    # count, so the grand total has to win wherever it appears — otherwise R-05
+    # compares every extracted claim against a single section's tally.
+    grand_count = next(
+        (
+            parse_int(match.group(1))
+            for _, text in sorted(page_texts.items(), reverse=True)
+            if (match := GRAND_COUNT_PATTERN.search(text))
+        ),
+        None,
+    )
+    if grand_count is not None:
+        metadata.printed_claim_count = grand_count
+    elif metadata.printed_claim_count is None:
         # The claim count is usually printed under the totals on the last page.
         for _, text in sorted(page_texts.items(), reverse=True):
             found = extract_metadata(text).printed_claim_count

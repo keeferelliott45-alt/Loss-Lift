@@ -441,6 +441,9 @@ class RawRow(BaseModel):
     def cell(self, index: int) -> str:
         return self.cells[index] if 0 <= index < len(self.cells) else ""
 
+    def text(self) -> str:
+        return " ".join(cell for cell in self.cells if cell.strip())
+
     def is_blank(self) -> bool:
         return not any(cell.strip() for cell in self.cells)
 
