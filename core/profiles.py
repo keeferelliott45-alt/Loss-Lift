@@ -57,6 +57,8 @@ LABEL_SYNONYMS: dict[str, str] = {
     "dol": "date_of_loss", "loss dt": "date_of_loss",
     "date of accident": "date_of_loss", "accident date": "date_of_loss",
     "occurrence date": "date_of_loss", "doi": "date_of_loss",
+    # Workers' comp reports date the injury rather than the loss.
+    "date of injury": "date_of_loss", "injury date": "date_of_loss",
     "date reported": "date_reported", "reported": "date_reported",
     "rptd": "date_reported", "rpt dt": "date_reported",
     "report date": "date_reported", "reported date": "date_reported",
@@ -83,6 +85,10 @@ LABEL_SYNONYMS: dict[str, str] = {
     "recovery": "recovery_total", "recoveries": "recovery_total",
     "recov": "recovery_total", "subrogation": "recovery_total",
     "subro": "recovery_total", "salvage": "recovery_total",
+    "deductible recoverable": "recovery_total",
+    "deductible reimbursement": "recovery_total",
+    # Allocated loss adjustment expense, standing alone as its own column.
+    "alae": "paid_expense", "lae": "paid_expense",
     "incurred": "incurred_total", "total incurred": "incurred_total",
     "net incurred": "incurred_total", "incurred total": "incurred_total",
     "total": "incurred_total",
