@@ -490,6 +490,14 @@ def _queue_summary() -> None:
     cols[4].metric("Reviewed", f"{reviewed_count} / {len(results)}")
 
 
+#: Widths and headings for the queue table. The heading row and the data rows
+#: are laid out separately, so they share these to stay aligned.
+_QUEUE_COLUMNS = [0.6, 0.8, 2.5, 1.4, 0.9, 1.3, 1.1, 0.8]
+_QUEUE_HEADINGS = [
+    "Export", "Reviewed", "Document", "Status", "Claims",
+    "Total incurred", "Valuation", "",
+]
+
 _SORT_OPTIONS = {
     "Upload order": lambda r: 0,
     "Filename": lambda r: r.document.source_filename.lower(),
@@ -560,11 +568,8 @@ def _queue_toolbar_and_list() -> None:
     _batch_export_bar(visible_ids)
     st.divider()
 
-    header = st.columns([0.4, 0.9, 2.6, 1.4, 0.9, 1.3, 1.1, 0.8])
-    for col, title in zip(
-        header,
-        ["", "Reviewed", "Document", "Status", "Claims", "Total incurred", "Valuation", ""],
-    ):
+    header = st.columns(_QUEUE_COLUMNS)
+    for col, title in zip(header, _QUEUE_HEADINGS):
         col.markdown(f"**{title}**")
 
     for document_id in visible_ids:
@@ -578,11 +583,15 @@ def _queue_row(document_id: str) -> None:
 
     with st.container():
         check, done, name, status_col, claims, incurred, valuation, action = st.columns(
-            [0.4, 0.9, 2.6, 1.4, 0.9, 1.3, 1.1, 0.8]
+            _QUEUE_COLUMNS
         )
-        check.checkbox("Select", key=f"select-{document_id}", label_visibility="collapsed")
+        check.checkbox(
+            "Export", key=f"select-{document_id}", label_visibility="collapsed",
+            help="Include this report in the batch export above.",
+        )
         done.checkbox(
-            "Reviewed", key=f"reviewed-{document_id}", label_visibility="collapsed"
+            "Reviewed", key=f"reviewed-{document_id}", label_visibility="collapsed",
+            help="Mark it as looked at, so you can hide it and see what is left.",
         )
         filename_style = "opacity: 0.55;" if reviewed else ""
         name.markdown(
