@@ -11,6 +11,10 @@ One workbook, four sheets:
   timestamp and reconciliation status, so the workbook can be audited back to
   the document it came from.
 
+``build_account_workbook`` writes a different shape for a whole account —
+several runs for one insured merged, with each claim's development between
+valuations and a sheet naming every file the history came from.
+
 The redaction toggle drops claimant names and loss descriptions (spec
 section 9).
 """
@@ -21,7 +25,7 @@ import io
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -29,6 +33,9 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from core.summary import summarise_by_period
+
+if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
+    from core.account import AccountRollup
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -455,6 +462,113 @@ def to_bytes(
     buffer = io.BytesIO()
     build_workbook(document, result, **kwargs).save(buffer)
     return buffer.getvalue()
+
+
+def _header_row(sheet: Worksheet, headers: Sequence[str]) -> dict[int, int]:
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = len(title) + 2
+    return widths
+
+
+def _fill_row(
+    sheet: Worksheet, row_index: int, values: Sequence[Any], widths: dict[int, int]
+) -> None:
+    for column_index, value in enumerate(values, start=1):
+        cell = sheet.cell(row=row_index, column=column_index, value=value)
+        if isinstance(value, float):
+            cell.number_format = MONEY_FORMAT
+        elif isinstance(value, date):
+            cell.number_format = DATE_FORMAT
+        if value is not None:
+            widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+
+def build_account_workbook(account: "AccountRollup", *, redact: bool = False) -> Workbook:
+    """One insured's merged loss history.
+
+    Deliberately not the single-document workbook pointed at merged claims: the
+    provenance of a merged history is several files with several valuation
+    dates, and Source Info can only name one. The Sources sheet names them all.
+    """
+    workbook = Workbook()
+
+    claims_sheet = workbook.active
+    claims_sheet.title = "Claims"
+    headers = ["Claim number", "Date of loss", "Status", "Carrier", "Valued at",
+               "Paid", "Reserve", "Recovery", "Incurred", "Development", "Runs seen in"]
+    if not redact:
+        headers.insert(3, "Claimant")
+    widths = _header_row(claims_sheet, headers)
+
+    for row_index, history in enumerate(account.histories, start=2):
+        claim = history.current
+        values: list[Any] = [
+            history.claim_number,
+            claim.date_of_loss,
+            claim.claim_status.value if claim.claim_status else None,
+        ]
+        if not redact:
+            values.append(claim.claimant_name)
+        values += [
+            ", ".join(history.carriers) or None,
+            history.valued_at,
+            _float(claim.paid_total),
+            _float(claim.reserve_total),
+            _float(claim.recovery_total),
+            _float(claim.incurred_total),
+            _float(history.development),
+            len(history.appearances),
+        ]
+        _fill_row(claims_sheet, row_index, values, widths)
+        if history.development and history.development > 0:
+            claims_sheet.cell(row=row_index, column=len(headers) - 1).fill = _FINDING_FILL
+    claims_sheet.freeze_panes = "A2"
+    _autosize(claims_sheet, widths)
+
+    summary_sheet = workbook.create_sheet("Loss Summary")
+    widths = _header_row(summary_sheet, ["Policy term", "Claims", "Open", "Closed",
+                                         "Paid", "Reserves", "Recoveries", "Incurred",
+                                         "Largest loss"])
+    for row_index, period in enumerate(account.periods, start=2):
+        _fill_row(summary_sheet, row_index, [
+            period.label, period.claims, period.open_claims, period.closed_claims,
+            float(period.totals["paid_total"]),
+            float(period.totals["reserve_total"]),
+            float(period.totals["recovery_total"]),
+            float(period.totals["incurred_total"]),
+            _float(period.largest_loss),
+        ], widths)
+    summary_sheet.freeze_panes = "A2"
+    _autosize(summary_sheet, widths)
+
+    sources_sheet = workbook.create_sheet("Sources")
+    widths = _header_row(sources_sheet, ["File", "Carrier", "Valuation date",
+                                         "Claims", "SHA-256"])
+    for row_index, document in enumerate(account.documents, start=2):
+        _fill_row(sources_sheet, row_index, [
+            document.source_filename,
+            document.carrier,
+            document.valuation_date,
+            len(document.claims),
+            document.file_sha256,
+        ], widths)
+    _autosize(sources_sheet, widths)
+    return workbook
+
+
+def account_to_bytes(account: "AccountRollup", **kwargs: Any) -> bytes:
+    """The account workbook as bytes, for a Streamlit download button."""
+    buffer = io.BytesIO()
+    build_account_workbook(account, **kwargs).save(buffer)
+    return buffer.getvalue()
+
+
+def _float(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
 
 
 def write_xlsx(

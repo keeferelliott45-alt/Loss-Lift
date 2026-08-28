@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+from typing import Sequence
 
 from core.schema import Claim, ClaimStatus, LossRunDocument, PrintedSection
 
@@ -124,18 +125,29 @@ def _summarise(
 
 
 def summarise_by_period(document: LossRunDocument) -> list[PeriodSummary]:
-    """Break the document's claims down by policy term, newest term last.
+    """Break one document's claims down by policy term."""
+    return summarise_periods(
+        document.claims, document.policy_periods, document.printed_sections
+    )
 
-    Uses the terms the document declares. A loss run that declares none — a
-    single-term report, or one that never says — falls back to the calendar
-    year of each loss, which is how a reviewer would group them by hand.
+
+def summarise_periods(
+    claims: list[Claim],
+    declared_periods: Sequence[tuple[date, date]] = (),
+    printed_sections: Sequence[PrintedSection] = (),
+) -> list[PeriodSummary]:
+    """Break claims down by policy term, newest term last.
+
+    Takes claims rather than a document so the same breakdown works for one
+    loss run or for several merged into an account. Uses the terms declared;
+    with none, falls back to the calendar year of each loss, which is how a
+    reviewer would group them by hand.
     """
-    claims = document.claims
     if not claims:
         return []
 
-    periods = sorted(document.policy_periods)
-    sections = list(document.printed_sections)
+    periods = sorted(declared_periods)
+    sections = list(printed_sections)
 
     if periods:
         summaries: list[PeriodSummary] = []

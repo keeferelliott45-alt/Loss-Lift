@@ -36,6 +36,7 @@ from core.pipeline import (
     to_records,
 )
 from core.profiles import list_profiles, llm_enabled
+from core.account import UNNAMED_ACCOUNT, build_accounts
 from core.summary import summarise_by_period
 from core.schema import (
     CANONICAL_FIELDS,
@@ -434,6 +435,7 @@ def screen_queue() -> None:
 
     st.divider()
     _queue_summary()
+    _accounts_panel()
     st.divider()
     _queue_toolbar_and_list()
     st.divider()
@@ -927,6 +929,95 @@ def _period_summary(document) -> None:
             ),
         })
     st.dataframe(rows, hide_index=True, width="stretch")
+
+
+def _accounts_panel() -> None:
+    """Loss runs for one insured, merged into the history a submission asks for.
+
+    Runs arrive one per carrier per term, so the document an underwriter prices
+    from has to be assembled. Only shown once an insured has more than one run,
+    since merging one run with nothing is the review screen again.
+    """
+    state = _state()
+    documents = [
+        state["documents"][did].document
+        for did in state["order"]
+        if not state["documents"][did].needs_mapping
+    ]
+    accounts = [
+        account
+        for account in build_accounts(documents)
+        if len(account.documents) > 1 and account.name != UNNAMED_ACCOUNT
+    ]
+    if not accounts:
+        return
+
+    st.markdown("### Accounts")
+    st.caption(
+        "Loss runs filed under the same insured, merged. Where a claim appears "
+        "in more than one run, the newest valuation is the one carried forward."
+    )
+    for account in accounts:
+        with st.expander(
+            f"{account.name} — {len(account.documents)} loss runs, "
+            f"{len(account.histories)} claims"
+        ):
+            st.caption(
+                "Valued at "
+                + ", ".join(d.isoformat() for d in account.valuation_dates)
+                + " · " + ", ".join(
+                    d.source_filename for d in account.documents
+                )
+            )
+            st.dataframe(
+                [
+                    {
+                        "Policy term": period.label,
+                        "Claims": period.claims,
+                        "Open": period.open_claims,
+                        "Paid": _money(period.totals["paid_total"]),
+                        "Reserves": _money(period.totals["reserve_total"]),
+                        "Incurred": _money(period.totals["incurred_total"]),
+                    }
+                    for period in account.periods
+                ],
+                hide_index=True, width="stretch",
+            )
+
+            if account.developed:
+                st.markdown("**Claims that moved between valuations**")
+                st.dataframe(
+                    [
+                        {
+                            "Claim #": history.claim_number,
+                            "Loss date": (
+                                history.current.date_of_loss.isoformat()
+                                if history.current.date_of_loss else "—"
+                            ),
+                            "Incurred now": _money(history.current.incurred_total),
+                            "Movement": _money(history.development),
+                            "Runs": len(history.appearances),
+                        }
+                        for history in account.developed
+                    ],
+                    hide_index=True, width="stretch",
+                )
+
+            if account.dropped:
+                st.caption(
+                    f"{len(account.dropped)} claim(s) appear in an earlier run but "
+                    f"not in a later one covering the same term: "
+                    + ", ".join(h.claim_number for h in account.dropped[:8])
+                    + ". Confirm they were closed and purged rather than left out."
+                )
+
+            st.download_button(
+                "Download account workbook",
+                data=export_module.account_to_bytes(account),
+                file_name=f"{account.name.replace(' ', '_')}_loss_history.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"account-dl-{account.name}",
+            )
 
 
 def screen_review(document_id: str, result: ExtractionResult) -> None:
