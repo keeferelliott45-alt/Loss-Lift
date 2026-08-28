@@ -148,6 +148,92 @@ def test_period_spans_every_section(result):
     assert result.document.policy_period_end == date(2024, 12, 31)
 
 
+WRAPPED = (
+    ("W-01", "Ecks, E", "1/9/2024", "Closed", 400, "rear-ended while stopped, neck and back soreness"),
+    ("W-02", "Wye, W", "4/2/2024", "Open", 600, "slipped on ice, contusion back of head, right hip"),
+    ("W-03", "Zed, Z", "8/8/2024", "Closed", 300, "MOVING SEAT WITH TWO WHEEL DOLLY, LEFT SHOULDER"),
+    ("W-04", "Que, Q", "11/5/2024", "Open", 700, "lifted wheelchair into position, left shoulder"),
+)
+
+#: The tagline every page of a real report carries under the claims.
+STRAPLINE = "delivering what matters most."
+
+
+def _build_wrapped(path) -> None:
+    """Two pages, a repeated footer, and descriptions that wrap across columns."""
+    doc = pymupdf.open()
+    for page_number, rows in ((1, WRAPPED[:2]), (2, WRAPPED[2:])):
+        page = doc.new_page(width=792, height=612)
+        _write(page, "ACME PUBLIC RISK POOL", 40, 30)
+        _write(page, "Printed: 3/1/2025 10:00:00 AM", 300, 30)
+        _write(page, "Numbers As of 12/31/2024", 40, 44)
+        for x, upper, lower in COLUMNS:
+            if upper:
+                _write(page, upper, x, 70)
+            _write(page, lower, x, 82)
+
+        y = 105
+        for number, claimant, loss, status, paid, description in rows:
+            for (x, _, _), value in zip(
+                COLUMNS,
+                (number, claimant, loss, status, _money(paid), _money(0),
+                 _money(0), _money(paid)),
+            ):
+                _write(page, value, x, y)
+            y += 11
+            # The description starts under the claimant column and runs right,
+            # so its words cross the date and money column boundaries.
+            words = description.split()
+            third = max(1, len(words) // 3)
+            for x, chunk in zip(
+                (130, 260, 400),
+                (words[:third], words[third:third * 2], words[third * 2:]),
+            ):
+                if chunk:
+                    _write(page, " ".join(chunk), x, y)
+            y += 14
+
+        if page_number == 2:
+            _write(page, "Report Totals:", 40, y)
+            _write(page, f"# Claims: {len(WRAPPED)}", 130, y + 11)
+            paid_total = sum(row[4] for row in WRAPPED)
+            for (x, _, _), value in zip(
+                COLUMNS[4:], (paid_total, 0, 0, paid_total)
+            ):
+                _write(page, _money(value), x, y + 11)
+            y += 30
+
+        _write(page, STRAPLINE, 40, 560)
+        _write(page, f"Page {page_number} of 2", 300, 560)
+    doc.save(str(path))
+    doc.close()
+
+
+@pytest.fixture(scope="module")
+def wrapped(tmp_path_factory):
+    path = tmp_path_factory.mktemp("wrapped") / "wrapped.pdf"
+    _build_wrapped(path)
+    return run_pipeline(path, use_vision=False)
+
+
+def test_repeated_footer_is_not_reported_as_skipped_data(wrapped):
+    """A strapline on every page is furniture, not a claim the app lost."""
+    assert [claim.claim_number for claim in wrapped.document.claims] == [
+        row[0] for row in WRAPPED
+    ]
+    assert wrapped.warnings == []
+
+
+def test_wrapped_description_is_kept_whole(wrapped):
+    """A description spilling across columns must not stop at the first one."""
+    descriptions = {
+        claim.claim_number: (claim.loss_description or "")
+        for claim in wrapped.document.claims
+    }
+    for number, _, _, _, _, expected in WRAPPED:
+        assert descriptions[number] == expected
+
+
 def test_document_reconciles_clean(result):
     """Nothing above is wrong, so nothing should be reported as wrong."""
     errors = [

@@ -237,20 +237,60 @@ def build_claim(
     )
 
 
+#: "Page 3 of 8" and friends. A footer often shares its line with a strapline,
+#: and the page number is the one part that changes, so it has to come out
+#: before two pages' footers can be compared.
+_PAGE_MARKER = re.compile(r"\bpage\s+\d+\s*(?:of\s*\d+)?\b", re.IGNORECASE)
+
+
+def _normalised(row: RawRow) -> str:
+    text = " ".join(row.text().lower().split())
+    return " ".join(_PAGE_MARKER.sub(" ", text).split())
+
+
+def page_furniture(tables: Sequence[RawTable]) -> set[str]:
+    """Row text that repeats across pages: a running header, footer or strapline.
+
+    A claim appears once. A line printed on most pages of the document is the
+    carrier's letterhead, its tagline or a column caption, and treating those as
+    skipped claim data buries the warnings that matter under one entry per page.
+    Needs at least two pages: on a single page a repeated line cannot be told
+    apart from data.
+    """
+    pages = {table.page for table in tables}
+    if len(pages) < 2:
+        return set()
+
+    seen: dict[str, set[int]] = {}
+    for table in tables:
+        for row in list(table.rows) + list(table.total_rows):
+            text = _normalised(row)
+            if text:
+                seen.setdefault(text, set()).add(table.page)
+    threshold = max(2, len(pages) // 2)
+    return {text for text, on in seen.items() if len(on) >= threshold}
+
+
 def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     """Text from a wrapped row that belongs to the claim above it."""
     values = _row_values(row, mapping)
     if clean_text(values.get("claim_number", "")):
         return None
-    if any(values.get(name, "").strip() for name in MONEY_FIELDS):
-        return None
-    text = clean_text(
-        " ".join(
-            values.get(name, "")
-            for name in ("loss_description", "claimant_name", "cause_of_loss")
-        )
-    )
-    return text or None
+
+    # A wrapped description runs the width of the row, so its words land in
+    # whichever columns they cross, money and date columns included. What marks
+    # a row as data is whether those cells parse: "WHEEL" under a date column
+    # is prose, and rejecting the row for it drops the description entirely.
+    for name in MONEY_FIELDS:
+        if parse_money(values.get(name, ""), None).value is not None:
+            return None
+    for name in DATE_FIELDS:
+        if parse_date(values.get(name, ""), None).value is not None:
+            return None
+
+    # Reading only the text-typed columns truncated the description at the
+    # first column boundary, so take the whole line.
+    return clean_text(" ".join(row.cells)) or None
 
 
 def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
@@ -283,6 +323,7 @@ def build_claims(
     """Normalise every row of every page, folding wrapped lines into their claim."""
     claims: list[Claim] = []
     warnings: list[str] = []
+    furniture = page_furniture(tables)
 
     for table in tables:
         table_mapping = mapping
@@ -292,6 +333,9 @@ def build_claims(
         for row in table.rows:
             if is_structural_row(row, table_mapping):
                 continue
+            text = _normalised(row)
+            if not text or text in furniture:
+                continue  # a running header, footer or page marker
             claim = build_claim(
                 row, table_mapping, locale, date_order,
                 dash_means_zero=dash_means_zero,
