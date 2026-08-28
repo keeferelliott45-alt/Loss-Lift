@@ -36,6 +36,7 @@ from core.pipeline import (
     to_records,
 )
 from core.profiles import list_profiles, llm_enabled
+from core.summary import summarise_by_period
 from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
@@ -876,6 +877,58 @@ def _loss_snapshot(document) -> None:
         st.caption(f"No claims at or above {threshold:,.0f}.")
 
 
+def _period_summary(document) -> None:
+    """Claims by policy term — the loss history a submission actually asks for.
+
+    Where the carrier printed a subtotal per term, each row says whether that
+    term ties to it. Knowing which year is out, and by how much, is what a
+    reviewer can act on; a single document-level pass or fail is not.
+    """
+    periods = summarise_by_period(document)
+    if len(periods) < 2:
+        return  # a single term is the snapshot above, said twice
+
+    st.markdown("**Loss summary by policy term**")
+    checked = [period for period in periods if period.has_printed_check]
+    if checked:
+        agree = sum(1 for period in checked if period.ties())
+        if agree == len(checked):
+            st.markdown(
+                f'<div class="ll-status ll-status-pass">✓ All {agree} policy '
+                f"terms tie to the totals printed for them</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="ll-status ll-status-fail">{len(checked) - agree} of '
+                f"{len(checked)} policy terms do not tie to the totals printed "
+                f"for them</div>",
+                unsafe_allow_html=True,
+            )
+
+    rows = []
+    for period in periods:
+        ties = period.ties()
+        difference = period.difference("incurred_total")
+        rows.append({
+            "Policy term": period.label,
+            "Claims": period.claims,
+            "Open": period.open_claims,
+            "Closed": period.closed_claims,
+            "Paid": _money(period.totals["paid_total"]),
+            "Reserves": _money(period.totals["reserve_total"]),
+            "Incurred": _money(period.totals["incurred_total"]),
+            "Largest": _money(period.largest_loss),
+            "Ties to carrier": (
+                "—" if ties is None
+                else "✓" if ties
+                else f"off by {difference:,.2f}" if difference
+                else "differs"
+            ),
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+
+
 def screen_review(document_id: str, result: ExtractionResult) -> None:
     if result.mapping.source == "profile":
         st.info(
@@ -889,6 +942,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         _document_facts(result)
         _document_notes(result)
 
+    _period_summary(result.document)
     _loss_snapshot(result.document)
 
     findings = result.reconciliation.findings

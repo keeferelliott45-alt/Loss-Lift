@@ -1,9 +1,11 @@
 """Stage 7 — export (spec section 5).
 
-One workbook, three sheets:
+One workbook, four sheets:
 
 * **Claims** — the table, in the chosen column order, with cells that carry a
   finding shaded amber and vision-extracted cells marked.
+* **Loss Summary** — claims by policy term, each checked against the subtotal
+  the carrier printed for that term.
 * **Exceptions** — every finding, errors first, with expected, actual and delta.
 * **Source Info** — filename, hash, valuation date, extraction method,
   timestamp and reconciliation status, so the workbook can be audited back to
@@ -26,6 +28,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from core.summary import summarise_by_period
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -282,6 +285,55 @@ def _write_exceptions_sheet(
     _autosize(sheet, widths)
 
 
+def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
+    """Claims by policy term — the loss history a submission asks for.
+
+    "Ties to carrier" is the column that matters: it says, per term, whether
+    these numbers match the subtotal the carrier printed for that term.
+    """
+    headers = ["Policy term", "Claims", "Open", "Closed", "Paid", "Reserves",
+               "Recoveries", "Incurred", "Largest loss", "Carrier printed",
+               "Ties to carrier"]
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = len(title) + 2
+
+    periods = summarise_by_period(document)
+    for row_index, period in enumerate(periods, start=2):
+        ties = period.ties()
+        printed = period.printed_totals.get("incurred_total")
+        values = [
+            period.label,
+            period.claims,
+            period.open_claims,
+            period.closed_claims,
+            float(period.totals["paid_total"]),
+            float(period.totals["reserve_total"]),
+            float(period.totals["recovery_total"]),
+            float(period.totals["incurred_total"]),
+            float(period.largest_loss) if period.largest_loss is not None else None,
+            float(printed) if printed is not None else None,
+            "not printed" if ties is None else "yes" if ties else "no",
+        ]
+        for column_index, value in enumerate(values, start=1):
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            if isinstance(value, float):
+                cell.number_format = MONEY_FORMAT
+            if ties is False:
+                cell.fill = _ERROR_FILL
+            if value is not None:
+                widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+    if not periods:
+        sheet.cell(row=2, column=1, value="No claims to summarise.")
+
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
 def _write_source_sheet(
     sheet: Worksheet,
     document: LossRunDocument,
@@ -374,7 +426,7 @@ def build_workbook(
     redact: bool = False,
     include_provenance: bool = True,
 ) -> Workbook:
-    """Build the three-sheet workbook."""
+    """Build the workbook: claims, loss summary, exceptions and provenance."""
     columns = resolve_columns(
         template, redact=redact, include_provenance=include_provenance
     )
@@ -382,6 +434,7 @@ def build_workbook(
     claims_sheet = workbook.active
     claims_sheet.title = "Claims"
     _write_claims_sheet(claims_sheet, document, columns, result)
+    _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
     _write_exceptions_sheet(workbook.create_sheet("Exceptions"), result)
     _write_source_sheet(
         workbook.create_sheet("Source Info"),

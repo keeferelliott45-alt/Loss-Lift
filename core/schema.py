@@ -211,6 +211,24 @@ class Claim(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class PrintedSection(BaseModel):
+    """A subtotal the carrier printed under one policy period.
+
+    Loss runs covering several terms print a total per term as well as one for
+    the report. Each of these is a number the carrier committed to, so each is
+    something the extracted claims for that term can be checked against.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    period_start: date | None = None
+    period_end: date | None = None
+    printed_totals: dict[str, Money | None] = Field(default_factory=dict)
+    printed_claim_count: int | None = None
+    page: int = 1
+
+
 class LossRunDocument(BaseModel):
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
@@ -233,6 +251,11 @@ class LossRunDocument(BaseModel):
 
     printed_totals: dict[str, Money | None] = Field(default_factory=dict)
     printed_claim_count: int | None = None
+    #: Every policy term the document declares, in the order printed. A loss run
+    #: covering several renewals declares one per section.
+    policy_periods: list[tuple[date, date]] = Field(default_factory=list)
+    #: Per-term subtotals the carrier printed, for checking each term's claims.
+    printed_sections: list[PrintedSection] = Field(default_factory=list)
 
     claims: list[Claim] = Field(default_factory=list)
 

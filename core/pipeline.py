@@ -28,6 +28,7 @@ from core.normalize import (
     infer_recovery_sign,
     parse_bool,
     parse_date,
+    parse_int,
     parse_money,
     parse_status,
     parse_text,
@@ -48,6 +49,7 @@ from core.schema import (
     LineOfBusiness,
     LossRunDocument,
     NullReason,
+    PrintedSection,
     RawRow,
     RawTable,
     ReconciliationResult,
@@ -310,6 +312,19 @@ def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
     return bool(separator) and bool(label) and label.replace(" ", "").isalpha()
 
 
+def mapping_for(table: RawTable, mapping: ColumnMapping) -> ColumnMapping:
+    """The column mapping that fits this page.
+
+    Column detection is per page, and pages of one document do not always agree
+    — a label that fits on one line here wraps into two columns there. Reading a
+    page through another page's mapping puts every value after the extra column
+    one field to the left.
+    """
+    if table.headers and table.headers != mapping.headers:
+        return build_mapping(table.headers, None, mapping.fingerprint)
+    return mapping
+
+
 def build_claims(
     tables: Sequence[RawTable],
     mapping: ColumnMapping,
@@ -326,9 +341,7 @@ def build_claims(
     furniture = page_furniture(tables)
 
     for table in tables:
-        table_mapping = mapping
-        if table.headers and table.headers != mapping.headers:
-            table_mapping = build_mapping(table.headers, None, mapping.fingerprint)
+        table_mapping = mapping_for(table, mapping)
 
         for row in table.rows:
             if is_structural_row(row, table_mapping):
@@ -368,9 +381,10 @@ def collect_printed_totals(
     best: dict[str, Decimal | None] = {}
     best_rank = (0, 0)
     for table in tables:
+        table_mapping = mapping_for(table, mapping)
         for row in table.total_rows:
             totals: dict[str, Decimal | None] = {}
-            for index, field_name in mapping.fields.items():
+            for index, field_name in table_mapping.fields.items():
                 if field_name not in MONEY_FIELDS:
                     continue
                 cell = row.cell(index).strip()
@@ -386,6 +400,60 @@ def collect_printed_totals(
             if totals and rank > best_rank:
                 best, best_rank = totals, rank
     return best
+
+
+#: The claim count printed inside a subtotal row, e.g. "# Claims: 6".
+_SECTION_COUNT = re.compile(r"#?\s*claims?\s*:?\s*(\d[\d,]*)", re.IGNORECASE)
+#: The date a subtotal row leads with, naming the term it totals.
+_SECTION_DATE = re.compile(r"\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}")
+
+
+def collect_printed_sections(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    date_order: str | None,
+) -> list[PrintedSection]:
+    """Read each per-term subtotal the document prints.
+
+    These are the only other numbers besides the grand total that the carrier
+    committed to, so they let each policy term be checked on its own rather
+    than only the document as a whole.
+    """
+    sections: list[PrintedSection] = []
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        for row in table.total_rows:
+            if GRAND_TOTAL_PATTERN.search(row.text()):
+                continue  # the report total, already held on the document
+
+            totals: dict[str, Decimal | None] = {}
+            for index, field_name in table_mapping.fields.items():
+                if field_name not in MONEY_FIELDS:
+                    continue
+                cell = row.cell(index).strip()
+                if cell:
+                    parsed = parse_money(cell, locale)
+                    if parsed.value is not None:
+                        totals[field_name] = parsed.value
+            if not totals:
+                continue
+
+            text = row.text()
+            count = _SECTION_COUNT.search(text)
+            start = _SECTION_DATE.search(row.cell(0))
+            sections.append(
+                PrintedSection(
+                    label=clean_text(row.cell(0)) or clean_text(text)[:40],
+                    period_start=(
+                        parse_date(start.group(0), date_order).value if start else None
+                    ),
+                    printed_totals=totals,
+                    printed_claim_count=parse_int(count.group(1)) if count else None,
+                    page=row.page,
+                )
+            )
+    return sections
 
 
 # --------------------------------------------------------------------------
@@ -597,21 +665,15 @@ def run_pipeline(
     # each later year as out of period, burying the real findings. The document
     # covers the whole span, so widen the window to what it actually lists.
     period_start_value, period_end_value = period_start.value, period_end.value
-    if len(metadata.policy_periods) > 1:
-        starts = [
-            parsed.value
-            for start, _ in metadata.policy_periods
-            if (parsed := parse_date(start, header_order)).value is not None
-        ]
-        ends = [
-            parsed.value
-            for _, end in metadata.policy_periods
-            if (parsed := parse_date(end, header_order)).value is not None
-        ]
-        if starts:
-            period_start_value = min(starts)
-        if ends:
-            period_end_value = max(ends)
+    declared_periods = [
+        (start_value, end_value)
+        for start_text, end_text in metadata.policy_periods
+        if (start_value := parse_date(start_text, header_order).value) is not None
+        and (end_value := parse_date(end_text, header_order).value) is not None
+    ]
+    if len(declared_periods) > 1:
+        period_start_value = min(start for start, _ in declared_periods)
+        period_end_value = max(end for _, end in declared_periods)
 
     printed_totals = collect_printed_totals(tables, mapping, locale)
 
@@ -678,6 +740,10 @@ def run_pipeline(
         scanned_pages=scanned_pages,
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
+        policy_periods=declared_periods,
+        printed_sections=collect_printed_sections(
+            tables, mapping, locale_inference.locale, date_inference.order
+        ),
         claims=claims,
         currencies_seen=currencies_seen,
         document_issues=document_issues,

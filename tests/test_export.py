@@ -27,9 +27,9 @@ def extracted(golden_dir):
     return run_pipeline(golden_dir / "arithmetic_error.pdf", use_vision=False)
 
 
-def test_three_sheets_in_order(extracted):
+def test_sheets_in_order(extracted):
     workbook = build_workbook(extracted.document, extracted.reconciliation)
-    assert workbook.sheetnames == ["Claims", "Exceptions", "Source Info"]
+    assert workbook.sheetnames == ["Claims", "Loss Summary", "Exceptions", "Source Info"]
 
 
 def test_claims_sheet_has_a_row_per_claim(extracted):
@@ -159,7 +159,7 @@ def test_bytes_round_trip_through_openpyxl(extracted, tmp_path):
     path = tmp_path / "out.xlsx"
     path.write_bytes(payload)
     workbook = load_workbook(path)
-    assert workbook.sheetnames == ["Claims", "Exceptions", "Source Info"]
+    assert workbook.sheetnames == ["Claims", "Loss Summary", "Exceptions", "Source Info"]
 
 
 def test_write_xlsx_creates_the_file(extracted, tmp_path):
