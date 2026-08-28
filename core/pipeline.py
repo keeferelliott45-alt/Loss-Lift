@@ -258,14 +258,16 @@ def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
 
     Documents grouped by policy period interleave "Policy Period: …" headings
     between claims, and page footers add lines like "Report: LossRunSummary".
-    Both land in the claim-number column, where a trailing colon marks printed
-    label text — a real claim number never ends in one.
+    Both land in the claim-number column carrying a label and its colon, and
+    how much of the value follows the colon depends on where the column
+    boundary happens to fall. A claim number contains no colon at all, so a
+    worded label ahead of one marks the row as printed furniture.
     """
     index = mapping.index_of("claim_number")
     if index is None:
         return False
-    cell = row.cell(index).strip()
-    return bool(cell) and cell.endswith(":")
+    label, separator, _ = row.cell(index).strip().partition(":")
+    return bool(separator) and bool(label) and label.replace(" ", "").isalpha()
 
 
 def build_claims(
@@ -546,6 +548,27 @@ def run_pipeline(
     period_start = parse_date(metadata.policy_period_start_text or "", header_order)
     period_end = parse_date(metadata.policy_period_end_text or "", header_order)
 
+    # A loss run grouped by policy period lists several terms, and page 1 only
+    # declares the first. Judging every claim against that one term reports
+    # each later year as out of period, burying the real findings. The document
+    # covers the whole span, so widen the window to what it actually lists.
+    period_start_value, period_end_value = period_start.value, period_end.value
+    if len(metadata.policy_periods) > 1:
+        starts = [
+            parsed.value
+            for start, _ in metadata.policy_periods
+            if (parsed := parse_date(start, header_order)).value is not None
+        ]
+        ends = [
+            parsed.value
+            for _, end in metadata.policy_periods
+            if (parsed := parse_date(end, header_order)).value is not None
+        ]
+        if starts:
+            period_start_value = min(starts)
+        if ends:
+            period_end_value = max(ends)
+
     printed_totals = collect_printed_totals(tables, mapping, locale)
 
     # Recoveries: settle the carrier's sign convention before anything is
@@ -597,8 +620,8 @@ def run_pipeline(
         carrier=metadata.carrier,
         named_insured=metadata.named_insured,
         policy_number=metadata.policy_number,
-        policy_period_start=period_start.value,
-        policy_period_end=period_end.value,
+        policy_period_start=period_start_value,
+        policy_period_end=period_end_value,
         line_of_business=_line_of_business(metadata.line_of_business),
         valuation_date=valuation.value,
         currency=currency,

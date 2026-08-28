@@ -213,6 +213,9 @@ _CARRIER_SUFFIXES = (
     "indemnity", "mutual", "underwriters", "company", "companies", "corp",
     "corporation", "group", "marine", "fire", "specialty", "speciality",
     "exchange", "reciprocal", "syndicate", "lloyds", "reinsurance",
+    # Public entities self-insure through risk pools and funds, which carry
+    # none of the company suffixes above but issue loss runs all the same.
+    "fund", "funds", "pool", "authority", "trust",
     "versicherung", "versicherungen", "limited", "ins", "co", "ag", "se",
     "plc", "ltd", "llc", "inc", "nv", "sa",
 )
@@ -227,6 +230,16 @@ _CARRIER_SUFFIX_RE = re.compile(
 _NOT_A_CARRIER = re.compile(
     r"^(loss\s*run|claims?\s*(?:listing|detail|report)|page\s+\d|"
     r"confidential|report\s*date|run\s*date)",
+    flags=re.IGNORECASE,
+)
+
+#: Reports often print the query that produced them — "All Claims Where Claim
+#: Status is Closed or Open As Of ...". That is a sentence, not a letterhead,
+#: and it sits above the carrier name on the page. A carrier name is a noun
+#: phrase, so the clause words that make this a sentence rule the line out.
+_CRITERIA_PROSE = re.compile(
+    r"\b(?:where|between|is\s+(?:closed|open|greater|less|equal)|"
+    r"all\s+claims|selected\s+by|filtered|criteria)\b",
     flags=re.IGNORECASE,
 )
 
@@ -259,6 +272,28 @@ def _strip_document_title(line: str) -> str:
     return " - ".join(parts).strip()
 
 
+#: Words that belong to a metadata label rather than to a company name.
+_LABEL_WORDS = frozenset(
+    "printed report run date dated valued valuation page policy insured named "
+    "claim claims period as of status location currency number no for".split()
+)
+
+
+def _before_label(line: str) -> str:
+    """The text ahead of a trailing label, e.g. "ACME FUND  Printed: 3/1/24".
+
+    Letterheads often share their line with a metadata label. Dropping the
+    whole line for containing a colon loses the carrier name; keeping the words
+    before the label recovers it, while a line that *starts* with a label —
+    "Named Insured: ..." — correctly reduces to nothing.
+    """
+    head = line.split(":", 1)[0]
+    words = head.split()
+    while words and words[-1].strip(".,").lower() in _LABEL_WORDS:
+        words.pop()
+    return " ".join(words)
+
+
 def detect_carrier(text: str) -> str | None:
     """Best-effort carrier name from the letterhead.
 
@@ -277,9 +312,11 @@ def detect_carrier(text: str) -> str | None:
     candidates: list[str] = []
     for line in lines:
         candidate = _PAGE_MARKER.sub("", line.strip())
-        if not candidate or len(candidate) > 120 or ":" in candidate:
+        if ":" in candidate:
+            candidate = _before_label(candidate)
+        if not candidate or len(candidate) > 120:
             continue
-        if _NOT_A_CARRIER.match(candidate):
+        if _NOT_A_CARRIER.match(candidate) or _CRITERIA_PROSE.search(candidate):
             continue
         candidate = _strip_document_title(candidate)
         if candidate:

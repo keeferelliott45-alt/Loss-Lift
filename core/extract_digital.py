@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -529,6 +529,9 @@ class DocumentMetadata:
     line_of_business: str | None = None
     currency: str | None = None
     printed_claim_count: int | None = None
+    #: Every period declared anywhere in the document. A loss run grouped by
+    #: policy period declares one per section, and the document covers them all.
+    policy_periods: list[tuple[str, str]] = dataclass_field(default_factory=list)
 
 
 #: Carriers phrase the valuation date many ways. "Report date" and "run date"
@@ -542,7 +545,7 @@ _VALUATION_PATTERNS = (
     r"valued\s*(?:as\s*of|through|thru)\s*[:\-]?\s*(.+)",
     r"evaluat(?:ion|ed)\s*(?:date|as\s*of)?\s*[:\-]?\s*(.+)",
     r"as\s*of\s*date\s*[:\-]?\s*(.+)",
-    r"(?:data|values?)\s*as\s*of\s*[:\-]?\s*(.+)",
+    r"(?:data|values?|numbers?|amounts?)\s*as\s*of\s*[:\-]?\s*(.+)",
     r"loss(?:es)?\s*valued\s*[:\-]?\s*(.+)",
 )
 
@@ -673,6 +676,16 @@ def extract_pdf(
         ),
         None,
     )
+    # Sections declare a period each, and only page 1's reached the metadata.
+    # Collect them all so the document's span covers every claim it lists.
+    seen: set[tuple[str, str]] = set()
+    for _, text in sorted(page_texts.items()):
+        for match in _PERIOD_PATTERN.finditer(text):
+            period = (clean_text(match.group(1)), clean_text(match.group(2)))
+            if period not in seen:
+                seen.add(period)
+                metadata.policy_periods.append(period)
+
     if grand_count is not None:
         metadata.printed_claim_count = grand_count
     elif metadata.printed_claim_count is None:
