@@ -1,0 +1,10 @@
+doc_id,failure_code,severity,description,root_cause,fixed_version,regression_test
+aig_lossrun,F17,critical,"Zero claims extracted but reconciliation status returned CLEAN","No rule tested for an empty claim list; every other rule is vacuously silent with no rows, so an unread table exported a green badge",8815244,tests/test_reconcile.py::test_a_document_with_no_claims_is_never_clean
+aig_lossrun,F04,high,"0 claims; headers include three columns labelled Total and abbreviations Ind/BI, Med/PD, Alloc Exp","Semantic column mapping cannot resolve repeated identical labels or carrier abbreviations",,
+liberty_risktrac,F06,high,"162 rows extracted against a printed count of 28; 152 of them from inside the loss run pages","Each claim is a stacked multi-line detail block. Continuation lines land in the claim-number column, and build_claim accepts any non-empty value there as a new claim. Continuation folding only fires when that cell is empty.",88bb1f7,tests/test_detail_block_rows.py
+liberty_risktrac,F02,high,"10 further rows extracted from page 54, a financial statement outside the loss run, with claim_number '0'","Extraction runs over every page of a compound document; no test that an identifier-shaped value is present",88bb1f7,tests/test_detail_block_rows.py::test_a_shape_must_recur_to_count_as_an_identifier
+liberty_risktrac,F10,medium,"Loss run occupies pages 39-51 of a 99-page board packet; the other 86 pages are municipal meeting material","No notion of which pages constitute the loss-run section of a compound document",,
+xl_lossrun,F15,high,"84 candidate rows with every date and money field null (168 R-07 findings)","Not yet root-caused; row detection succeeds but field association fails",,
+xl_lossrun,F13,medium,"Carrier identified as 'Status Currency Indemnity'","Letterhead detection picked a header fragment",,
+italian_sinistri,F05,high,"0 claims; no headers detected at all","Not yet root-caused; combines scanned pages, Italian labels and EU numerics",,
+italian_sinistri,F09,high,"6 of 23 pages carry no text layer","Vision path disabled in the cold run; OCR contribution not yet measured",,

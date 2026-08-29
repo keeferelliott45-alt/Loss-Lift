@@ -7,6 +7,7 @@ UI does any of this work.
 
 from __future__ import annotations
 
+import collections
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -276,8 +277,6 @@ def page_furniture(tables: Sequence[RawTable]) -> set[str]:
 def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     """Text from a wrapped row that belongs to the claim above it."""
     values = _row_values(row, mapping)
-    if clean_text(values.get("claim_number", "")):
-        return None
 
     # A wrapped description runs the width of the row, so its words land in
     # whichever columns they cross, money and date columns included. What marks
@@ -293,6 +292,104 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     # Reading only the text-typed columns truncated the description at the
     # first column boundary, so take the whole line.
     return clean_text(" ".join(row.cells)) or None
+
+
+#: A cell shorter than this is a code or a stray digit, never a claim number.
+MIN_IDENTIFIER_LENGTH = 3
+
+#: A whole cell that is just a date. Claim numbers are not dates.
+DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
+
+
+def identifier_shape(text: str) -> str:
+    """The cell's pattern with the specifics removed: WC550C44573 -> AA999A99999.
+
+    Claim numbers inside one document are issued by one system and share a
+    shape. Comparing shapes rather than values is what lets a document say
+    which of its own cells are identifiers without anyone naming the carrier.
+    """
+    return "".join(
+        "9" if char.isdigit() else "A" if char.isalpha() else char for char in text
+    )
+
+
+def _is_identifier_candidate(text: str) -> bool:
+    """The tests any claim number passes, before the document has its say.
+
+    A continuation line that lands in the claim-number column fails at least
+    one of these: injury text carries no digit, a bare code is too short, and
+    a date belongs to a date column that has bled left.
+    """
+    if len(text) < MIN_IDENTIFIER_LENGTH:
+        return False
+    if not any(char.isdigit() for char in text):
+        return False
+    # Date-shaped, not date-parseable: an ambiguous date like 11/11/19 does
+    # not resolve without document evidence and so parses to None, which would
+    # otherwise read as "not a date" and let a date column bleed in as an
+    # identifier.
+    return not DATE_SHAPED.fullmatch(text)
+
+
+def accepted_identifier_shapes(
+    tables: Sequence[RawTable], mapping: ColumnMapping
+) -> set[str]:
+    """Which shapes this document uses for claim numbers.
+
+    Detail layouts print each claim as a stack of lines, and the lines under
+    the first one land in the claim-number column carrying a cause code, a
+    class code or an injury description. Those are not claims, and no rule
+    downstream can tell: they arrive with a plausible-looking identifier and
+    inflate the count, the sums and the duplicate checks alike.
+
+    A claim number is normally one token. Where a document has such cells they
+    define what an identifier looks like here, and anything shaped differently
+    is a continuation line. Where it has none — some carriers print the
+    insured's name into the same cell — the shape used most often stands in,
+    since a layout repeats itself even when it is not tidy.
+    """
+    candidates: list[str] = []
+    for table in tables:
+        index = mapping_for(table, mapping).index_of("claim_number")
+        if index is None:
+            continue
+        for row in table.rows:
+            cell = row.cell(index).strip()
+            if cell and _is_identifier_candidate(cell):
+                candidates.append(cell)
+    if not candidates:
+        return set()
+
+    single = [text for text in candidates if " " not in text]
+    shapes = collections.Counter(
+        identifier_shape(text) for text in (single or candidates)
+    )
+
+    # A shape has to recur to count as this document's. A claim number is
+    # issued in a series, so its shape appears once per claim; a mangled code
+    # that slipped the tests above appears once or twice. Keeping every shape
+    # would let each of those define its own, which is how seven junk rows
+    # survived. The fraction admits a genuine second series -- a book with
+    # both WC and GL numbering -- without admitting one-offs.
+    most_common = shapes.most_common(1)[0][1]
+    floor = max(2, int(most_common * 0.25))
+    return {shape for shape, count in shapes.items() if count >= floor}
+
+
+def has_claim_identifier(
+    row: RawRow, mapping: ColumnMapping, shapes: set[str]
+) -> bool:
+    """Whether this row opens a claim, rather than continuing the one above."""
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return False
+    cell = row.cell(index).strip()
+    if not cell or not _is_identifier_candidate(cell):
+        return False
+    # No shape consensus means nothing to compare against; fall back to the
+    # basic tests rather than rejecting every row and reporting an empty
+    # document, which R-20 would then have to catch.
+    return not shapes or identifier_shape(cell) in shapes
 
 
 def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
@@ -339,6 +436,7 @@ def build_claims(
     claims: list[Claim] = []
     warnings: list[str] = []
     furniture = page_furniture(tables)
+    shapes = accepted_identifier_shapes(tables, mapping)
 
     for table in tables:
         table_mapping = mapping_for(table, mapping)
@@ -349,6 +447,29 @@ def build_claims(
             text = _normalised(row)
             if not text or text in furniture:
                 continue  # a running header, footer or page marker
+
+            # A row whose claim-number cell holds something that is not an
+            # identifier is the continuation of the claim above it, not a new
+            # one. Folding it in keeps its text; treating it as a claim
+            # multiplies the count by however many lines each claim occupies.
+            if not has_claim_identifier(row, table_mapping, shapes):
+                extra = clean_text(" ".join(row.cells))
+                # A continuation line carries prose. A row carrying money or a
+                # date is a claim whose number could not be identified, and
+                # folding that into the description above would bury real
+                # figures inside someone else's narrative.
+                if extra and claims and _continuation_text(row, table_mapping):
+                    previous = claims[-1]
+                    previous.loss_description = clean_text(
+                        f"{previous.loss_description or ''} {extra}"
+                    )
+                elif extra:
+                    warnings.append(
+                        f"Page {row.page}: skipped a row with no claim number "
+                        f"({extra[:60]})."
+                    )
+                continue
+
             claim = build_claim(
                 row, table_mapping, locale, date_order,
                 dash_means_zero=dash_means_zero,

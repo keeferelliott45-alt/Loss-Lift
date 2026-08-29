@@ -1,0 +1,13 @@
+doc_id,engine_version,timestamp,claims_expected,claims_extracted,claim_precision,claim_recall,money_fields_expected,money_fields_exact,mapping_accuracy,reconciliation_status,false_clean,review_flags,processing_seconds,label,notes
+liberty_risktrac,8815244,2026-08-29T21:42:38+00:00,28,162,,1.0,,,,NEEDS_REVIEW,no,349,13.09,cold-baseline,
+aig_lossrun,8815244,2026-08-29T21:42:51+00:00,,0,,,,,,NEEDS_MAPPING,no,3,0.4,cold-baseline,
+xl_lossrun,8815244,2026-08-29T21:42:51+00:00,,84,,,,,,NEEDS_REVIEW,no,171,1.86,cold-baseline,
+italian_sinistri,8815244,2026-08-29T21:42:53+00:00,,0,,,,,,NEEDS_MAPPING,no,4,0.72,cold-baseline,
+illinois_wc_pool,8815244,2026-08-29T21:42:54+00:00,50,50,,1.0,,,,CLEAN,no,7,1.07,cold-baseline,
+cna_school_board,8815244,2026-08-29T21:42:55+00:00,2,2,,1.0,,,,NEEDS_REVIEW,no,3,0.5,cold-baseline,
+liberty_risktrac,8815244,2026-08-29T21:48:17+00:00,28,28,,1.0,,,,NEEDS_REVIEW,no,12,10.94,after-liberty-F06,
+aig_lossrun,8815244,2026-08-29T21:48:27+00:00,,0,,,,,,NEEDS_MAPPING,no,3,0.41,after-liberty-F06,
+xl_lossrun,8815244,2026-08-29T21:48:28+00:00,,84,,,,,,NEEDS_REVIEW,no,171,1.78,after-liberty-F06,
+italian_sinistri,8815244,2026-08-29T21:48:30+00:00,,0,,,,,,NEEDS_MAPPING,no,4,0.7,after-liberty-F06,
+illinois_wc_pool,8815244,2026-08-29T21:48:30+00:00,50,50,,1.0,,,,CLEAN,no,7,1.07,after-liberty-F06,
+cna_school_board,8815244,2026-08-29T21:48:31+00:00,2,2,,1.0,,,,NEEDS_REVIEW,no,3,0.49,after-liberty-F06,
