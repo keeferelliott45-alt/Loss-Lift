@@ -50,8 +50,34 @@ class SourceMethod(str, Enum):
 class ClaimStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
+    #: Closed with payment, which some carriers print separately from a
+    #: closed-without-payment claim; the distinction changes frequency counts.
+    CLOSED_PAID = "CLOSED_PAID"
     REOPENED = "REOPENED"
+    #: Reported but never opened as a claim. Carries no money and must not be
+    #: counted as a loss, but is real information about reporting behaviour.
+    REPORT_ONLY = "REPORT_ONLY"
     UNKNOWN = "UNKNOWN"
+
+
+class DeductibleBasis(str, Enum):
+    """Whether amounts are stated before or after the deductible.
+
+    Never inferred. A net loss run read as gross understates every claim by the
+    deductible, and the sheet looks perfectly reasonable while it does so.
+    """
+
+    GROSS = "gross"
+    NET = "net"
+    UNKNOWN = "unknown"
+
+
+class AlaeTreatment(str, Enum):
+    """Whether ALAE sits inside the indemnity figures or beside them."""
+
+    INCLUDED = "included"
+    SEPARATE = "separate"
+    UNKNOWN = "unknown"
 
 
 class LineOfBusiness(str, Enum):
@@ -166,6 +192,19 @@ class Claim(BaseModel):
     incurred_total: Money | None = None
 
     litigation_flag: bool | None = None
+    #: The carrier's own claimant identifier, when it prints one. Distinct from
+    #: claimant_name: a reference is not personal data, a name is.
+    claimant_ref: str | None = None
+    close_date: date | None = None
+    loss_state: str | None = None
+    deductible_basis: DeductibleBasis = DeductibleBasis.UNKNOWN
+    alae_treatment: AlaeTreatment = AlaeTreatment.UNKNOWN
+
+    # Workers' comp only; null on every other line of business.
+    body_part: str | None = None
+    nature_of_injury: str | None = None
+    ncci_class_code: str | None = None
+    medical_only_flag: bool | None = None
 
     # Provenance — spec section 2, principle 2.
     source_page: int = 1
@@ -176,6 +215,29 @@ class Claim(BaseModel):
     field_issues: dict[str, NullReason] = Field(default_factory=dict)
     raw_cells: dict[str, str] = Field(default_factory=dict)
     currency: str | None = None
+
+    @property
+    def confidence(self) -> float:
+        """The row's confidence: the least confident field in it.
+
+        A row is only as trustworthy as its worst cell, so this is a minimum
+        and not an average — averaging lets one unreadable amount hide behind
+        nine clean ones.
+        """
+        return min(self.field_confidence.values(), default=1.0)
+
+    @property
+    def is_medical_only(self) -> bool:
+        """Medical paid or reserved, with no indemnity either side.
+
+        Reported rather than inferred where the carrier states it: this is the
+        fallback when it does not.
+        """
+        if self.medical_only_flag is not None:
+            return self.medical_only_flag
+        medical = (self.paid_medical or Decimal("0")) + (self.reserve_medical or Decimal("0"))
+        indemnity = (self.paid_indemnity or Decimal("0")) + (self.reserve_indemnity or Decimal("0"))
+        return medical > 0 and indemnity == 0
 
     @field_validator("claim_number")
     @classmethod
@@ -199,7 +261,8 @@ class Claim(BaseModel):
         """The reason ``field`` is null, if it is null for a recorded reason."""
         return self.field_issues.get(field)
 
-    def confidence(self, field: str, default: float = 1.0) -> float:
+    def confidence_for(self, field: str, default: float = 1.0) -> float:
+        """One field's confidence. The row's own is the ``confidence`` property."""
         return float(self.field_confidence.get(field, default))
 
     def needs_review(self) -> bool:
@@ -256,6 +319,9 @@ class LossRunDocument(BaseModel):
     policy_periods: list[tuple[date, date]] = Field(default_factory=list)
     #: Per-term subtotals the carrier printed, for checking each term's claims.
     printed_sections: list[PrintedSection] = Field(default_factory=list)
+    #: Claim rows found on each page before stitching, so R-19 can tell whether
+    #: dropping repeated headers and subtotals also dropped a claim.
+    rows_seen_per_page: dict[int, int] = Field(default_factory=dict)
 
     claims: list[Claim] = Field(default_factory=list)
 
@@ -400,11 +466,16 @@ MONEY_FIELDS: tuple[str, ...] = (
     "incurred_total",
 )
 
-DATE_FIELDS: tuple[str, ...] = ("date_of_loss", "date_reported")
+DATE_FIELDS: tuple[str, ...] = ("date_of_loss", "date_reported", "close_date")
 
 TEXT_FIELDS: tuple[str, ...] = (
     "claim_number",
     "claimant_name",
+    "claimant_ref",
+    "loss_state",
+    "body_part",
+    "nature_of_injury",
+    "ncci_class_code",
     "loss_description",
     "cause_of_loss",
 )

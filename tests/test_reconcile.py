@@ -59,12 +59,16 @@ def ids_for(result, rule_id: str) -> list:
 
 def test_a_clean_document_is_clean():
     result = reconcile(build_doc([good_claim()]))
-    assert result.findings == []
+    # R-18 stands on every document that does not state its deductible basis
+    # or ALAE treatment, which is nearly all of them. It is a soft flag and
+    # never blocks a clean badge; anything else here would be a real defect.
+    assert [f.rule_id for f in result.findings] == ["R-18", "R-18"]
+    assert result.errors == []
     assert result.status is DocumentStatus.CLEAN
 
 
-def test_all_sixteen_rules_are_registered():
-    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 17)]
+def test_every_rule_is_registered():
+    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 20)]
 
 
 # --- R-01 ------------------------------------------------------------------
@@ -447,7 +451,7 @@ def test_a_deliberately_wrong_document_produces_exactly_the_expected_findings():
     result = reconcile(doc)
 
     assert sorted({f.rule_id for f in result.findings}) == [
-        "R-01", "R-02", "R-04", "R-05", "R-08", "R-09", "R-14",
+        "R-01", "R-02", "R-04", "R-05", "R-08", "R-09", "R-14", "R-18",
     ]
     assert {f.claim_number for f in result.errors if f.claim_number} == {"BAD-01", "BAD-02"}
     assert result.status is DocumentStatus.NEEDS_REVIEW

@@ -133,6 +133,30 @@ COLUMN_TITLES: dict[str, str] = {
 MONEY_FORMAT = '#,##0.00;[Red](#,##0.00)'
 DATE_FORMAT = "yyyy-mm-dd"
 
+#: Default cut for the Large Loss sheet. Configurable per export.
+LARGE_LOSS_THRESHOLD = Decimal("25000")
+
+#: Document-level facts written onto every claim row, so one row describes
+#: itself without its header — what makes a merged multi-carrier sheet usable.
+_DOCUMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("Carrier", "carrier"),
+    ("Named insured", "named_insured"),
+    ("Policy number", "policy_number"),
+    ("Policy term start", "policy_period_start"),
+    ("Policy term end", "policy_period_end"),
+    ("Line of business", "line_of_business"),
+    ("Valuation date", "valuation_date"),
+)
+
+
+def _document_values(document: LossRunDocument) -> list[Any]:
+    values: list[Any] = []
+    for _, attribute in _DOCUMENT_COLUMNS:
+        value = getattr(document, attribute, None)
+        values.append(value.value if hasattr(value, "value") else value)
+    return values
+
+
 _HEADER_FILL = PatternFill("solid", fgColor="1F2933")
 _HEADER_FONT = Font(color="FFFFFF", bold=True)
 _FINDING_FILL = PatternFill("solid", fgColor="FDE8C8")   # amber
@@ -210,12 +234,17 @@ def _write_claims_sheet(
     findings = _findings_index(result)
     widths: dict[int, int] = {}
 
-    for column_index, field_name in enumerate(columns, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=_title(field_name))
+    titles = [_title(name) for name in columns] + [
+        title for title, _ in _DOCUMENT_COLUMNS
+    ]
+    for column_index, title in enumerate(titles, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        widths[column_index] = len(_title(field_name)) + 2
+        widths[column_index] = len(title) + 2
+
+    document_values = _document_values(document)
 
     for row_index, claim in enumerate(document.claims, start=2):
         for column_index, field_name in enumerate(columns, start=1):
@@ -238,6 +267,14 @@ def _write_claims_sheet(
             if claim.source_method is SourceMethod.VISION:
                 cell.font = _VISION_FONT
 
+            if value is not None:
+                widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+        for offset, value in enumerate(document_values):
+            column_index = len(columns) + 1 + offset
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            if isinstance(value, date):
+                cell.number_format = DATE_FORMAT
             if value is not None:
                 widths[column_index] = max(widths[column_index], len(str(value)) + 2)
 
@@ -299,8 +336,8 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     these numbers match the subtotal the carrier printed for that term.
     """
     headers = ["Policy term", "Claims", "Open", "Closed", "Paid", "Reserves",
-               "Recoveries", "Incurred", "Largest loss", "Carrier printed",
-               "Ties to carrier"]
+               "Recoveries", "Incurred", "Frequency", "Severity",
+               "Largest loss", "Carrier printed", "Ties to carrier"]
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
@@ -321,6 +358,16 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
             float(period.totals["reserve_total"]),
             float(period.totals["recovery_total"]),
             float(period.totals["incurred_total"]),
+            # Frequency is the claim count for the term; severity is the mean
+            # incurred per claim. No exposure base is on a loss run, so neither
+            # is rated per unit of payroll or revenue -- that is the broker's
+            # own number to divide by.
+            period.claims,
+            (
+                float(period.totals["incurred_total"] / period.claims)
+                if period.claims
+                else None
+            ),
             float(period.largest_loss) if period.largest_loss is not None else None,
             float(printed) if printed is not None else None,
             "not printed" if ties is None else "yes" if ties else "no",
@@ -337,6 +384,46 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     if not periods:
         sheet.cell(row=2, column=1, value="No claims to summarise.")
 
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
+def _write_large_loss_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    threshold: Decimal,
+) -> None:
+    """Claims at or above the threshold, worst first.
+
+    The shock losses drive the price, so they get their own sheet rather than
+    being found by sorting the detail tab.
+    """
+    headers = ["Claim number", "Date of loss", "Status", "Cause of loss",
+               "Paid", "Reserve", "Recovery", "Incurred", "Source page"]
+    widths = _header_row(sheet, headers)
+
+    large = sorted(
+        (c for c in document.claims
+         if c.incurred_total is not None and c.incurred_total >= threshold),
+        key=lambda c: c.incurred_total,
+        reverse=True,
+    )
+    for row_index, claim in enumerate(large, start=2):
+        _fill_row(sheet, row_index, [
+            claim.claim_number,
+            claim.date_of_loss,
+            claim.claim_status.value if claim.claim_status else None,
+            claim.cause_of_loss,
+            _float(claim.paid_total),
+            _float(claim.reserve_total),
+            _float(claim.recovery_total),
+            _float(claim.incurred_total),
+            claim.source_page,
+        ], widths)
+
+    if not large:
+        sheet.cell(row=2, column=1,
+                   value=f"No claim reaches {threshold:,.0f}.")
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
 
@@ -432,6 +519,7 @@ def build_workbook(
     template: str | Sequence[str] = DEFAULT_TEMPLATE,
     redact: bool = False,
     include_provenance: bool = True,
+    large_loss_threshold: Decimal = LARGE_LOSS_THRESHOLD,
 ) -> Workbook:
     """Build the workbook: claims, loss summary, exceptions and provenance."""
     columns = resolve_columns(
@@ -439,9 +527,12 @@ def build_workbook(
     )
     workbook = Workbook()
     claims_sheet = workbook.active
-    claims_sheet.title = "Claims"
+    claims_sheet.title = "Claim Detail"
     _write_claims_sheet(claims_sheet, document, columns, result)
     _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
+    _write_large_loss_sheet(
+        workbook.create_sheet("Large Loss"), document, large_loss_threshold
+    )
     _write_exceptions_sheet(workbook.create_sheet("Exceptions"), result)
     _write_source_sheet(
         workbook.create_sheet("Source Info"),

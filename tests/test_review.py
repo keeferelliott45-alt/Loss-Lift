@@ -73,7 +73,7 @@ def test_an_edited_cell_is_marked_manual(broken):
     edited = next(c for c in updated.claims if c.claim_number == "FM-0003")
     untouched = next(c for c in updated.claims if c.claim_number == "FM-0001")
     assert edited.source_method is SourceMethod.MANUAL
-    assert edited.confidence("incurred_total") == 1.0
+    assert edited.confidence_for("incurred_total") == 1.0
     assert untouched.source_method is SourceMethod.DIGITAL
 
 

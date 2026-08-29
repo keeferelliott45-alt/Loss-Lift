@@ -89,9 +89,26 @@ LABEL_SYNONYMS: dict[str, str] = {
     "deductible reimbursement": "recovery_total",
     # Allocated loss adjustment expense, standing alone as its own column.
     "alae": "paid_expense", "lae": "paid_expense",
+    "defense cost": "paid_expense", "defense costs": "paid_expense",
+    "legal expense": "paid_expense", "defense": "paid_expense",
     "incurred": "incurred_total", "total incurred": "incurred_total",
     "net incurred": "incurred_total", "incurred total": "incurred_total",
     "total": "incurred_total",
+    # spec section 3 additions
+    "claimant ref": "claimant_ref", "claimant id": "claimant_ref",
+    "claimant number": "claimant_ref", "claimant no": "claimant_ref",
+    "close date": "close_date", "date closed": "close_date",
+    "closed date": "close_date", "closed": "close_date",
+    "loss state": "loss_state", "state": "loss_state",
+    "jurisdiction": "loss_state", "state of loss": "loss_state",
+    # workers' comp extension
+    "body part": "body_part", "part of body": "body_part",
+    "injured body part": "body_part",
+    "nature of injury": "nature_of_injury", "injury type": "nature_of_injury",
+    "injury": "nature_of_injury", "nature": "nature_of_injury",
+    "class code": "ncci_class_code", "ncci class": "ncci_class_code",
+    "ncci code": "ncci_class_code", "ncci": "ncci_class_code",
+    "medical only": "medical_only_flag", "med only": "medical_only_flag",
     # litigation
     "suit": "litigation_flag", "litigation": "litigation_flag",
     "lit": "litigation_flag", "in suit": "litigation_flag",

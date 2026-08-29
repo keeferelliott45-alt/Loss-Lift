@@ -215,9 +215,9 @@ def build_claim(
             confidence["claim_status"] = min(
                 confidence_cap, 1.0 if status is not ClaimStatus.UNKNOWN else 0.0
             )
-        elif field_name == "litigation_flag":
-            fields["litigation_flag"] = parse_bool(raw)
-            confidence["litigation_flag"] = confidence_cap
+        elif field_name in ("litigation_flag", "medical_only_flag"):
+            fields[field_name] = parse_bool(raw)
+            confidence[field_name] = confidence_cap
         else:
             fields[field_name] = parse_text(raw)
             confidence[field_name] = confidence_cap
@@ -675,6 +675,25 @@ def run_pipeline(
         period_start_value = min(start for start, _ in declared_periods)
         period_end_value = max(end for _, end in declared_periods)
 
+    rows_seen_per_page: dict[int, int] = {}
+    furniture = page_furniture(tables)
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        # Count rows that carry a claim number: those are the rows that ought
+        # to survive stitching. A row skipped for having no claim number is
+        # already reported on its own, and counting it here would make R-19
+        # repeat that warning as a phantom stitching loss.
+        index = table_mapping.index_of("claim_number")
+        rows_seen_per_page[table.page] = sum(
+            1
+            for row in table.rows
+            if index is not None
+            and row.cell(index).strip()
+            and not is_structural_row(row, table_mapping)
+            and (text := _normalised(row))
+            and text not in furniture
+        )
+
     printed_totals = collect_printed_totals(tables, mapping, locale)
 
     # Recoveries: settle the carrier's sign convention before anything is
@@ -741,6 +760,7 @@ def run_pipeline(
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,
+        rows_seen_per_page=rows_seen_per_page,
         printed_sections=collect_printed_sections(
             tables, mapping, locale_inference.locale, date_inference.order
         ),

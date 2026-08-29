@@ -606,11 +606,28 @@ _STATUS_VOCAB: dict[str, ClaimStatus] = {
     "reopened": ClaimStatus.REOPENED,
     "re open": ClaimStatus.REOPENED,
     "re opened": ClaimStatus.REOPENED,
+    # Closed with payment, printed separately by carriers that distinguish it
+    # from a closed-without-payment claim.
+    "closed paid": ClaimStatus.CLOSED_PAID,
+    "closed with payment": ClaimStatus.CLOSED_PAID,
+    "closed pd": ClaimStatus.CLOSED_PAID,
+    "cwp": ClaimStatus.CLOSED_PAID,
+    "paid and closed": ClaimStatus.CLOSED_PAID,
+    # Reported, never opened. Carries no money and is not a loss.
+    "report only": ClaimStatus.REPORT_ONLY,
+    "record only": ClaimStatus.REPORT_ONLY,
+    "incident only": ClaimStatus.REPORT_ONLY,
+    "notice only": ClaimStatus.REPORT_ONLY,
+    "info only": ClaimStatus.REPORT_ONLY,
+    "ro only": ClaimStatus.REPORT_ONLY,
 }
 
 
 def parse_status(raw: object) -> ClaimStatus:
-    """Fold a carrier's status vocabulary onto the canonical four."""
+    """Fold a carrier's status vocabulary onto the canonical set.
+
+    Anything unrecognised is UNKNOWN, never a guess at the nearest match.
+    """
     text = normalize_label(raw)
     if not text:
         return ClaimStatus.UNKNOWN

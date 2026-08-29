@@ -51,7 +51,7 @@ def test_unknown_fields_are_refused():
 def test_confidence_must_be_a_probability():
     with pytest.raises(ValidationError):
         Claim(claim_number="C1", field_confidence={"paid_total": 1.5})
-    assert Claim(claim_number="C1", field_confidence={"paid_total": 0.85}).confidence("paid_total") == 0.85
+    assert Claim(claim_number="C1", field_confidence={"paid_total": 0.85}).confidence_for("paid_total") == 0.85
 
 
 def test_defaults_are_null_not_zero():

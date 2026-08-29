@@ -45,14 +45,17 @@ def test_a_large_multipage_document_extracts_every_claim(golden_dir):
     assert findings(result, "R-05") == []
 
 
-def test_warnings_alone_do_not_flip_the_badge(golden_dir):
-    """44 claims, 5 pages, a genuine duplicate, a 100x outlier, a
-    closed-with-reserve claim and a legitimate negative paid all fire at
-    once, and every one of them is WARN or INFO -- the badge must still say
-    Reconciled, because only ERROR severity blocks it."""
+def test_only_the_duplicate_blocks_the_badge(golden_dir):
+    """44 claims and 5 pages of simultaneous findings, of which exactly one
+    is a hard fail: the duplicated claim number. An outlier, a
+    closed-with-reserve claim and a legitimate negative paid all fire beside
+    it and none of them blocks the badge, because only ERROR severity does.
+
+    R-11 counts a claim twice and every total built from it is wrong by that
+    claim, which is why it is a hard fail rather than a flag."""
     result = result_for(golden_dir, "stress_mega_wc")
-    assert result.reconciliation.status is DocumentStatus.CLEAN
-    assert result.reconciliation.errors == []
+    assert [f.rule_id for f in result.reconciliation.errors] == ["R-11"]
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
     assert len(result.reconciliation.warnings) >= 4
 
 
@@ -194,7 +197,7 @@ def test_claim_numbers_are_the_one_thing_that_did_resolve(golden_dir):
 def test_every_planted_defect_is_caught_and_nothing_extra(golden_dir):
     result = result_for(golden_dir, "stress_dirty_avalanche")
     rule_ids = sorted({f.rule_id for f in result.reconciliation.findings})
-    assert rule_ids == ["R-01", "R-04", "R-05", "R-07", "R-11", "R-15"]
+    assert rule_ids == ["R-01", "R-04", "R-05", "R-07", "R-11", "R-15", "R-18"]
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 

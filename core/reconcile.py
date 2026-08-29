@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Sixteen rules, each returning zero or more :class:`~core.schema.Finding`
+Nineteen rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -18,6 +18,8 @@ from typing import Callable, Sequence
 
 from core.schema import (
     MONEY_FIELDS,
+    AlaeTreatment,
+    DeductibleBasis,
     PAID_COMPONENT_FIELDS,
     RESERVE_COMPONENT_FIELDS,
     REVIEW_REASONS,
@@ -35,7 +37,7 @@ DEFAULT_TOLERANCE = Decimal("0.01")
 
 #: R-13: a value this many times the column median is almost always a
 #: mis-parse (a stray thousands separator, a merged cell).
-OUTLIER_MULTIPLE = Decimal("100")
+OUTLIER_MULTIPLE = Decimal("10")
 
 
 @dataclass(frozen=True)
@@ -425,7 +427,12 @@ def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
 def r11_duplicate_claim_numbers(
     doc: LossRunDocument, config: ReconcileConfig
 ) -> list[Finding]:
-    """The same claim number twice in one policy period."""
+    """The same claim number twice within one carrier and policy.
+
+    A hard fail rather than a flag: the document is scoped to one carrier and
+    policy, so a repeated number is the same claim counted twice, and every
+    total built from it is wrong by that claim.
+    """
     findings: list[Finding] = []
     for number, claims in doc.claims_by_number().items():
         if len(claims) < 2:
@@ -436,7 +443,7 @@ def r11_duplicate_claim_numbers(
         findings.append(
             Finding(
                 rule_id="R-11",
-                severity=Severity.WARN,
+                severity=Severity.ERROR,
                 claim_number=number,
                 field="claim_number",
                 message=(
@@ -615,6 +622,113 @@ def r16_mixed_currency(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
             ),
             expected=doc.currency,
             actual=listed,
+        )
+    ]
+
+
+@rule("R-17")
+def r17_no_money_either_side(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A claim with nothing paid and nothing reserved.
+
+    Legitimate — a report-only claim or one closed without payment — but it is
+    also what a row looks like when its money column failed to map, so it is
+    worth a reviewer's glance rather than silent acceptance.
+    """
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        if claim.paid_total is None and claim.reserve_total is None:
+            continue  # no figures at all is R-07's business, not this rule
+        if _money(claim.paid_total) != 0 or _money(claim.reserve_total) != 0:
+            continue
+        if claim.claim_status is ClaimStatus.REPORT_ONLY:
+            continue  # a report-only claim is meant to carry no money
+        findings.append(
+            Finding(
+                rule_id="R-17",
+                severity=Severity.WARN,
+                claim_number=claim.claim_number,
+                field="paid_total",
+                message=(
+                    "Nothing paid and nothing reserved. Expected for a "
+                    "report-only or closed-without-payment claim; otherwise "
+                    "check the amounts were read from the right columns."
+                ),
+                expected="a paid or reserve amount",
+                actual="0.00 and 0.00",
+                page=claim.source_page,
+            )
+        )
+    return findings
+
+
+@rule("R-18")
+def r18_unstated_basis(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """The document never says whether it is gross or net, or where ALAE sits.
+
+    Neither is ever inferred (spec section 3). Read a net loss run as gross and
+    every claim is understated by the deductible while the sheet looks fine, so
+    the unknown is surfaced rather than quietly defaulted.
+    """
+    findings: list[Finding] = []
+    unknowns = {
+        "deductible_basis": (
+            DeductibleBasis.UNKNOWN,
+            "Whether these amounts are gross or net of the deductible is not "
+            "stated on the document. Confirm with the carrier before pricing.",
+        ),
+        "alae_treatment": (
+            AlaeTreatment.UNKNOWN,
+            "Whether ALAE is included in the indemnity figures or sits beside "
+            "them is not stated on the document. Confirm before comparing to "
+            "another carrier's run.",
+        ),
+    }
+    for field_name, (unknown_value, message) in unknowns.items():
+        if all(getattr(claim, field_name) is unknown_value for claim in doc.claims):
+            findings.append(
+                Finding(
+                    rule_id="R-18",
+                    severity=Severity.WARN,
+                    field=field_name,
+                    message=message,
+                    expected="stated on the document",
+                    actual="unknown",
+                )
+            )
+    return findings
+
+
+@rule("R-19")
+def r19_stitching_row_count(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Claims recovered after stitching pages differ from the rows seen.
+
+    Multi-page tables are stitched into one before validation, dropping
+    repeated headers and per-page subtotals. If that drops more than it should,
+    the count is the first place it shows.
+    """
+    seen = doc.rows_seen_per_page
+    if not seen:
+        return []
+    expected = sum(seen.values())
+    actual = len(doc.claims)
+    if expected == actual:
+        return []
+    return [
+        Finding(
+            rule_id="R-19",
+            severity=Severity.WARN,
+            message=(
+                f"Pages held {expected} claim row(s) but {actual} came through "
+                f"stitching. Repeated headers and per-page subtotals are meant "
+                f"to be dropped; check none of the claims went with them."
+            ),
+            expected=expected,
+            actual=actual,
+            delta=Decimal(actual - expected),
         )
     ]
 
