@@ -137,3 +137,83 @@ def test_a_shape_must_recur_to_count_as_an_identifier():
 def test_a_row_with_money_but_no_identifier_is_reported_not_absorbed(result):
     """Prose folds into the claim above; figures must never be buried in it."""
     assert result.warnings == []  # this document has no such row
+
+
+# --------------------------------------------------------------------------
+# Adversarial cases for the identifier-shape filter
+#
+# The filter that stopped Liberty's over-extraction can just as easily reject
+# claims that are real. These are the shapes a legitimate document might have
+# that the consensus could wrongly refuse.
+# --------------------------------------------------------------------------
+
+
+def _shapes_for(values):
+    from core.pipeline import accepted_identifier_shapes
+    from core.schema import RawRow, RawTable
+
+    class _Mapping:
+        headers = ["Claim Number"]
+        fields = {0: "claim_number"}
+
+        def index_of(self, name):
+            return 0 if name == "claim_number" else None
+
+    table = RawTable(
+        page=1, headers=["Claim Number"],
+        rows=[RawRow(cells=[value]) for value in values],
+    )
+    return accepted_identifier_shapes([table], _Mapping())
+
+
+def _accepts(values, probe=None):
+    from core.pipeline import identifier_shape
+
+    return identifier_shape(probe or values[0]) in _shapes_for(values)
+
+
+def test_a_report_with_one_claim_still_yields_that_claim():
+    """A single-claim loss run is ordinary, and its shape occurs once.
+
+    Requiring a shape to appear twice extracted nothing from these.
+    """
+    assert _accepts(["ABC-2024-0001"])
+
+
+def test_a_short_series_is_accepted():
+    assert _accepts([f"ABC-2024-000{n}" for n in range(1, 4)])
+
+
+def test_two_legitimate_numbering_series_both_survive():
+    """A book numbering WC and GL differently must keep both."""
+    values = ["WC-1001"] * 20 + ["GL-2024-0001"] * 10
+    assert _accepts(values, "WC-1001")
+    assert _accepts(values, "GL-2024-0001")
+
+
+def test_an_identifier_smeared_with_a_neighbouring_column_is_kept():
+    """Column bleed varies by page; the same claim series arrives both ways.
+
+    The identifier leads the cell and the bleed trails it, which is what
+    separates this from a continuation line.
+    """
+    from core.pipeline import claim_identifier
+    from core.schema import RawRow
+
+    class _Mapping:
+        fields = {0: "claim_number"}
+
+        def index_of(self, name):
+            return 0 if name == "claim_number" else None
+
+    shapes = _shapes_for([f"502-09959{n}-001/6556534010US" for n in range(4)])
+    row = RawRow(cells=["502-124958-001/8459543132US Acc/Ben: FL/"])
+    assert claim_identifier(row, _Mapping(), shapes) == "502-124958-001/8459543132US"
+
+
+def test_a_one_off_damaged_identifier_is_not_silently_accepted():
+    """An OCR-mangled number cannot be told from a stray code, so it is not
+    guessed at. The count then disagrees with the printed one, which is what
+    R-05 exists to say out loud."""
+    values = [f"ABC-2024-{n:04d}" for n in range(20)] + ["A8C~2O24~O0O1"]
+    assert not _accepts(values, "A8C~2O24~O0O1")

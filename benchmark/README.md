@@ -95,6 +95,13 @@ is treated as neither success nor failure on its own.
 | F15 | Monetary interpretation |
 | F16 | Source and provenance evidence |
 | F17 | Incorrect clean / reconciliation state |
+| F18 | Multi-line record with per-line headers |
+
+F18 was added from evidence, not to describe one PDF: a layout where the
+header is N lines and each labels a different line of an N-line claim record,
+so the fields of one claim are distributed down the page rather than across
+it. The engine models one header line and one line per claim, so N-1 lines of
+every claim are lost.
 
 Extend this when reality shows a genuinely different class. Do not add a code
 to describe one PDF.

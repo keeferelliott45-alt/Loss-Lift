@@ -371,25 +371,50 @@ def accepted_identifier_shapes(
     # would let each of those define its own, which is how seven junk rows
     # survived. The fraction admits a genuine second series -- a book with
     # both WC and GL numbering -- without admitting one-offs.
+    # The floor can never exceed the most common shape's own count: that shape
+    # is by definition what this document uses, and a report with a single
+    # claim on it is ordinary. Requiring two would extract nothing from it.
     most_common = shapes.most_common(1)[0][1]
-    floor = max(2, int(most_common * 0.25))
+    floor = min(most_common, max(2, int(most_common * 0.25)))
     return {shape for shape, count in shapes.items() if count >= floor}
+
+
+def claim_identifier(
+    row: RawRow, mapping: ColumnMapping, shapes: set[str]
+) -> str | None:
+    """The claim number this row opens, or None if it continues the one above.
+
+    A neighbouring column bleeds into the identifier cell on some pages and
+    not others, so the same claim series arrives clean here and as
+    "502-124958-001/8459543132US Acc/Ben: FL/" there. An identifier leads its
+    cell and the contamination trails it, which is what separates this from a
+    continuation line: the junk that detail layouts put in this column does
+    not begin with an identifier either. Where only the leading token matches,
+    the trailing text belongs to another column and is dropped from the
+    number rather than carried into it.
+    """
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return None
+    cell = row.cell(index).strip()
+    if not cell or not _is_identifier_candidate(cell):
+        return None
+    # No shape consensus means nothing to compare against; fall back to the
+    # basic tests rather than rejecting every row and reporting an empty
+    # document, which R-20 would then have to catch.
+    if not shapes or identifier_shape(cell) in shapes:
+        return cell
+    leading = cell.split()[0]
+    if identifier_shape(leading) in shapes:
+        return leading
+    return None
 
 
 def has_claim_identifier(
     row: RawRow, mapping: ColumnMapping, shapes: set[str]
 ) -> bool:
     """Whether this row opens a claim, rather than continuing the one above."""
-    index = mapping.index_of("claim_number")
-    if index is None:
-        return False
-    cell = row.cell(index).strip()
-    if not cell or not _is_identifier_candidate(cell):
-        return False
-    # No shape consensus means nothing to compare against; fall back to the
-    # basic tests rather than rejecting every row and reporting an empty
-    # document, which R-20 would then have to catch.
-    return not shapes or identifier_shape(cell) in shapes
+    return claim_identifier(row, mapping, shapes) is not None
 
 
 def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
@@ -452,7 +477,8 @@ def build_claims(
             # identifier is the continuation of the claim above it, not a new
             # one. Folding it in keeps its text; treating it as a claim
             # multiplies the count by however many lines each claim occupies.
-            if not has_claim_identifier(row, table_mapping, shapes):
+            identifier = claim_identifier(row, table_mapping, shapes)
+            if identifier is None:
                 extra = clean_text(" ".join(row.cells))
                 # A continuation line carries prose. A row carrying money or a
                 # date is a claim whose number could not be identified, and
@@ -477,6 +503,10 @@ def build_claims(
                 confidence_cap=confidence_cap,
             )
             if claim is not None:
+                # The cell may have carried a neighbouring column's text; the
+                # claim is filed under the identifier, not under the smear.
+                if claim.claim_number != identifier:
+                    claim.claim_number = identifier
                 claims.append(claim)
                 continue
 

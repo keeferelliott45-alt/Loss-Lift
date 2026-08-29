@@ -330,6 +330,14 @@ def extract_page_table(page: pdfplumber.page.Page, page_number: int) -> RawTable
     # A ruled grid usually stops above the footer, leaving the printed totals
     # outside the detected table. R-04 depends on those totals, so borrow them
     # from the word pass when the two agree on the column count.
+    # A ruled grid drawn around the header block alone is still a grid, and
+    # pdfplumber returns it as a table: a header, no data, and the real rows
+    # sitting below it outside the ruling. A table with nothing in it has not
+    # found the table, so where the word pass sees rows and the grid does not,
+    # the rows win.
+    if len(ruled.rows) < 2 and positioned is not None and len(positioned.rows) > len(ruled.rows):
+        return positioned
+
     if not ruled.total_rows and positioned is not None and positioned.total_rows:
         if positioned.column_count == ruled.column_count:
             ruled.total_rows = positioned.total_rows

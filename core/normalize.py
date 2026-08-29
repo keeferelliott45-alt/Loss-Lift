@@ -73,8 +73,14 @@ def clean_text(raw: object) -> str:
 
 
 def normalize_label(raw: object) -> str:
-    """Fold a column header for comparison: lowercase, alphanumerics only."""
-    text = clean_text(raw).lower()
+    """Fold a column header for comparison: lowercase, alphanumerics only.
+
+    "#" becomes the word it stands for. Dropping it turned "Claim # / OneClaim
+    #" into "claim oneclaim", which carries no token saying it is a number, so
+    the column that identifies every claim mapped to nothing. The symbol means
+    "number" wherever a loss run uses it.
+    """
+    text = clean_text(raw).lower().replace("#", " number ")
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
 

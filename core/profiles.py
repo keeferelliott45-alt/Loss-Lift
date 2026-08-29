@@ -123,9 +123,17 @@ _GROUP_TOKENS: dict[str, tuple[str, ...]] = {
 }
 
 _COMPONENT_TOKENS: dict[str, tuple[str, ...]] = {
-    "indemnity": ("indemnity", "indem", "indm", "loss", "losses"),
+    # "ind" and "bi" are the trade's own shorthand: indemnity, and bodily
+    # injury, which is the liability line's name for the same component.
+    "indemnity": ("indemnity", "indem", "indm", "ind", "bi", "loss", "losses"),
+    # "pd" is deliberately absent: it means property damage on a liability
+    # run and "paid" on nearly every other one, where it is already claimed by
+    # the paid group. "Med/PD" resolves on "med" alone, so nothing is lost by
+    # leaving the ambiguous token out.
     "medical": ("medical", "med"),
-    "expense": ("expense", "expenses", "exp", "alae", "lae"),
+    # ALAE is allocated loss adjustment expense; carriers abbreviate the word
+    # "allocated" as often as they spell it.
+    "expense": ("expense", "expenses", "exp", "alae", "lae", "alloc", "allocated"),
     "total": ("total", "tot", "ttl"),
 }
 
