@@ -37,7 +37,7 @@ DEFAULT_TOLERANCE = Decimal("0.01")
 
 #: R-13: a value this many times the column median is almost always a
 #: mis-parse (a stray thousands separator, a merged cell).
-OUTLIER_MULTIPLE = Decimal("10")
+OUTLIER_MULTIPLE = Decimal("100")
 
 
 @dataclass(frozen=True)

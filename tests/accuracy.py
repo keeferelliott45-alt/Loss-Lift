@@ -11,6 +11,7 @@ explicitly by :attr:`FieldReport.nulls_as_zeros`.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -209,3 +210,116 @@ def aggregate(reports: Iterable[AccuracyReport]) -> AccuracyReport:
         total.missing_claims.extend(report.missing_claims)
         total.unexpected_claims.extend(report.unexpected_claims)
     return total
+
+
+# --------------------------------------------------------------------------
+# Per carrier, and the regression gate
+# --------------------------------------------------------------------------
+
+#: Recorded accuracy per carrier. A build fails if any carrier drops below it.
+BASELINE_PATH = Path(__file__).resolve().parent / "golden" / "accuracy_baseline.json"
+
+#: Float comparison slack. Accuracy is a ratio of integers, so anything beyond
+#: this is a real change in how many fields were read correctly.
+BASELINE_EPSILON = 1e-9
+
+
+def by_carrier(
+    reports: dict[str, AccuracyReport], fixtures: Iterable[Any]
+) -> dict[str, AccuracyReport]:
+    """Regroup per-fixture reports under the carrier each fixture imitates.
+
+    A blended average hides the case that matters: one carrier's format
+    regressing while the rest carry the mean. Accuracy is only actionable per
+    carrier, because a fix is per carrier.
+    """
+    grouped: dict[str, list[AccuracyReport]] = {}
+    for fixture in fixtures:
+        report = reports.get(fixture.name)
+        if report is not None:
+            grouped.setdefault(fixture.carrier, []).append(report)
+    merged: dict[str, AccuracyReport] = {}
+    for carrier, group in sorted(grouped.items()):
+        total = aggregate(group)
+        total.name = carrier
+        merged[carrier] = total
+    return merged
+
+
+def baseline_entry(report: AccuracyReport) -> dict[str, Any]:
+    return {
+        "money": round(report.money.accuracy, 6),
+        "other": round(report.other.accuracy, 6),
+        "money_fields": report.money.expected_non_null,
+        "other_fields": report.other.expected_non_null,
+        "rows": report.expected_rows,
+    }
+
+
+def load_baseline(path: Path = BASELINE_PATH) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def write_baseline(
+    reports: dict[str, AccuracyReport], path: Path = BASELINE_PATH
+) -> None:
+    payload = {carrier: baseline_entry(r) for carrier, r in sorted(reports.items())}
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+@dataclass
+class Regression:
+    carrier: str
+    metric: str
+    baseline: float
+    current: float
+
+    def __str__(self) -> str:  # pragma: no cover - diagnostics
+        return (
+            f"{self.carrier} {self.metric}: was {self.baseline:.2%}, "
+            f"now {self.current:.2%}"
+        )
+
+
+def regressions(
+    reports: dict[str, AccuracyReport], baseline: dict[str, dict[str, Any]]
+) -> list[Regression]:
+    """Carriers that read less accurately than the recorded baseline.
+
+    Only drops are reported. An improvement is not a failure — it is a reason
+    to refresh the baseline so the new level is the one being held.
+    """
+    found: list[Regression] = []
+    for carrier, report in sorted(reports.items()):
+        recorded = baseline.get(carrier)
+        if recorded is None:
+            continue  # a carrier with no baseline yet; the test names it separately
+        for metric, current in (
+            ("money", report.money.accuracy),
+            ("other", report.other.accuracy),
+        ):
+            was = float(recorded.get(metric, 0.0))
+            if current < was - BASELINE_EPSILON:
+                found.append(Regression(carrier, metric, was, current))
+    return found
+
+
+def carrier_table(reports: dict[str, AccuracyReport]) -> str:
+    """The per-carrier report, for a human reading a build log."""
+    width = max((len(name) for name in reports), default=7)
+    lines = [f"{'carrier':<{width}}  {'money':>9}  {'text':>9}  {'rows':>9}"]
+    for carrier, report in sorted(reports.items()):
+        lines.append(
+            f"{carrier:<{width}}  {report.money.accuracy:>9.2%}  "
+            f"{report.other.accuracy:>9.2%}  "
+            f"{report.extracted_rows:>4}/{report.expected_rows:<4}"
+        )
+    total = aggregate(reports.values())
+    lines.append(
+        f"{'ALL':<{width}}  {total.money.accuracy:>9.2%}  "
+        f"{total.other.accuracy:>9.2%}  "
+        f"{total.extracted_rows:>4}/{total.expected_rows:<4}"
+    )
+    return "\n".join(lines)

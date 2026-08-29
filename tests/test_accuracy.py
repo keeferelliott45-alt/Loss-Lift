@@ -10,7 +10,15 @@ from decimal import Decimal
 import pytest
 
 from core.schema import DocumentStatus, Severity
-from tests.accuracy import aggregate, score_all, score_fixture
+from tests.accuracy import (
+    aggregate,
+    by_carrier,
+    carrier_table,
+    load_baseline,
+    regressions,
+    score_all,
+    score_fixture,
+)
 from tests.golden.fixtures import DIGITAL_FIXTURES
 from tests.golden.generate import load_meta
 
@@ -203,3 +211,105 @@ def test_accuracy_report_is_printable(reports, capsys):
     print("\n" + "\n".join(r.summary() for r in reports.values()))
     print(total.summary())
     assert "money" in total.summary()
+
+
+# --------------------------------------------------------------------------
+# Per carrier, and the regression gate (spec section 10)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def carriers(reports):
+    return by_carrier(reports, DIGITAL_FIXTURES)
+
+
+def test_every_carrier_is_scored_separately(carriers):
+    """A blended average hides one carrier regressing behind the others."""
+    assert len(carriers) >= 8
+    assert set(carriers) == {fixture.carrier for fixture in DIGITAL_FIXTURES}
+
+
+def test_every_carrier_meets_the_digital_thresholds(carriers):
+    poor = {
+        carrier: report.summary()
+        for carrier, report in carriers.items()
+        if report.money.accuracy < MONEY_ACCURACY_DIGITAL
+        or report.other.accuracy < TEXT_ACCURACY_DIGITAL
+    }
+    assert not poor, "\n".join(poor.values())
+
+
+def test_the_baseline_covers_every_carrier(carriers):
+    """A new carrier format must be recorded before it can be defended.
+
+    Refresh with: python -m tests.golden.baseline --update
+    """
+    missing = sorted(set(carriers) - set(load_baseline()))
+    assert not missing, (
+        "no recorded baseline for: " + ", ".join(missing)
+        + "\nrun: python -m tests.golden.baseline --update"
+    )
+
+
+def test_no_carrier_reads_less_accurately_than_the_baseline(carriers):
+    """The build fails on a drop, not on an absolute number.
+
+    The thresholds above are the floor; this is the ratchet. Extraction that
+    used to read a carrier perfectly and now does not is a regression even
+    when it stays above 99.5%.
+    """
+    dropped = regressions(carriers, load_baseline())
+    assert not dropped, "\n".join(
+        [str(regression) for regression in dropped]
+        + ["", carrier_table(carriers),
+           "", "if the drop is intended: python -m tests.golden.baseline --update"]
+    )
+
+
+def test_the_carrier_table_is_printable(carriers, capsys):
+    print(carrier_table(carriers))
+    out = capsys.readouterr().out
+    assert "carrier" in out and "ALL" in out
+    for carrier in carriers:
+        assert carrier in out
+
+
+def _report(name, money=(1, 1), other=(1, 1)):
+    from tests.accuracy import AccuracyReport
+    report = AccuracyReport(name=name)
+    report.money.correct, report.money.expected_non_null = money
+    report.other.correct, report.other.expected_non_null = other
+    return report
+
+
+def test_the_gate_reports_a_drop():
+    """A carrier reading worse than recorded is named, with both numbers."""
+    current = {"Acme": _report("Acme", money=(8, 10))}
+    dropped = regressions(current, {"Acme": {"money": 1.0, "other": 1.0}})
+    assert [(d.carrier, d.metric) for d in dropped] == [("Acme", "money")]
+    assert dropped[0].baseline == 1.0 and dropped[0].current == 0.8
+
+
+def test_the_gate_ignores_an_improvement():
+    """Reading better than recorded is not a failure."""
+    current = {"Acme": _report("Acme", money=(10, 10))}
+    assert regressions(current, {"Acme": {"money": 0.5, "other": 0.5}}) == []
+
+
+def test_the_gate_says_nothing_about_an_unrecorded_carrier():
+    """Absence is handled by the baseline-coverage test, not silently passed."""
+    assert regressions({"New": _report("New", money=(1, 10))}, {}) == []
+
+
+def test_carriers_merge_their_fixtures():
+    """Two formats from one carrier score as one carrier, not two."""
+    from types import SimpleNamespace
+    reports = {"a": _report("a", money=(1, 2)), "b": _report("b", money=(3, 4))}
+    fixtures = [
+        SimpleNamespace(name="a", carrier="Acme"),
+        SimpleNamespace(name="b", carrier="Acme"),
+    ]
+    merged = by_carrier(reports, fixtures)
+    assert set(merged) == {"Acme"}
+    assert merged["Acme"].money.correct == 4
+    assert merged["Acme"].money.expected_non_null == 6

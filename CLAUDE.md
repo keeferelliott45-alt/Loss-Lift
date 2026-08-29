@@ -225,7 +225,7 @@ Default money tolerance: `Decimal("0.01")`. Make it configurable per profile —
 | R-10 | Date ordering `date_of_loss <= date_reported <= valuation_date` | WARN |
 | R-11 | Duplicate `claim_number` within one carrier + policy | ERROR |
 | R-12 | Same claim appearing on two pages (cross-page continuation artifact) | WARN |
-| R-13 | Value exceeds 10× the column median | WARN |
+| R-13 | Value exceeds 100× the column median | WARN |
 | R-14 | Negative `paid_total` | INFO (legitimate recovery) |
 | R-15 | Any field with `AMBIGUOUS_SEPARATOR` or null-with-reason | WARN |
 | R-16 | Mixed currency symbols within one document | WARN |
@@ -326,6 +326,17 @@ full set runs before any deploy and a regression fails the build. Fixtures are
 *structure* is reproduced synthetically and that is what gets committed (spec
 section 9). A verified mapping is cached as a carrier profile — structure only,
 never the file.
+
+**Per-carrier accuracy and the ratchet.** `python -m tests.golden.baseline`
+prints accuracy per carrier; `--update` records it to
+`tests/golden/accuracy_baseline.json`, which is committed. The thresholds below
+are the floor; the baseline is the ratchet. A change that drops any carrier
+below its recorded accuracy fails the build even when it stays above 99.5%,
+because extraction that used to read a carrier perfectly and now does not is a
+regression whatever the absolute number says. An improvement never fails —
+refresh the baseline so the better number is the one being defended. A new
+carrier format has to be recorded before it can be defended, so adding a
+fixture means refreshing the file.
 
 **Thresholds before charging anyone:**
 - Money fields: ≥ 99.5% on digital PDFs
