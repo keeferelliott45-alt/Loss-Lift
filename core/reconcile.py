@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Nineteen rules, each returning zero or more :class:`~core.schema.Finding`
+Twenty rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -729,6 +729,37 @@ def r19_stitching_row_count(
             expected=expected,
             actual=actual,
             delta=Decimal(actual - expected),
+        )
+    ]
+
+
+@rule("R-20")
+def r20_no_claims_extracted(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A document that produced no claims is never clean.
+
+    Both explanations are real. The account may genuinely have no losses, which
+    is a good submission and worth stating plainly. Or the table was not read
+    at all, which looks identical from here — no rows, no arithmetic to check,
+    and every other rule silent because there is nothing to test. Reporting
+    that as reconciled is the worst failure this app can have: materially
+    wrong output wearing a green badge. Which of the two it is, is a
+    reviewer's call, so the rule states both and refuses to guess.
+    """
+    if doc.claims:
+        return []
+    return [
+        Finding(
+            rule_id="R-20",
+            severity=Severity.ERROR,
+            message=(
+                "No claims were read from this document. Either the account "
+                "genuinely has no losses, or the claim table was not "
+                "recognised — confirm against the PDF before exporting."
+            ),
+            expected="at least one claim",
+            actual=0,
         )
     ]
 

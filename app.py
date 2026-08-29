@@ -187,6 +187,7 @@ _DATA_QUALITY_RULES = {
     "R-01", "R-02", "R-03", "R-04", "R-05", "R-06", "R-07",  # arithmetic + required fields
     "R-11", "R-12",  # duplicates caused by extraction
     "R-15",          # unreadable / ambiguous -- the document, not the claim
+    "R-20",          # nothing extracted at all -- never a clean document
 }
 
 

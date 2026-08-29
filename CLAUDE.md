@@ -232,6 +232,8 @@ Default money tolerance: `Decimal("0.01")`. Make it configurable per profile —
 | R-17 | Claim with zero paid **and** zero reserve | WARN |
 | R-18 | `deductible_basis` or `alae_treatment` is `unknown` | WARN |
 | R-19 | Rows recovered after page stitching ≠ rows seen per page | WARN |
+| R-20 | No claims extracted at all | ERROR |
+| | A document that produced nothing must never read as reconciled. The account may truly be loss-free, or the table may not have been read; the rule states both and leaves the call to a reviewer. | |
 
 **Hard fails (ERROR) block a clean export; soft flags (WARN/INFO) never do.**
 The date rules R-09 and R-10 are deliberately soft: real loss runs report a

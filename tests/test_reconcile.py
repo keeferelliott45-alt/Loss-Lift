@@ -68,7 +68,25 @@ def test_a_clean_document_is_clean():
 
 
 def test_every_rule_is_registered():
-    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 20)]
+    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 21)]
+
+
+def test_a_document_with_no_claims_is_never_clean():
+    """The worst failure available: nothing read, reported as reconciled.
+
+    Every other rule is silent on an empty document — no rows, no arithmetic
+    to check — so without R-20 an unreadable table exports a green badge and
+    an empty sheet. Whether the account is genuinely loss-free or the table
+    was missed is a reviewer's call, not the app's.
+    """
+    result = reconcile(build_doc([]))
+    assert [f.rule_id for f in result.errors] == ["R-20"]
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_document_with_claims_does_not_trip_the_empty_rule():
+    result = reconcile(build_doc([good_claim()]))
+    assert "R-20" not in {f.rule_id for f in result.findings}
 
 
 # --- R-01 ------------------------------------------------------------------
