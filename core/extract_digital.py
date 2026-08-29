@@ -287,9 +287,15 @@ def _merge_header_fragments(
         words=tuple(sorted(above.words + header.words, key=lambda word: word.x0)),
         index=header_index,
     )
+    # Accept a tie. Merging only ever adds the qualifying word a wrapped label
+    # left on the line above -- "Loss"/"Occur"/"Closed" over three columns that
+    # all read "Date" on their own. Those score the same as one bare "Date" but
+    # are the difference between knowing which date is the date of loss and
+    # not. A merge with a line that is not a header still loses: its words land
+    # inside the real labels and the score drops, which this rejects.
     before = [text for text, _, _ in split_cells(header, char_width)]
     after = [text for text, _, _ in split_cells(merged, char_width)]
-    return merged if header_score(after) > header_score(before) else None
+    return merged if header_score(after) >= header_score(before) else None
 
 
 def find_header_line(
@@ -676,6 +682,18 @@ def extract_pdf(
         ),
         None,
     )
+    # A valuation date need not be printed on page 1. Some carriers state it
+    # once, on whichever page the numbers begin. Missing it is a hard fail
+    # (R-06), so it is worth looking at every page before concluding it is
+    # absent -- the patterns are specific enough that a later page cannot
+    # supply a false one.
+    if metadata.valuation_date_text is None:
+        for _, text in sorted(page_texts.items()):
+            found = _first_match(text, _VALUATION_PATTERNS)
+            if found:
+                metadata.valuation_date_text = found
+                break
+
     # Sections declare a period each, and only page 1's reached the metadata.
     # Collect them all so the document's span covers every claim it lists.
     seen: set[tuple[str, str]] = set()
