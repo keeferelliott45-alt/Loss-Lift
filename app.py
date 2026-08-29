@@ -496,6 +496,8 @@ def _queue_summary() -> None:
 #: Widths and headings for the queue table. The heading row and the data rows
 #: are laid out separately, so they share these to stay aligned.
 _QUEUE_COLUMNS = [0.6, 0.8, 2.5, 1.4, 0.9, 1.3, 1.1, 0.8]
+#: Rows rendered before the list is capped. Roughly a screenful.
+_QUEUE_PAGE_SIZE = 20
 _QUEUE_HEADINGS = [
     "Export", "Reviewed", "Document", "Status", "Claims",
     "Total incurred", "Valuation", "",
@@ -569,14 +571,35 @@ def _queue_toolbar_and_list() -> None:
         return
 
     _batch_export_bar(visible_ids)
+
+    # Every row is a live set of controls, and the browser re-renders all of
+    # them on any interaction anywhere on the page. Past a screenful that cost
+    # is paid on every click for rows nobody is looking at, so show a page at a
+    # time and let the search and filters above do the narrowing.
+    shown, hidden = visible_ids, 0
+    if len(visible_ids) > _QUEUE_PAGE_SIZE:
+        if not st.checkbox(
+            f"Show all {len(visible_ids)} documents",
+            key="show_all_rows",
+            help="Off by default: a long list re-renders every row on every "
+                 "click, which is what makes the queue feel slow.",
+        ):
+            shown = visible_ids[:_QUEUE_PAGE_SIZE]
+            hidden = len(visible_ids) - _QUEUE_PAGE_SIZE
     st.divider()
 
     header = st.columns(_QUEUE_COLUMNS)
     for col, title in zip(header, _QUEUE_HEADINGS):
         col.markdown(f"**{title}**")
 
-    for document_id in visible_ids:
+    for document_id in shown:
         _queue_row(document_id)
+
+    if hidden:
+        st.caption(
+            f"{hidden} more not shown. Search or filter to narrow the list, "
+            f"or tick \u201cShow all\u201d above."
+        )
 
 
 def _queue_row(document_id: str) -> None:

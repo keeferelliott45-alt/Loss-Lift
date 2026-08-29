@@ -1,4 +1,27 @@
-[server]
-headless = true
+# Local-run settings. The defaults are tuned for Streamlit's hosted service and
+# cost real seconds per interaction on a laptop.
+
 [browser]
+# Streamlit posts usage telemetry to an external endpoint on load and on
+# interaction. When that endpoint is slow to answer or blocked by a firewall or
+# VPN, the request stalls and the page appears frozen — the "click Open, wait,
+# click again" symptom. Off is also the right setting for an app that handles
+# claimant data (spec section 9).
 gatherUsageStats = false
+
+[server]
+# The default watcher walks the working directory on every rerun. This project
+# writes carrier profiles and holds uploaded PDFs under its own tree, so that
+# walk grows with use, and on Windows each stat goes through the antivirus
+# filter driver. Nothing here needs hot reload at run time; restart to pick up
+# code changes.
+fileWatcherType = "none"
+
+[runner]
+# Let a new click interrupt the run in progress instead of queueing behind it.
+# Without this, clicking a slow button twice runs it twice, one after the other.
+fastReruns = true
+
+[client]
+# Drops the "Deploy" toolbar, which is not useful when running locally.
+toolbarMode = "minimal"
