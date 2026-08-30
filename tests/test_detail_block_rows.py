@@ -25,11 +25,8 @@ from decimal import Decimal
 import pymupdf
 import pytest
 
-from core.pipeline import (
-    accepted_identifier_shapes,
-    identifier_shape,
-    run_pipeline,
-)
+from core.pipeline import accepted_identifier_shapes, run_pipeline
+from core.records import identifier_shape
 
 FONT = "helv"
 SIZE = 7.5
@@ -167,7 +164,6 @@ def _shapes_for(values):
 
 
 def _accepts(values, probe=None):
-    from core.pipeline import identifier_shape
 
     return identifier_shape(probe or values[0]) in _shapes_for(values)
 

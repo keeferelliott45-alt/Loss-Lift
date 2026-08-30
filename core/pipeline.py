@@ -7,7 +7,6 @@ UI does any of this work.
 
 from __future__ import annotations
 
-import collections
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -41,6 +40,11 @@ from core.profiles import (
     load_profile,
     page_top_text,
     resolve_columns,
+)
+from core.records import (
+    consensus_shapes,
+    is_identifier_candidate,
+    leading_identifier,
 )
 from core.reconcile import ReconcileConfig, reconcile
 from core.schema import (
@@ -320,43 +324,6 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     return clean_text(" ".join(row.cells)) or None
 
 
-#: A cell shorter than this is a code or a stray digit, never a claim number.
-MIN_IDENTIFIER_LENGTH = 3
-
-#: A whole cell that is just a date. Claim numbers are not dates.
-DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
-
-
-def identifier_shape(text: str) -> str:
-    """The cell's pattern with the specifics removed: WC550C44573 -> AA999A99999.
-
-    Claim numbers inside one document are issued by one system and share a
-    shape. Comparing shapes rather than values is what lets a document say
-    which of its own cells are identifiers without anyone naming the carrier.
-    """
-    return "".join(
-        "9" if char.isdigit() else "A" if char.isalpha() else char for char in text
-    )
-
-
-def _is_identifier_candidate(text: str) -> bool:
-    """The tests any claim number passes, before the document has its say.
-
-    A continuation line that lands in the claim-number column fails at least
-    one of these: injury text carries no digit, a bare code is too short, and
-    a date belongs to a date column that has bled left.
-    """
-    if len(text) < MIN_IDENTIFIER_LENGTH:
-        return False
-    if not any(char.isdigit() for char in text):
-        return False
-    # Date-shaped, not date-parseable: an ambiguous date like 11/11/19 does
-    # not resolve without document evidence and so parses to None, which would
-    # otherwise read as "not a date" and let a date column bleed in as an
-    # identifier.
-    return not DATE_SHAPED.fullmatch(text)
-
-
 def accepted_identifier_shapes(
     tables: Sequence[RawTable], mapping: ColumnMapping
 ) -> set[str]:
@@ -381,28 +348,9 @@ def accepted_identifier_shapes(
             continue
         for row in table.rows:
             cell = row.cell(index).strip()
-            if cell and _is_identifier_candidate(cell):
+            if cell and is_identifier_candidate(cell):
                 candidates.append(cell)
-    if not candidates:
-        return set()
-
-    single = [text for text in candidates if " " not in text]
-    shapes = collections.Counter(
-        identifier_shape(text) for text in (single or candidates)
-    )
-
-    # A shape has to recur to count as this document's. A claim number is
-    # issued in a series, so its shape appears once per claim; a mangled code
-    # that slipped the tests above appears once or twice. Keeping every shape
-    # would let each of those define its own, which is how seven junk rows
-    # survived. The fraction admits a genuine second series -- a book with
-    # both WC and GL numbering -- without admitting one-offs.
-    # The floor can never exceed the most common shape's own count: that shape
-    # is by definition what this document uses, and a report with a single
-    # claim on it is ordinary. Requiring two would extract nothing from it.
-    most_common = shapes.most_common(1)[0][1]
-    floor = min(most_common, max(2, int(most_common * 0.25)))
-    return {shape for shape, count in shapes.items() if count >= floor}
+    return consensus_shapes(candidates)
 
 
 def claim_identifier(
@@ -422,18 +370,10 @@ def claim_identifier(
     index = mapping.index_of("claim_number")
     if index is None:
         return None
-    cell = row.cell(index).strip()
-    if not cell or not _is_identifier_candidate(cell):
-        return None
-    # No shape consensus means nothing to compare against; fall back to the
-    # basic tests rather than rejecting every row and reporting an empty
-    # document, which R-20 would then have to catch.
-    if not shapes or identifier_shape(cell) in shapes:
-        return cell
-    leading = cell.split()[0]
-    if identifier_shape(leading) in shapes:
-        return leading
-    return None
+    # No shape consensus means nothing to compare against; leading_identifier
+    # falls back to the basic tests rather than rejecting every row and
+    # reporting an empty document, which R-20 would then have to catch.
+    return leading_identifier(row.cell(index), shapes)
 
 
 def has_claim_identifier(

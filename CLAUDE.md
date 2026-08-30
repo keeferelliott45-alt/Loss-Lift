@@ -164,6 +164,23 @@ Per page, count extractable characters via PyMuPDF. `< 50 chars/page` → scanne
 **Stage 2a — Digital extraction** (`core/extract_digital.py`)
 `pdfplumber.extract_tables()` first. Where table detection fails (very common on loss runs, which are often positioned text rather than ruled tables), fall back to word-position clustering: extract words with x/y coordinates, cluster by y to form rows, cluster by x to form columns, using the header row's x-positions as column boundaries.
 
+Not every carrier gives a claim one line. Some spend three: the claimant on
+one, the identifier and status on the next, the dates and money on a third,
+under a header block with one line of labels per record line. `core/records.py`
+reconstructs those, and the rule it works to is that **incorrect association is
+worse than incomplete association**. The header block proposes a shape — how
+many lines, and which of them names the claim — and the body confirms it: every
+claim number found anchors one record, which is the fixed span of lines around
+that anchor and nothing else. A span is taken only when it holds exactly one
+identifier, contains no line that ends a record, sits closer together than
+records sit apart, and overlaps no span already taken. An anchor failing any of
+those keeps its lines to itself, and the claim keeps its null fields.
+
+Nothing outside a span is ever read into a claim, so a section total printed
+hard against the last claim cannot be absorbed by it — not because the total is
+recognised, but because the record's extent was settled before the total was
+reached. A merged row records every printed line it came from.
+
 **Stage 2b — Vision extraction** (`core/extract_vision.py`)
 Render pages at 300 DPI with PyMuPDF, send to Gemini with the JSON schema. Only for scanned pages. Mark every field `source_method="vision"` and cap confidence at 0.85 regardless of model output.
 
@@ -214,6 +231,7 @@ Default money tolerance: `Decimal("0.01")`. Make it configurable per profile —
 |---|---|---|
 | R-01 | `paid_total + reserve_total - recovery_total == incurred_total` per row | ERROR |
 | | Recoveries stay in the identity: a carrier printing a $138.26 third-party recovery makes `paid + reserve == incurred` wrong by exactly that. | |
+| | Where a carrier prints the components of paid or reserve and no total of them, **all** of that group must be on the row before their sum stands in for it. Half a group is not a total: the rest may be in a column that was never mapped, and adding up what happens to be present reports that column as the carrier's arithmetic error. | |
 | R-02 | `paid_indemnity + paid_medical + paid_expense == paid_total` where components exist | ERROR |
 | R-03 | `reserve_indemnity + reserve_medical + reserve_expense == reserve_total` | ERROR |
 | R-04 | Column sum equals the printed footer total, per money column | ERROR |

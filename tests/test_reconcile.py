@@ -131,6 +131,39 @@ def test_r01_treats_missing_recovery_as_no_recovery():
     assert ids_for(reconcile(build_doc([claim])), "R-01") == []
 
 
+def test_r01_uses_the_components_when_a_carrier_prints_no_paid_total():
+    """AIG prints indemnity, medical and expense paid, and no total of them."""
+    broken = good_claim(
+        paid_total=None, recovery_total=None, incurred_total=Decimal("600.00")
+    )
+    findings = ids_for(reconcile(build_doc([broken])), "R-01")
+    assert len(findings) == 1
+    assert findings[0].expected == Decimal("525.00")  # 175 paid + 350 reserve
+
+    whole = good_claim(
+        paid_total=None, recovery_total=None, incurred_total=Decimal("525.00")
+    )
+    assert ids_for(reconcile(build_doc([whole])), "R-01") == []
+
+
+def test_r01_will_not_unlock_itself_from_half_a_group_of_components():
+    """One component present is not a paid total; the rest may be unmapped.
+
+    CNA prints an Expenses Total this engine does not map, and no total of
+    either paid or reserve. Adding up the indemnity that *is* mapped and
+    calling it the paid figure turned that unmapped column into a six-figure
+    arithmetic error against a carrier that had made none. With neither side
+    of the identity stated, the rule has nothing to check and says so.
+    """
+    claim = good_claim(
+        paid_total=None, paid_medical=None, paid_expense=None,
+        reserve_total=None, reserve_indemnity=Decimal("0.00"),
+        reserve_medical=None, reserve_expense=None,
+        recovery_total=None, incurred_total=Decimal("600.00"),
+    )
+    assert ids_for(reconcile(build_doc([claim])), "R-01") == []
+
+
 # --- R-02 / R-03 -----------------------------------------------------------
 
 

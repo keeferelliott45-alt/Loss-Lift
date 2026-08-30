@@ -108,8 +108,17 @@ reconcile perfectly with a column's money silently discarded.
 F18 was added from evidence, not to describe one PDF: a layout where the
 header is N lines and each labels a different line of an N-line claim record,
 so the fields of one claim are distributed down the page rather than across
-it. The engine models one header line and one line per claim, so N-1 lines of
-every claim are lost.
+it. The engine modelled one header line and one line per claim, so N-1 lines of
+every claim were lost.
+
+Closing it is more dangerous than leaving it open. A claim missing its dates
+and money announces itself — R-07 fires on every row. A claim that has been
+given the line beneath it, when that line belonged to the next claim, announces
+nothing: it is complete, it is plausible, and the column totals still tie. So
+the mechanism is built to refuse. The header block proposes a record shape and
+the body has to bear it out, anchor by anchor; a span that cannot be settled is
+left alone and its claim comes back incomplete. Six of the ten regression
+fixtures assert exactly that outcome rather than a recovered claim.
 
 Extend this when reality shows a genuinely different class. Do not add a code
 to describe one PDF.

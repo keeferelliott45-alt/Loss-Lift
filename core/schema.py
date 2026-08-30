@@ -573,6 +573,13 @@ class RawRow(BaseModel):
     bbox: tuple[float, float, float, float] | None = None
     kind: str = "data"  # data | total | header
 
+    #: Every printed line this row was read from, when a carrier spreads one
+    #: claim over several. Empty means the row is one line, at ``line_index``.
+    #: Reconstruction has to leave a trail: a reviewer looking at a merged
+    #: record needs to know which lines on the page it came from, and a
+    #: reader of this row needs to be able to tell that it was merged at all.
+    source_lines: list[int] = Field(default_factory=list)
+
     def cell(self, index: int) -> str:
         return self.cells[index] if 0 <= index < len(self.cells) else ""
 
@@ -592,7 +599,7 @@ class RawTable(BaseModel):
     headers: list[str] = Field(default_factory=list)
     rows: list[RawRow] = Field(default_factory=list)
     total_rows: list[RawRow] = Field(default_factory=list)
-    strategy: str = "words"  # words | ruled | vision
+    strategy: str = "words"  # words | ruled | records | vision
     header_line_index: int | None = None
     column_bounds: list[tuple[float, float]] = Field(default_factory=list)
 

@@ -21,8 +21,17 @@ from typing import Any, Iterable, Sequence
 import pdfplumber
 
 from core.normalize import clean_text, parse_int
-from core.profiles import header_score, looks_like_header
-from core.schema import RawRow, RawTable
+from core.profiles import guess_field, header_score, looks_like_header
+from core.records import (
+    DATE_SHAPED,
+    RecordLayout,
+    consensus_shapes,
+    detect_layout,
+    group_records,
+    is_identifier_candidate,
+    leading_identifier,
+)
+from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable
 
 #: A line whose leading words say "total" closes the table.
 TOTAL_ROW_PATTERN = re.compile(r"\b(?:grand\s+)?(?:report\s+)?totals?\b", re.IGNORECASE)
@@ -38,6 +47,19 @@ MIN_GUTTER = 4.0
 
 #: Words closer than this many multiples of a character width belong together.
 CELL_GAP_FACTOR = 1.8
+
+#: The blank channel that separates two columns, as a multiple of character
+#: width. Narrower than CELL_GAP_FACTOR because a column boundary survives on
+#: every line of the table, whereas words inside one cell only sometimes part.
+COLUMN_GUTTER_FACTOR = 1.2
+
+#: A line that says how many claims a section holds. Carriers print it beside
+#: the section's amounts, directly under the last claim, which makes it the
+#: line most likely to be mistaken for part of that claim.
+CLAIM_COUNT_LABEL = re.compile(
+    r"\b(?:claims?|losses|loss)\s*(?:count|cnt)\b|\bcount\s+of\s+(?:claims?|losses)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -137,9 +159,11 @@ def cluster_lines(words: Sequence[Word]) -> list[Line]:
     ]
 
 
-def split_cells(line: Line, char_width: float) -> list[tuple[str, float, float]]:
+def split_cells(
+    line: Line, char_width: float, gap_factor: float = CELL_GAP_FACTOR
+) -> list[tuple[str, float, float]]:
     """Split one line into cells on the wide gaps between words."""
-    threshold = max(MIN_GUTTER, CELL_GAP_FACTOR * char_width)
+    threshold = max(MIN_GUTTER, gap_factor * char_width)
     cells: list[tuple[str, float, float]] = []
     buffer: list[Word] = []
     for word in line.words:
@@ -169,7 +193,7 @@ def column_bounds(lines: Sequence[Line], char_width: float) -> list[tuple[float,
         return []
 
     spans.sort()
-    gutter = max(MIN_GUTTER, char_width * 1.2)
+    gutter = max(MIN_GUTTER, char_width * COLUMN_GUTTER_FACTOR)
     merged: list[list[float]] = [spans[0][:]]
     for start, end in spans[1:]:
         if start - merged[-1][1] < gutter:
@@ -408,6 +432,302 @@ def _extract_ruled_table(
     return None
 
 
+# --------------------------------------------------------------------------
+# Claims printed across several lines
+# --------------------------------------------------------------------------
+
+
+def header_block(
+    lines: Sequence[Line], header_index: int, char_width: float
+) -> list[Line]:
+    """The run of label lines ending at the line that scored as the header.
+
+    A carrier that prints a claim over three lines heads it with three lines of
+    labels, one per record line. Walking up from the header collects them:
+    label lines carry no digits, and each sits one line-height above the next.
+    The walk stops at the first line that fails either test, which is what
+    keeps the policy heading and the valuation date out of the block.
+    """
+    header = next((line for line in lines if line.index == header_index), None)
+    if header is None or not header.words:
+        return []
+
+    height = max(word.bottom - word.top for word in header.words)
+    block = [header]
+    for index in range(header_index - 1, -1, -1):
+        above = next((line for line in lines if line.index == index), None)
+        if above is None or not above.words:
+            break
+        if any(char.isdigit() for word in above.words for char in word.text):
+            break
+        gap = min(word.top for word in block[0].words) - min(
+            word.top for word in above.words
+        )
+        if not 0 < gap <= height * 2:
+            break
+        block.insert(0, above)
+    return block
+
+
+def _ends_a_record(line: Line, cells: Sequence[tuple[str, float, float]]) -> bool:
+    """Whether this line closes whatever came before it, rather than continuing it.
+
+    Section totals, claim counts, repeated headers and printed metadata all sit
+    flush against the claims around them, and a record that reached across one
+    would take its money for a claim's own. A label followed by a colon marks
+    the metadata: "Policy :", "Pol-Asco-Mod:". No claim number contains one.
+    """
+    if _is_total_line(line) or CLAIM_COUNT_LABEL.search(line.text):
+        return True
+    if looks_like_header([text for text, _, _ in cells]):
+        return True
+    label, separator, _ = (cells[0][0] if cells else "").partition(":")
+    return bool(separator) and bool(label) and label.replace(" ", "").replace(
+        "-", ""
+    ).isalpha()
+
+
+def _pair_labels(
+    header_cells: Sequence[tuple[str, float, float]],
+    bounds: Sequence[tuple[float, float]],
+) -> list[str]:
+    """Name each detected column, and leave it unnamed rather than guess.
+
+    Money prints right-aligned under a left-aligned label, so the label and its
+    own values need not overlap at all; matching purely on geometry puts every
+    amount one column to the left of where it belongs. Matching purely on order
+    is worse when a column is missing. So order is used, and only where it
+    agrees with geometry everywhere geometry has an opinion — a label that
+    overlaps a column must be that column's. Where the two disagree, only the
+    columns a label demonstrably sits over are named, and the rest carry no
+    label and so assert nothing.
+    """
+
+    def over(cell: tuple[str, float, float]) -> list[int]:
+        return [
+            index
+            for index, (start, end) in enumerate(bounds)
+            if min(cell[2], end) - max(cell[1], start) > 0
+        ]
+
+    if len(header_cells) == len(bounds) and all(
+        not (hit := over(cell)) or index in hit
+        for index, cell in enumerate(header_cells)
+    ):
+        return [text for text, _, _ in header_cells]
+
+    labels: list[str] = []
+    for start, end in bounds:
+        sitting = [
+            text
+            for text, x0, x1 in header_cells
+            if min(x1, end) - max(x0, start) > 0
+        ]
+        labels.append(sitting[0] if len(sitting) == 1 else "")
+    return labels
+
+
+#: A printed amount: digits, separators, and the punctuation carriers wrap them
+#: in. Enough to tell an amount from a date or a word, which is all it is for.
+MONEY_SHAPED = re.compile(r"[($€£]?-?[\d,. ]*\d[\d,. ]*[)%\-]?$")
+
+
+def _agrees(value: str, label: str) -> bool:
+    """Whether this cell holds the kind of thing its column claims to hold."""
+    field_name = guess_field(label).field
+    if field_name in MONEY_FIELDS:
+        return bool(MONEY_SHAPED.fullmatch(value)) and not DATE_SHAPED.fullmatch(value)
+    if field_name in DATE_FIELDS:
+        return bool(DATE_SHAPED.fullmatch(value))
+    if field_name == "claim_number":
+        return is_identifier_candidate(value)
+    return False
+
+
+def _fitting_slice(
+    line: Line, slices: Sequence[tuple[list[tuple[float, float]], list[str]]]
+) -> int:
+    """Which record line's columns this stray line was printed under.
+
+    A leftover line is one no record could claim: a section total, or the
+    remains of a record whose membership could not be established. Its columns
+    still have to be named, and the three sets of columns on the page overlap,
+    so position alone often fits all of them equally. What separates them is
+    meaning — an amount under a column labelled for amounts, an identifier
+    under the one labelled for claim numbers — with position settling the rest.
+    Naming a stray line's columns wrongly is how a claim disappears into the
+    description of the one above it.
+    """
+
+    def score(index: int) -> tuple[int, int]:
+        bounds, labels = slices[index]
+        cells = assign_to_columns(line, bounds)
+        return (
+            sum(
+                1
+                for value, label in zip(cells, labels)
+                if value.strip() and _agrees(value.strip(), label)
+            ),
+            sum(
+                1
+                for word in line.words
+                for start, end in bounds
+                if start <= word.middle <= end
+            ),
+        )
+
+    return max(range(len(slices)), key=score)
+
+
+def _extract_record_table(
+    page_number: int,
+    lines: Sequence[Line],
+    header_index: int,
+    layout: RecordLayout,
+    char_width: float,
+) -> RawTable | None:
+    """Read a page whose claims each occupy several printed lines.
+
+    The header block has already said how tall a record is and which of its
+    lines names the claim. Here the body supplies the anchors: every line
+    carrying a claim number of this document's own shape. A record is the fixed
+    span of lines around one anchor and nothing else, so a section total under
+    the last claim is never reached for, whatever it prints.
+
+    Returns None when the body does not bear the shape out, leaving the caller
+    to read the page one line at a time — which yields claims with null dates
+    and amounts, and a document that says so.
+    """
+    body = [line for line in lines if line.index > header_index and line.words]
+    if not body or layout.identifier_span is None:
+        return None
+    span = layout.identifier_span
+    cells = {line.index: split_cells(line, char_width, COLUMN_GUTTER_FACTOR) for line in body}
+
+    def identifier_cell(line: Line) -> str:
+        for text, x0, x1 in cells[line.index]:
+            if min(x1, span[1]) - max(x0, span[0]) > 0:
+                return text
+        return ""
+
+    shapes = consensus_shapes(
+        [
+            text
+            for line in body
+            for text in (identifier_cell(line),)
+            if text and is_identifier_candidate(text)
+        ]
+    )
+    grouping = group_records(
+        [min(word.top for word in line.words) for line in body],
+        [leading_identifier(identifier_cell(line), shapes) is not None for line in body],
+        [_ends_a_record(line, cells[line.index]) for line in body],
+        layout,
+    )
+    if grouping is None:
+        return None
+
+    # Each record line has its own columns, and they differ: the claimant line
+    # is four wide where the money line is ten. Both ways of finding them fail
+    # differently -- whitespace gutters merge two columns when one bleeds into
+    # the next, header gaps sit left of right-aligned money -- so each line
+    # takes whichever names more of its columns, and the data's own gutters
+    # settle a tie, since they are where the values actually are.
+    slices: list[tuple[list[tuple[float, float]], list[str]]] = []
+    for position in range(layout.height):
+        members = [body[record[position]] for record in grouping.records]
+        header_cells = layout.line_headers[position]
+        best: tuple[int, list[tuple[float, float]], list[str]] | None = None
+        for bounds in (
+            column_bounds(members, char_width),
+            _bounds_from_header(header_cells),
+        ):
+            if not bounds:
+                continue
+            labels = _pair_labels(header_cells, bounds)
+            named = sum(1 for label in labels if label)
+            if best is None or named > best[0]:
+                best = (named, list(bounds), labels)
+        if best is None:
+            return None
+        slices.append((best[1], best[2]))
+
+    # A record table that cannot say which column holds the claim number has
+    # not read the page, whatever else it recovered. Reading line by line at
+    # least reports the claims it can see, so hand the page back.
+    if not any(
+        guess_field(label).field == "claim_number"
+        for _, labels in slices
+        for label in labels
+    ):
+        return None
+
+    offsets = []
+    running = 0
+    for bounds, _ in slices:
+        offsets.append(running)
+        running += len(bounds)
+    width = running
+
+    def placed(line: Line, position: int) -> list[str]:
+        """The line's words in their own slice of the record's columns."""
+        row = [""] * width
+        assigned = assign_to_columns(line, slices[position][0])
+        row[offsets[position] : offsets[position] + len(assigned)] = assigned
+        return row
+
+    rows: list[RawRow] = []
+    for record in grouping.records:
+        members = [body[index] for index in record]
+        merged = [""] * width
+        for position, line in enumerate(members):
+            for column, value in enumerate(placed(line, position)):
+                if value:
+                    merged[column] = value
+        boxes = [line.bbox for line in members]
+        rows.append(
+            RawRow(
+                cells=merged,
+                page=page_number,
+                line_index=members[layout.identifier_line or 0].index,
+                source_lines=[line.index for line in members],
+                bbox=(
+                    min(box[0] for box in boxes),
+                    min(box[1] for box in boxes),
+                    max(box[2] for box in boxes),
+                    max(box[3] for box in boxes),
+                ),
+                kind="data",
+            )
+        )
+
+    total_rows: list[RawRow] = []
+    for index in grouping.ungrouped:
+        line = body[index]
+        if looks_like_header([text for text, _, _ in cells[line.index]]):
+            continue  # a header repeated mid-page
+        row = RawRow(
+            cells=placed(line, _fitting_slice(line, slices)),
+            page=page_number,
+            line_index=line.index,
+            bbox=line.bbox,
+            kind="total" if _is_total_line(line) else "data",
+        )
+        if row.is_blank():
+            continue
+        (total_rows if row.kind == "total" else rows).append(row)
+
+    rows.sort(key=lambda row: row.line_index)
+    return RawTable(
+        page=page_number,
+        headers=[label for _, labels in slices for label in labels],
+        rows=rows,
+        total_rows=total_rows,
+        strategy="records",
+        header_line_index=header_index,
+        column_bounds=[bound for bounds, _ in slices for bound in bounds],
+    )
+
 def _extract_positioned_table(
     page: pdfplumber.page.Page, page_number: int
 ) -> RawTable | None:
@@ -422,6 +742,21 @@ def _extract_positioned_table(
     if found is None:
         return None
     header_index, header_cells = found
+
+    # Some carriers spend three printed lines on one claim, under three lines
+    # of labels. Read singly those pages yield claims with nothing but a number
+    # in them, so the block is asked first whether it describes a record; only
+    # a block that says so, and a body that bears it out, takes this path.
+    block = header_block(lines, header_index, char_width)
+    layout = detect_layout(
+        [split_cells(line, char_width, COLUMN_GUTTER_FACTOR) for line in block]
+    )
+    if layout.is_multi_line:
+        reconstructed = _extract_record_table(
+            page_number, lines, header_index, layout, char_width
+        )
+        if reconstructed is not None:
+            return reconstructed
 
     body = [line for line in lines if line.index > header_index]
     data_lines = [

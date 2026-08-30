@@ -92,22 +92,62 @@ def _label(field_name: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _whole_group(*components: Decimal | None) -> Decimal | None:
+    """The components' sum, or None unless every one of them is on the row.
+
+    A partial sum is not a total. Treating it as one turns a column this engine
+    failed to map into an arithmetic error against the carrier.
+    """
+    if any(value is None for value in components):
+        return None
+    return sum(components, Decimal("0"))
+
+
 @rule("R-01")
 def r01_incurred_identity(
     doc: LossRunDocument, config: ReconcileConfig
 ) -> list[Finding]:
-    """paid_total + reserve_total - recovery_total == incurred_total."""
+    """paid_total + reserve_total - recovery_total == incurred_total.
+
+    Some carriers print the components of paid and reserve and no total for
+    either -- AIG prints indemnity, medical and expense paid, and never a paid
+    total. Where all three are on the row their sum is that carrier's paid
+    figure, so the identity is still checkable. Where only some are, it is not:
+    a document that prints indemnity paid and keeps its expenses in a column
+    this engine did not map has not said it paid no expenses, and adding up
+    what happens to be present reports a shortfall the carrier never had.
+
+    What a partial sum must never do is *unlock* the rule. Reading indemnity
+    paid as the paid total, on a document whose expenses sit in a column this
+    engine did not map, reported the whole of those expenses as an arithmetic
+    error against the carrier -- an error entirely of the reader's making.
+    Where a side cannot be established from what is printed, it stays unknown,
+    and where neither side can be, the rule abstains.
+
+    A side that is unknown while the other is known is still taken as zero, as
+    it always has been: most loss runs print no recovery column at all and many
+    print no reserve column, and reading those as unknown would silence the
+    rule on the documents it exists for. That is a stated convention, not an
+    inference about a blank cell, and it is why the two sides are not
+    symmetrical with the derivation above.
+    """
     findings: list[Finding] = []
     for claim in doc.claims:
         if claim.incurred_total is None:
             continue
-        if claim.paid_total is None and claim.reserve_total is None:
+        paid = claim.paid_total
+        if paid is None:
+            paid = _whole_group(
+                claim.paid_indemnity, claim.paid_medical, claim.paid_expense
+            )
+        reserve = claim.reserve_total
+        if reserve is None:
+            reserve = _whole_group(
+                claim.reserve_indemnity, claim.reserve_medical, claim.reserve_expense
+            )
+        if paid is None and reserve is None:
             continue
-        expected = (
-            _money(claim.paid_total)
-            + _money(claim.reserve_total)
-            - _money(claim.recovery_total)
-        )
+        expected = _money(paid) + _money(reserve) - _money(claim.recovery_total)
         delta = claim.incurred_total - expected
         if config.within_tolerance(delta):
             continue
@@ -119,7 +159,7 @@ def r01_incurred_identity(
                 field="incurred_total",
                 message=(
                     f"Incurred does not equal paid + reserve - recovery: "
-                    f"{_fmt(claim.paid_total)} + {_fmt(claim.reserve_total)} - "
+                    f"{_fmt(paid)} + {_fmt(reserve)} - "
                     f"{_fmt(claim.recovery_total)} = {_fmt(expected)}, "
                     f"but the document shows {_fmt(claim.incurred_total)}."
                 ),
