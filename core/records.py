@@ -147,26 +147,17 @@ def _family(field_name: str | None) -> str | None:
 
 
 def refined_label(parent: str, own: str) -> tuple[str, bool]:
-    """Combine a header cell with the one beneath it, when that sharpens it.
+    """Join a qualifier to the label beneath it: "Ind/BI" over "Paid".
 
-    "Ind/BI" over "Paid" is the indemnity component of paid, and combining is
-    the only way to tell it from the two "Paid" columns beside it. "Claim #"
-    over "Loss Date" is not a refinement at all — those are two different
-    fields on two different record lines, and combining them would invent a
-    column that does not exist. The test is whether the pair resolves to the
-    same money group the lower cell already names: a refinement narrows a
-    meaning, it never replaces one.
+    Whether the pair *is* a qualifier and a label is not decided here — see
+    ``push_qualifiers``, which asks the page rather than the vocabulary.
 
     Returns the label to use and whether the parent was consumed.
     """
     parent, own = parent.strip(), own.strip()
     if not parent or not own:
         return own or parent, bool(parent and not own)
-    own_family = _family(guess_field(own).field)
-    combined = f"{parent} {own}"
-    if own_family and _family(guess_field(combined).field) == own_family:
-        return combined, True
-    return own, False
+    return f"{parent} {own}", True
 
 
 def _overlap(left: Cell, right: Cell) -> float:
@@ -257,11 +248,12 @@ def _fields_of(line: Sequence[Cell]) -> set[str]:
 def detect_layout(header_lines: Sequence[Sequence[Cell]]) -> RecordLayout:
     """Decide whether a header block describes one line per claim, or several.
 
-    A wrapped header spreads one set of labels over two printed lines: "Date"
-    above "Loss", which combine into one column. A record header uses each line
-    for a different part of the claim: claimant here, identifier there, dates
-    and money below. Adjacent lines that read as halves of one label are folded
-    together; what survives is the record's shape.
+    A record header uses each line for a different part of the claim: claimant
+    here, identifier there, dates and money below. So the block proposes a
+    record as many lines tall as it has, and the body is left to say whether
+    that is really the shape of the page — which it does by refusing to group
+    around it, since a wrapped header over a flat table puts a claim number on
+    every line and no span of two can then hold exactly one.
 
     The shape only counts as a record when it separates the claim number from
     the claim's facts, because that separation is the whole problem being
@@ -272,30 +264,8 @@ def detect_layout(header_lines: Sequence[Sequence[Cell]]) -> RecordLayout:
     lines = [list(line) for line in header_lines if any(text.strip() for text, _, _ in line)]
     if not lines:
         return RecordLayout([[]])
-
-    index = 0
-    while index < len(lines) - 1:
-        if _joins(lines[index], lines[index + 1]):
-            lines[index : index + 2] = [_merge_label_lines(lines[index], lines[index + 1])]
-        else:
-            index += 1
     if len(lines) < 2:
         return RecordLayout(lines)
-
-    # Within a record, a parent label still sharpens the child beneath it, and
-    # the parent is blanked once consumed so it cannot also claim a field of
-    # its own and collide with the child now carrying its meaning.
-    for lower in range(1, len(lines)):
-        for position, cell in enumerate(lines[lower]):
-            above = _partner(cell, lines[lower - 1])
-            if above is None:
-                continue
-            label, consumed = refined_label(above[0], cell[0])
-            if not consumed:
-                continue
-            lines[lower][position] = (label, min(cell[1], above[1]), max(cell[2], above[2]))
-            lines[lower - 1][lines[lower - 1].index(above)] = ("", above[1], above[2])
-    lines = [[cell for cell in line if cell[0].strip()] for line in lines]
 
     naming = [
         (number, cell)
@@ -327,6 +297,50 @@ def detect_layout(header_lines: Sequence[Sequence[Cell]]) -> RecordLayout:
 # --------------------------------------------------------------------------
 
 
+def push_qualifiers(
+    line_headers: Sequence[Sequence[Cell]], occupied: Sequence[Sequence[tuple[float, float]]]
+) -> list[list[Cell]]:
+    """Move a label that heads no column of its own down onto the one it heads.
+
+    AIG prints "Ind/BI" and three bare "Total"s on the record line that carries
+    the claim number, and the amounts they name a line lower, under "Paid",
+    "Reserves", "Recoveries", "Incurred". Read as written, the identifier line
+    gains six columns it has no values in and three of them are called Total.
+
+    Liberty prints "Incurred Indemnity" one line above "Paid Indemnity" and
+    both lines carry money. Those are two columns, not a label and its
+    qualifier, and joining them loses the incurred figure entirely.
+
+    The vocabulary cannot tell these apart and does not have to: the page can.
+    A label with nothing printed beneath it on its own record line is heading
+    the line below, so it is moved there. ``occupied`` is where each record
+    line actually has values.
+    """
+    lines = [list(line) for line in line_headers]
+    for upper in range(len(lines) - 1):
+        kept: list[Cell] = []
+        for cell in lines[upper]:
+            if any(
+                min(cell[2], end) - max(cell[1], start) > 0
+                for start, end in occupied[upper]
+            ):
+                kept.append(cell)
+                continue
+            below = _partner(cell, lines[upper + 1])
+            if below is None:
+                kept.append(cell)  # nothing beneath it either; leave it be
+                continue
+            position = lines[upper + 1].index(below)
+            label, _ = refined_label(cell[0], below[0])
+            lines[upper + 1][position] = (
+                label,
+                min(cell[1], below[1]),
+                max(cell[2], below[2]),
+            )
+        lines[upper] = kept
+    return lines
+
+
 @dataclass(frozen=True)
 class Grouping:
     """Body lines gathered into logical records, and the ones left over."""
@@ -348,11 +362,18 @@ def group_records(
     so many below. Nothing outside a span is ever read, which is what keeps a
     section total printed under the last claim from being absorbed into it.
 
-    An anchor is refused, and its lines left to be read singly, when its span
-    would run off the page, hold a second claim number, contain a line that
-    ends a record, sit further apart than records do, or overlap a span already
-    taken. Returns None when no record could be formed at all, meaning the
-    proposed shape is not the shape of this page.
+    An anchor is refused when its span would hold a second claim number,
+    contain a line that ends a record, sit further apart than records do, or
+    overlap a span already taken. Any such refusal abandons the page: a shape
+    that fits some of the claims and not others is not this page's shape, and
+    the spans it does fit are then reached for rather than read. A flat table
+    with a description under every other claim offers exactly that -- pair the
+    description above a claim with the claim, and every pair holds one number,
+    no boundary and a tight gap, while every one of them is wrong.
+
+    The one refusal that is not fatal is a record cut off by the foot of the
+    page, which says nothing about the shape and leaves that claim incomplete.
+    Returns None when the page is abandoned or no record could be formed.
     """
     if not layout.is_multi_line:
         return None
@@ -367,18 +388,19 @@ def group_records(
     for anchor in (i for i, found in enumerate(has_identifier) if found):
         start = anchor - offset
         span = list(range(start, start + height))
-        if start < 0 or span[-1] >= len(tops):
-            continue  # the record is cut off by the page edge
-        if any(index in claimed for index in span):
-            continue
-        if sum(has_identifier[index] for index in span) != 1:
-            continue
-        if any(is_boundary[index] for index in span):
-            continue
-        if any(
-            tops[span[step + 1]] - tops[span[step]] > limit for step in range(height - 1)
+        if span[-1] >= len(tops):
+            continue  # cut off by the foot of the page; that claim stays partial
+        if (
+            start < 0
+            or any(index in claimed for index in span)
+            or sum(has_identifier[index] for index in span) != 1
+            or any(is_boundary[index] for index in span)
+            or any(
+                tops[span[step + 1]] - tops[span[step]] > limit
+                for step in range(height - 1)
+            )
         ):
-            continue
+            return None
         records.append(span)
         claimed.update(span)
 

@@ -373,26 +373,26 @@ def missing_line(tmp_path_factory):
     return _run(tmp_path_factory.mktemp("f18"), "missing_line", build)
 
 
-def test_a_short_record_does_not_take_a_line_from_the_claim_above(missing_line):
-    """The line above it belongs to the first claim and stays there."""
+def test_a_short_record_refuses_the_page_rather_than_reach_for_a_line(missing_line):
+    """One claim that does not fit the shape means the shape is not the page's.
+
+    The line above the short record belongs to the first claim, and pairing it
+    with the second is available, cheap and wrong. Rather than take the records
+    that happen to fit and reach for the one that does not, the page is read a
+    line at a time and every claim on it comes back incomplete.
+    """
     claims = _claims(missing_line)
-    first = claims["701-448120-001"]
-    assert first.date_of_loss.isoformat() == "2024-03-14"
-    assert first.incurred_total == Decimal("1650.00")
-    assert first.paid_expense == Decimal("150.00")
+    assert set(claims) == {record.number for record in CLAIMS}
+    assert all(claim.incurred_total is None for claim in claims.values())
+    assert all(claim.date_of_loss is None for claim in claims.values())
 
 
-def test_the_short_record_comes_back_incomplete_rather_than_wrong(missing_line):
-    claims = _claims(missing_line)
-    short = claims["701-448120-002"]
-    assert short.incurred_total is None
-    assert short.date_of_loss is None
-    assert short.incurred_total != Decimal("1650.00")
-
-
-def test_the_records_after_it_recover(missing_line):
-    claims = _claims(missing_line)
-    assert claims["702-330941-001"].incurred_total == Decimal("2250.00")
+def test_no_claim_on_a_refused_page_carries_another_claim_s_money(missing_line):
+    """Refusing costs three complete claims. This is what it buys."""
+    printed = {Decimal("1650.00"), Decimal("1375.00"), Decimal("2250.00")}
+    for claim in _claims(missing_line).values():
+        assert claim.incurred_total not in printed
+        assert claim.paid_indemnity is None
 
 
 # --------------------------------------------------------------------------
@@ -502,10 +502,15 @@ def test_an_unsettled_record_is_left_incomplete(ambiguous_spacing):
 
 
 def test_its_money_is_not_quietly_given_to_a_neighbour(ambiguous_spacing):
-    """The failure mode this whole file guards against."""
+    """The failure mode this whole file guards against.
+
+    1,375.00 is printed on the page and belongs to a claim whose membership
+    could not be settled. It must reach no claim at all — least of all either
+    of the two it sits between, where it would look entirely at home.
+    """
     claims = _claims(ambiguous_spacing)
-    assert claims["701-448120-001"].incurred_total == Decimal("1650.00")
-    assert claims["702-330941-001"].incurred_total == Decimal("2250.00")
+    assert set(claims) == {record.number for record in CLAIMS}
     assert Decimal("1375.00") not in {
         claim.incurred_total for claim in claims.values()
     }
+    assert all(claim.incurred_total is None for claim in claims.values())

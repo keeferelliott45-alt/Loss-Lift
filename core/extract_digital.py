@@ -30,6 +30,7 @@ from core.records import (
     group_records,
     is_identifier_candidate,
     leading_identifier,
+    push_qualifiers,
 )
 from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable
 
@@ -159,23 +160,31 @@ def cluster_lines(words: Sequence[Word]) -> list[Line]:
     ]
 
 
+def split_words(
+    line: Line, char_width: float, gap_factor: float = CELL_GAP_FACTOR
+) -> list[list[Word]]:
+    """Group one line's words into cells on the wide gaps between them."""
+    threshold = max(MIN_GUTTER, gap_factor * char_width)
+    cells: list[list[Word]] = []
+    buffer: list[Word] = []
+    for word in line.words:
+        if buffer and word.x0 - buffer[-1].x1 > threshold:
+            cells.append(buffer)
+            buffer = []
+        buffer.append(word)
+    if buffer:
+        cells.append(buffer)
+    return cells
+
+
 def split_cells(
     line: Line, char_width: float, gap_factor: float = CELL_GAP_FACTOR
 ) -> list[tuple[str, float, float]]:
     """Split one line into cells on the wide gaps between words."""
-    threshold = max(MIN_GUTTER, gap_factor * char_width)
-    cells: list[tuple[str, float, float]] = []
-    buffer: list[Word] = []
-    for word in line.words:
-        if buffer and word.x0 - buffer[-1].x1 > threshold:
-            cells.append(
-                (" ".join(w.text for w in buffer), buffer[0].x0, buffer[-1].x1)
-            )
-            buffer = []
-        buffer.append(word)
-    if buffer:
-        cells.append((" ".join(w.text for w in buffer), buffer[0].x0, buffer[-1].x1))
-    return cells
+    return [
+        (" ".join(word.text for word in cell), cell[0].x0, cell[-1].x1)
+        for cell in split_words(line, char_width, gap_factor)
+    ]
 
 
 def column_bounds(lines: Sequence[Line], char_width: float) -> list[tuple[float, float]]:
@@ -202,6 +211,137 @@ def column_bounds(lines: Sequence[Line], char_width: float) -> list[tuple[float,
             merged.append([start, end])
     return [(start, end) for start, end in merged]
 
+
+def _blank_point(rows: Sequence[Line], low: float, high: float) -> float | None:
+    """Where inside this gap most rows leave the page blank, if most of them do.
+
+    A column boundary is a channel the rows keep clear. ``column_bounds``
+    requires *every* row to keep it clear, which is right when nothing else
+    says a boundary is there, and too strict when something does: one claimant
+    name long enough to touch the currency beside it, or a footer printed at
+    its own positions, closes a channel forty other rows agree on.
+
+    The header has already said there is a boundary here. This asks the rows
+    where it is, and takes their answer only if they agree on one -- so a wide
+    header gap over a column of running prose, where every row leaves different
+    space blank and none of it repeats, still yields nothing.
+    """
+    edges = sorted(
+        {low, high}
+        | {
+            value
+            for line in rows
+            for word in line.words
+            if word.x0 < high and word.x1 > low
+            for value in (max(word.x0, low), min(word.x1, high))
+        }
+    )
+    best: float | None = None
+    fewest = len(rows)
+    for left, right in zip(edges, edges[1:]):
+        if right <= left:
+            continue
+        middle = (left + right) / 2
+        crossing = sum(
+            1 for line in rows if any(w.x0 < middle < w.x1 for w in line.words)
+        )
+        if crossing < fewest:
+            best, fewest = middle, crossing
+    return best if best is not None and fewest * 2 < len(rows) else None
+
+
+def subdivided(
+    bounds: Sequence[tuple[float, float]],
+    block: Sequence[Line],
+    data_lines: Sequence[Line],
+    char_width: float,
+) -> list[tuple[float, float]]:
+    """Split a detected column that the header names more than once.
+
+    Two independent sources have to agree before a column is cut: the header
+    puts two labels over it with clear space between them, and the column's own
+    rows leave a point in that space blank. Either alone would be wrong --
+    a centred two-word heading is not two columns, and rows leave gaps between
+    ordinary words all the time.
+    """
+    gutter = max(MIN_GUTTER, char_width * COLUMN_GUTTER_FACTOR)
+    labels = [
+        cell
+        for line in block
+        for cell in split_cells(line, char_width, COLUMN_GUTTER_FACTOR)
+    ]
+    result: list[tuple[float, float]] = []
+    for start, end in bounds:
+        over = sorted(
+            (cell for cell in labels if min(cell[2], end) - max(cell[1], start) > 0),
+            key=lambda cell: cell[1],
+        )
+        rows = [
+            line
+            for line in data_lines
+            if any(word.x0 < end and word.x1 > start for word in line.words)
+        ]
+        cuts: list[float] = []
+        for left, right in zip(over, over[1:]):
+            if right[1] - left[2] < gutter:
+                continue  # one label wrapped, not two labels
+            point = _blank_point(rows, max(left[2], start), min(right[1], end))
+            if point is not None and start < point < end:
+                cuts.append(point)
+        edges = [start, *sorted(cuts), end]
+        result.extend(zip(edges, edges[1:]))
+    return result
+
+
+def label_bounds(
+    block: Sequence[Line], bounds: Sequence[tuple[float, float]], char_width: float
+) -> list[str]:
+    """Name each column from every line of the header block.
+
+    A header word that falls between two columns belongs to whichever its own
+    label belongs to. "Payment Indemnity" sits left of the amounts it heads,
+    as right-aligned money always does, and its first word lands nearer the
+    column before -- so following the word alone splits the label in two and
+    leaves both halves meaning nothing.
+    """
+    parts: list[list[str]] = [[] for _ in bounds]
+    for line in block:
+        placed: list[list[Word]] = [[] for _ in bounds]
+        for cell in split_words(line, char_width, COLUMN_GUTTER_FACTOR):
+            span = (cell[0].x0, cell[-1].x1)
+            over = [
+                index
+                for index, (start, end) in enumerate(bounds)
+                if min(span[1], end) - max(span[0], start) > 0
+            ]
+            for word in cell:
+                target = next(
+                    (
+                        index
+                        for index, (start, end) in enumerate(bounds)
+                        if start - MIN_GUTTER <= word.middle <= end + MIN_GUTTER
+                    ),
+                    None,
+                )
+                if target is None:
+                    target = (
+                        over[0]
+                        if len(over) == 1
+                        else min(
+                            range(len(bounds)),
+                            key=lambda i: min(
+                                abs(word.middle - bounds[i][0]),
+                                abs(word.middle - bounds[i][1]),
+                            ),
+                        )
+                    )
+                placed[target].append(word)
+        for index, words in enumerate(placed):
+            if words:
+                parts[index].append(
+                    " ".join(w.text for w in sorted(words, key=lambda w: w.x0))
+                )
+    return [" ".join(group) for group in parts]
 
 def _bounds_from_header(
     header_cells: Sequence[tuple[str, float, float]]
@@ -437,6 +577,17 @@ def _extract_ruled_table(
 # --------------------------------------------------------------------------
 
 
+def _is_label_line(line: Line | None) -> bool:
+    """A line that could be part of a header block: words, and no figures.
+
+    Every claim row carries a date, an amount or an identifier, so a digit is
+    what separates a line of labels from the table beneath it.
+    """
+    if line is None or not line.words:
+        return False
+    return not any(char.isdigit() for word in line.words for char in word.text)
+
+
 def header_block(
     lines: Sequence[Line], header_index: int, char_width: float
 ) -> list[Line]:
@@ -453,19 +604,48 @@ def header_block(
         return []
 
     height = max(word.bottom - word.top for word in header.words)
+    pitch: list[float] = []
+
+    def joins(gap: float) -> bool:
+        """Whether a line that close belongs to the block.
+
+        The first line has only the type size to go on. After that the block
+        has shown its own spacing, and that is the better measure: a header
+        block sets its lines at one pitch, and a short line in the middle of
+        one -- Liberty prints "Applied Recovery" alone -- opens a gap wider
+        than the type but nothing like the space before the table itself.
+        """
+        limit = 2 * (statistics.median(pitch) if pitch else height)
+        return 0 < gap <= limit
+
     block = [header]
     for index in range(header_index - 1, -1, -1):
         above = next((line for line in lines if line.index == index), None)
-        if above is None or not above.words:
-            break
-        if any(char.isdigit() for word in above.words for char in word.text):
+        if not _is_label_line(above):
             break
         gap = min(word.top for word in block[0].words) - min(
             word.top for word in above.words
         )
-        if not 0 < gap <= height * 2:
+        if not joins(gap):
             break
         block.insert(0, above)
+        pitch.append(gap)
+
+    # A label can wrap downwards just as readily: "Trigger Date" over "Claim
+    # Status", "Gross Reserve" over "Indemnity". Only one line scores as the
+    # header, so without this the rest is left to be read as claims -- and
+    # worse, its words close the very gutters between the columns it names.
+    last = next(index for index, line in enumerate(lines) if line is header)
+    for below in lines[last + 1 :]:
+        if not _is_label_line(below):
+            break
+        gap = min(word.top for word in below.words) - min(
+            word.top for word in block[-1].words
+        )
+        if not joins(gap):
+            break
+        block.append(below)
+        pitch.append(gap)
     return block
 
 
@@ -633,10 +813,23 @@ def _extract_record_table(
     # the next, header gaps sit left of right-aligned money -- so each line
     # takes whichever names more of its columns, and the data's own gutters
     # settle a tie, since they are where the values actually are.
+    members_by_line = [
+        [body[record[position]] for record in grouping.records]
+        for position in range(layout.height)
+    ]
+    # A label with nothing printed beneath it on its own record line is heading
+    # the line below -- AIG's three bare "Total"s sit on the identifier line and
+    # name the amounts a line lower. Moved down before the columns are read, so
+    # they cannot claim columns the line does not have.
+    line_headers = push_qualifiers(
+        layout.line_headers,
+        [column_bounds(members, char_width) for members in members_by_line],
+    )
+
     slices: list[tuple[list[tuple[float, float]], list[str]]] = []
     for position in range(layout.height):
-        members = [body[record[position]] for record in grouping.records]
-        header_cells = layout.line_headers[position]
+        members = members_by_line[position]
+        header_cells = line_headers[position]
         best: tuple[int, list[tuple[float, float]], list[str]] | None = None
         for bounds in (
             column_bounds(members, char_width),
@@ -758,7 +951,12 @@ def _extract_positioned_table(
         if reconstructed is not None:
             return reconstructed
 
-    body = [line for line in lines if line.index > header_index]
+    # The table starts below the whole block, not below the one line that
+    # scored as the header. A second line of labels left in the body is read
+    # as a claim, and worse, its words close the gutters between the columns
+    # it is naming -- so the table loses the boundaries its own header drew.
+    block_end = max(line.index for line in block)
+    body = [line for line in lines if line.index > block_end]
     data_lines = [
         line
         for line in body
@@ -789,21 +987,41 @@ def _extract_positioned_table(
         ),
     )
 
-    best: tuple[int, int, list[tuple[float, float]], list[str]] | None = None
-    for candidate in (
-        column_bounds(data_lines, char_width),
-        _bounds_from_header(header_cells),
-    ):
+    # Three ways to find the columns, each with its own failure mode, and the
+    # one that names the most of them wins. The third reads the whole header
+    # block against the data's own gutters and splits a column the block names
+    # twice, which is what recovers a table whose headings wrap downwards or
+    # whose columns were closed by one overlong cell.
+    gutters = column_bounds(data_lines, char_width)
+    # Reading the whole block as one row of labels is right only when that is
+    # what it is. Where the block describes a record line each -- Liberty gives
+    # a claim seven lines and heads them with seven -- joining them per column
+    # produces labels like "Incurred Indemnity Paid Indemnity Indemnity O/R"
+    # that name nothing. The body has already refused that shape by the time
+    # this runs, but the block still says what it is.
+    candidates: list[tuple[list[tuple[float, float]], bool]] = [
+        (gutters, False),
+        (_bounds_from_header(header_cells), False),
+    ]
+    if not layout.is_multi_line:
+        candidates.append((subdivided(gutters, block, data_lines, char_width), True))
+
+    best: tuple[tuple[int, int], list[tuple[float, float]], list[str]] | None = None
+    for candidate, labels in candidates:
         if len(candidate) < 2:
             continue
-        labels = assign_to_columns(header_line, candidate)
-        score = (header_score(labels), len(candidate))
+        named = (
+            label_bounds(block, candidate, char_width)
+            if labels
+            else assign_to_columns(header_line, candidate)
+        )
+        score = (header_score(named), len(candidate))
         if best is None or score > best[0]:
-            best = (score, len(candidate), list(candidate), labels)
+            best = (score, list(candidate), named)
 
     if best is None:
         return None
-    bounds, headers = best[2], best[3]
+    bounds, headers = best[1], best[2]
 
     rows: list[RawRow] = []
     total_rows: list[RawRow] = []
