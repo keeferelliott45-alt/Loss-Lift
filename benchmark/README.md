@@ -96,6 +96,14 @@ is treated as neither success nor failure on its own.
 | F16 | Source and provenance evidence |
 | F17 | Incorrect clean / reconciliation state |
 | F18 | Multi-line record with per-line headers |
+| F19 | Lossy or ambiguous semantic mapping |
+
+F19 is the one arithmetic cannot reach. Two or more materially distinct
+source columns collapse into the same canonical field, or a column cannot be
+mapped uniquely enough to keep its financial meaning. R-01 to R-05 ask whether
+the numbers add up, never whether they are the right numbers in the right
+places, and a sum does not care which addend is which — so a document can
+reconcile perfectly with a column's money silently discarded.
 
 F18 was added from evidence, not to describe one PDF: a layout where the
 header is N lines and each labels a different line of an N-line claim record,

@@ -274,6 +274,44 @@ class Claim(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class MappingState(str, Enum):
+    """How a source column came to carry the canonical field it carries.
+
+    A state rather than a number: the vocabulary is either sure or it is not,
+    and inventing a 0.87 to sit between those would be a confidence this
+    system has never calibrated.
+    """
+
+    #: Resolved by the reviewed label vocabulary.
+    DETERMINISTIC = "deterministic"
+    #: Taken from a saved, human-confirmed carrier profile.
+    PROFILE_MATCH = "profile_match"
+    #: Proposed by the LLM for a label the vocabulary could not place.
+    MODEL_MAPPED = "model_mapped"
+    #: Two or more columns claimed one field. The value here is not trusted.
+    AMBIGUOUS = "ambiguous"
+    #: No canonical field; the column is carried but not interpreted.
+    UNMAPPED = "unmapped"
+
+
+class ColumnMappingRecord(BaseModel):
+    """One source column, and what was decided about it.
+
+    Kept so a reviewer can ask "why is this figure in this field?" and get an
+    answer that names the printed header rather than a column index.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_index: int
+    source_header_raw: str = ""
+    source_header_normalized: str = ""
+    canonical_field: str | None = None
+    state: MappingState = MappingState.UNMAPPED
+    #: The field this column wanted when another column won it.
+    contested_field: str | None = None
+
+
 class PrintedSection(BaseModel):
     """A subtotal the carrier printed under one policy period.
 
@@ -322,6 +360,9 @@ class LossRunDocument(BaseModel):
     #: Claim rows found on each page before stitching, so R-19 can tell whether
     #: dropping repeated headers and subtotals also dropped a claim.
     rows_seen_per_page: dict[int, int] = Field(default_factory=dict)
+    #: What was decided about every source column, including the ones whose
+    #: meaning could not be settled. R-21 reads this.
+    column_mapping: list[ColumnMappingRecord] = Field(default_factory=list)
 
     claims: list[Claim] = Field(default_factory=list)
 

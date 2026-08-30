@@ -142,7 +142,9 @@ _COMPONENT_TOKENS: dict[str, tuple[str, ...]] = {
 class FieldGuess:
     field: str | None
     confidence: float
-    source: str  # "synonym" | "heuristic" | "unmapped"
+    source: str  # synonym | heuristic | profile | llm | unmapped | contested
+    #: When ``source`` is "contested", the field another column won.
+    contested_field: str | None = None
 
 
 def guess_field(label: str) -> FieldGuess:
@@ -219,7 +221,11 @@ def map_headers(headers: Sequence[str]) -> dict[int, FieldGuess]:
         if guess.field is None:
             continue
         if guess.field in claimed:
-            guesses[index] = FieldGuess(None, 0.0, "unmapped")
+            # The loser is not merely unmapped: a column carrying money was
+            # dropped because its label did not distinguish it from another.
+            # Recording which field it wanted is what lets R-21 say so instead
+            # of the value disappearing without trace.
+            guesses[index] = FieldGuess(None, 0.0, "contested", guess.field)
         else:
             claimed[guess.field] = index
     return guesses

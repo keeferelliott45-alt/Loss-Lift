@@ -188,6 +188,7 @@ _DATA_QUALITY_RULES = {
     "R-11", "R-12",  # duplicates caused by extraction
     "R-15",          # unreadable / ambiguous -- the document, not the claim
     "R-20",          # nothing extracted at all -- never a clean document
+    "R-21",          # a source column's meaning could not be settled
 }
 
 

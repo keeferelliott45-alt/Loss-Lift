@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Twenty rules, each returning zero or more :class:`~core.schema.Finding`
+Twenty-one rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -20,6 +20,7 @@ from core.schema import (
     MONEY_FIELDS,
     AlaeTreatment,
     DeductibleBasis,
+    MappingState,
     PAID_COMPONENT_FIELDS,
     RESERVE_COMPONENT_FIELDS,
     REVIEW_REASONS,
@@ -762,6 +763,48 @@ def r20_no_claims_extracted(
             actual=0,
         )
     ]
+
+
+@rule("R-21")
+def r21_ambiguous_column_mapping(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Two source columns claimed one canonical field, so one was dropped.
+
+    Arithmetic cannot catch this. Three columns printed "Total" and one of them
+    became the incurred figure; the other two carried money that is now in no
+    field at all, and every identity still balances because it balances over
+    the values that survived. R-01 through R-05 answer "do these numbers add
+    up", never "are these the right numbers in the right places".
+
+    So this is a hard fail even on a document whose arithmetic is perfect. The
+    engine cannot say which column meant what, and guessing is how a reserve
+    figure ends up reported as a recovery with nothing to show it happened.
+    """
+    contested = [
+        record for record in doc.column_mapping
+        if record.state is MappingState.AMBIGUOUS and record.contested_field
+    ]
+    findings: list[Finding] = []
+    for record in contested:
+        label = record.source_header_raw or f"column {record.source_index}"
+        findings.append(
+            Finding(
+                rule_id="R-21",
+                severity=Severity.ERROR,
+                field=record.contested_field,
+                message=(
+                    f"Column {record.source_index + 1}, printed \"{label}\", "
+                    f"could carry {_label(record.contested_field)} but another "
+                    f"column was read as that field, so this one was not used. "
+                    f"Confirm on the mapping screen which column is which — "
+                    f"the totals can still balance with this value missing."
+                ),
+                expected=f"one column per {_label(record.contested_field)}",
+                actual=f"{len(contested) + 1} columns claimed it",
+            )
+        )
+    return findings
 
 
 # --------------------------------------------------------------------------

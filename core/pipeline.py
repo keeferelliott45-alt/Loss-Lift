@@ -32,6 +32,7 @@ from core.normalize import (
     parse_int,
     parse_money,
     parse_status,
+    normalize_label,
     parse_text,
 )
 from core.profiles import (
@@ -49,6 +50,8 @@ from core.schema import (
     ClaimStatus,
     LineOfBusiness,
     LossRunDocument,
+    ColumnMappingRecord,
+    MappingState,
     NullReason,
     PrintedSection,
     RawRow,
@@ -72,6 +75,9 @@ class ColumnMapping:
     fields: dict[int, str | None]
     source: str = "heuristic"  # profile | heuristic | llm | manual
     fingerprint: str = ""
+    #: Per column, what was decided and why. Carries the columns that lost a
+    #: contest, which `fields` cannot represent: it only has room for a None.
+    decisions: list[ColumnMappingRecord] = field(default_factory=list)
 
     @property
     def mapped_fields(self) -> set[str]:
@@ -143,11 +149,31 @@ def build_mapping(
         use_llm=use_llm,
         client=llm_client,
     )
+    states = {
+        "profile": MappingState.PROFILE_MATCH,
+        "llm": MappingState.MODEL_MAPPED,
+        "contested": MappingState.AMBIGUOUS,
+        "unmapped": MappingState.UNMAPPED,
+    }
+    decisions = [
+        ColumnMappingRecord(
+            source_index=index,
+            source_header_raw=headers[index] if index < len(headers) else "",
+            source_header_normalized=normalize_label(
+                headers[index] if index < len(headers) else ""
+            ),
+            canonical_field=guess.field,
+            state=states.get(guess.source, MappingState.DETERMINISTIC),
+            contested_field=guess.contested_field,
+        )
+        for index, guess in sorted(guesses.items())
+    ]
     return ColumnMapping(
         headers=list(headers),
         fields={index: guess.field for index, guess in guesses.items()},
         source=source,
         fingerprint=fingerprint_value,
+        decisions=decisions,
     )
 
 
@@ -912,6 +938,7 @@ def run_pipeline(
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,
         rows_seen_per_page=rows_seen_per_page,
+        column_mapping=mapping.decisions,
         printed_sections=collect_printed_sections(
             tables, mapping, locale_inference.locale, date_inference.order
         ),
