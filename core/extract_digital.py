@@ -212,8 +212,28 @@ def column_bounds(lines: Sequence[Line], char_width: float) -> list[tuple[float,
     return [(start, end) for start, end in merged]
 
 
-def _blank_point(rows: Sequence[Line], low: float, high: float) -> float | None:
-    """Where inside this gap most rows leave the page blank, if most of them do.
+def _word_spacing(rows: Sequence[Line], start: float, end: float, fallback: float) -> float:
+    """The space this column sets between its own words.
+
+    Measured inside the column: across a whole row the widest gaps are the ones
+    between columns, and taking those for word spacing would rule out every
+    boundary there is.
+    """
+    gaps = [
+        follower.x0 - word.x1
+        for line in rows
+        for word, follower in zip(line.words, line.words[1:])
+        if word.x0 < end and word.x1 > start
+        and follower.x0 < end and follower.x1 > start
+        and follower.x0 > word.x1
+    ]
+    return statistics.median(gaps) if gaps else fallback
+
+
+def _blank_point(
+    rows: Sequence[Line], low: float, high: float, spacing: float
+) -> float | None:
+    """Where inside this gap most rows leave a channel clear, if most of them do.
 
     A column boundary is a channel the rows keep clear. ``column_bounds``
     requires *every* row to keep it clear, which is right when nothing else
@@ -222,9 +242,12 @@ def _blank_point(rows: Sequence[Line], low: float, high: float) -> float | None:
     its own positions, closes a channel forty other rows agree on.
 
     The header has already said there is a boundary here. This asks the rows
-    where it is, and takes their answer only if they agree on one -- so a wide
-    header gap over a column of running prose, where every row leaves different
-    space blank and none of it repeats, still yields nothing.
+    where it is, and takes their answer only if they agree on a channel wider
+    than the space they set between their own words -- so a two-word heading
+    over running prose, where the words tile the line and every channel is
+    crossed by one of them, still yields nothing and no description is cut in
+    half. The channel need not be as wide as a column gutter: the header has
+    already supplied the evidence a gutter would otherwise have to carry alone.
     """
     edges = sorted(
         {low, high}
@@ -239,14 +262,15 @@ def _blank_point(rows: Sequence[Line], low: float, high: float) -> float | None:
     best: float | None = None
     fewest = len(rows)
     for left, right in zip(edges, edges[1:]):
-        if right <= left:
+        if right - left <= spacing:
             continue
-        middle = (left + right) / 2
         crossing = sum(
-            1 for line in rows if any(w.x0 < middle < w.x1 for w in line.words)
+            1
+            for line in rows
+            if any(word.x0 < right and word.x1 > left for word in line.words)
         )
         if crossing < fewest:
-            best, fewest = middle, crossing
+            best, fewest = (left + right) / 2, crossing
     return best if best is not None and fewest * 2 < len(rows) else None
 
 
@@ -281,11 +305,14 @@ def subdivided(
             for line in data_lines
             if any(word.x0 < end and word.x1 > start for word in line.words)
         ]
+        spacing = _word_spacing(rows, start, end, gutter)
         cuts: list[float] = []
         for left, right in zip(over, over[1:]):
             if right[1] - left[2] < gutter:
                 continue  # one label wrapped, not two labels
-            point = _blank_point(rows, max(left[2], start), min(right[1], end))
+            point = _blank_point(
+                rows, max(left[2], start), min(right[1], end), spacing
+            )
             if point is not None and start < point < end:
                 cuts.append(point)
         edges = [start, *sorted(cuts), end]
@@ -342,6 +369,44 @@ def label_bounds(
                     " ".join(w.text for w in sorted(words, key=lambda w: w.x0))
                 )
     return [" ".join(group) for group in parts]
+
+def _clusters_cut(
+    bounds: Sequence[tuple[float, float]], clusters: Sequence[tuple[float, float]]
+) -> int:
+    """How many runs of text on the page this set of boundaries cuts through.
+
+    The rows themselves say where the text runs together. A candidate boundary
+    landing inside one of those runs is claiming a column edge where the page
+    shows none, and every value in that column arrives in two pieces.
+    """
+    edges = {edge for bound in bounds for edge in bound}
+    return sum(
+        1
+        for start, end in clusters
+        if any(start < edge < end for edge in edges)
+    )
+
+
+def _detached_footer_removed(lines: Sequence[Line]) -> list[Line]:
+    """Drop the strapline printed at the foot of the page.
+
+    A footer is set at its own positions and owes the table nothing: its words
+    run across the channel between two columns and close it for every row above.
+    What marks it is the space above it — a table sets its rows at one pitch,
+    and the footer sits many times that below the last of them. Only trailing
+    lines are dropped, so a subtotal printed directly under the claims, which
+    is part of the table and shares its columns, stays.
+    """
+    if len(lines) < 3:
+        return list(lines)
+    tops = [min(word.top for word in line.words) for line in lines]
+    gaps = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
+    limit = 2 * statistics.median(gaps)
+    end = len(lines)
+    while end > 2 and gaps[end - 2] > limit:
+        end -= 1
+    return list(lines[:end])
+
 
 def _bounds_from_header(
     header_cells: Sequence[tuple[str, float, float]]
@@ -957,11 +1022,19 @@ def _extract_positioned_table(
     # it is naming -- so the table loses the boundaries its own header drew.
     block_end = max(line.index for line in block)
     body = [line for line in lines if line.index > block_end]
+    # A strapline set well below the last row is not part of the table: not a
+    # claim, and not a source of column boundaries either, since its words run
+    # wherever the designer put them.
+    attached = _detached_footer_removed(body)
+    footer = {line.index for line in body if line not in attached}
+    body = [line for line in body if line.index not in footer or _is_total_line(line)]
     data_lines = [
         line
         for line in body
         if not _is_total_line(line)
-        and not looks_like_header([text for text, _, _ in split_cells(line, char_width)])
+        and not looks_like_header(
+            [text for text, _, _ in split_cells(line, char_width)]
+        )
     ]
 
     # Two ways to find the columns, each with its own failure mode: whitespace
@@ -1015,7 +1088,21 @@ def _extract_positioned_table(
             if labels
             else assign_to_columns(header_line, candidate)
         )
-        score = (header_score(named), len(candidate))
+        # Where two readings name the same number of columns, the better one
+        # is the one that recovers more of the schema: two columns both read
+        # as "Gross Reserve" name one field between them, where "Gross Reserve
+        # Indemnity" and "Payment Indemnity" name two.
+        fields = {guess_field(label).field for label in named}
+        fields.discard(None)
+        # A boundary falling inside a run of text the rows never break is not a
+        # boundary. "Accident" and "Description" set a hundred points apart head
+        # one column of prose, and taking the gap between them for a column edge
+        # cuts every description in half.
+        # A subdivided candidate cuts a run of text on purpose, and proved each
+        # cut against the header and the rows before making it. The other two
+        # are cutting on geometry alone, so only they are charged for it.
+        cuts = 0 if labels else _clusters_cut(candidate, gutters)
+        score = (header_score(named), len(fields), -cuts, len(candidate))
         if best is None or score > best[0]:
             best = (score, list(candidate), named)
 
@@ -1114,6 +1201,8 @@ _VALUATION_PATTERNS = (
     r"as\s*of\s*date\s*[:\-]?\s*(.+)",
     r"(?:data|values?|numbers?|amounts?)\s*as\s*of\s*[:\-]?\s*(.+)",
     r"loss(?:es)?\s*valued\s*[:\-]?\s*(.+)",
+    # A report titled with the date it was struck: "Loss Run as per 13 Sep 2016".
+    r"loss\s*runs?\s*(?:as\s*(?:per|of|at)|through|thru)\s*[:\-]?\s*(.+)",
 )
 
 _PERIOD_PATTERN = re.compile(

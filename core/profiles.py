@@ -57,6 +57,10 @@ LABEL_SYNONYMS: dict[str, str] = {
     "dol": "date_of_loss", "loss dt": "date_of_loss",
     "date of accident": "date_of_loss", "accident date": "date_of_loss",
     "occurrence date": "date_of_loss", "doi": "date_of_loss",
+    # Liability policies written on an occurrence trigger date the event that
+    # triggers cover, which is the date of loss under another name.
+    "trigger date": "date_of_loss", "date of occurrence": "date_of_loss",
+    "event date": "date_of_loss",
     # Workers' comp reports date the injury rather than the loss.
     "date of injury": "date_of_loss", "injury date": "date_of_loss",
     "date reported": "date_reported", "reported": "date_reported",
@@ -80,6 +84,9 @@ LABEL_SYNONYMS: dict[str, str] = {
     # money
     "paid": "paid_total", "paid total": "paid_total", "total paid": "paid_total",
     "pd tot": "paid_total", "paid to date": "paid_total",
+    # "Payment" is the same word in the noun form, and carriers use both.
+    "payment": "paid_total", "payments": "paid_total",
+    "total payment": "paid_total", "total payments": "paid_total",
     "reserve": "reserve_total", "reserves": "reserve_total",
     "outstanding": "reserve_total", "rsv tot": "reserve_total",
     "recovery": "recovery_total", "recoveries": "recovery_total",
@@ -116,7 +123,7 @@ LABEL_SYNONYMS: dict[str, str] = {
 }
 
 _GROUP_TOKENS: dict[str, tuple[str, ...]] = {
-    "paid": ("paid", "pd", "pay", "payments"),
+    "paid": ("paid", "pd", "pay", "payment", "payments"),
     "reserve": ("reserve", "reserves", "res", "rsv", "rsrv", "outstanding", "o s"),
     "recovery": ("recovery", "recoveries", "recov", "subro", "subrogation", "salvage"),
     "incurred": ("incurred", "incur", "inc"),
@@ -364,6 +371,62 @@ def detect_carrier(text: str) -> str | None:
         if match:
             return " ".join(match.group(1).split())
     return " ".join(candidates[0].split()) if candidates else None
+
+
+# --------------------------------------------------------------------------
+# Document-level columns
+# --------------------------------------------------------------------------
+
+#: A loss run exported from a spreadsheet often carries the facts that belong
+#: to the document -- who wrote it, for whom, under which policy -- as columns
+#: repeated on every claim, rather than in a letterhead above the table. The
+#: canonical schema holds them once on the document and writes them onto every
+#: exported row, so the two shapes describe the same thing; only the reading
+#: differs. These labels are kept apart from the claim vocabulary so a column
+#: named for the policy can never be mistaken for a column of the claim.
+_DOCUMENT_LABELS: dict[str, tuple[str, ...]] = {
+    "carrier": (
+        "carrier", "company", "company name", "insurer", "insurance company",
+        "underwriting company", "writing company",
+    ),
+    "named_insured": (
+        "insured", "insured name", "named insured", "policyholder",
+        "policy holder", "client name", "account name",
+    ),
+    "policy_number": (
+        "policy number", "policy no", "policy num", "policy", "policy id",
+    ),
+    "line_of_business": (
+        "line of business", "lob", "coverage", "coverage line", "product line",
+        "business line",
+    ),
+    "policy_period_start": (
+        "inception date", "inception", "effective date", "policy effective date",
+        "policy inception", "policy start date", "term start",
+    ),
+    "policy_period_end": (
+        "expiry date", "expiry", "expiration date", "policy expiration date",
+        "policy expiry", "policy end date", "term end",
+    ),
+    "currency": (
+        "currency", "reporting currency", "settlement currency", "ccy",
+    ),
+}
+
+_DOCUMENT_LOOKUP: dict[str, str] = {
+    label: field for field, labels in _DOCUMENT_LABELS.items() for label in labels
+}
+
+
+def guess_document_field(label: str) -> str | None:
+    """The document-level fact this column carries, if it carries one.
+
+    Exact labels only. A claim column reading "Loss State" should not become
+    the policy's state because both contain the word, and a document fact
+    stated in a column is always stated plainly -- the spreadsheet it came from
+    had to name it for a person to read.
+    """
+    return _DOCUMENT_LOOKUP.get(normalize_label(label))
 
 
 #: Header-block labels a loss run prints. Their *presence* identifies a

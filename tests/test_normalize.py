@@ -414,3 +414,16 @@ def test_clean_text_folds_exotic_whitespace():
 def test_normalize_label():
     assert normalize_label("  Paid   Indemnity ($) ") == "paid indemnity"
     assert normalize_label("TOTAL_INCURRED") == "total incurred"
+
+def test_a_status_followed_by_intruding_text_still_reads():
+    """A narrow status column is what the column beside it runs into.
+
+    AIG's description bleeds into it and XL's claimant name does. The status
+    leads and the intrusion trails, on both. A cell that merely mentions a
+    status word later says nothing about the claim's state.
+    """
+    assert parse_status("Closed GIANCARLO DE ANGELIS") is ClaimStatus.CLOSED
+    assert parse_status("Closed INSD, IV DID NOT HIT OV") is ClaimStatus.CLOSED
+    assert parse_status("Reopened GIORGIO GORGONE") is ClaimStatus.REOPENED
+    assert parse_status("vehicle was open at the time") is ClaimStatus.UNKNOWN
+    assert parse_status("struck a parked vehicle") is ClaimStatus.UNKNOWN

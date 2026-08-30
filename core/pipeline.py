@@ -35,6 +35,7 @@ from core.normalize import (
     parse_text,
 )
 from core.profiles import (
+    guess_document_field,
     CarrierProfile,
     fingerprint,
     load_profile,
@@ -491,6 +492,87 @@ def build_claims(
     return claims, warnings
 
 
+def stated_periods(
+    stated: dict[str, list[str]], date_order: str | None
+) -> list[tuple[date, date]]:
+    """Every policy term the document names in its own columns.
+
+    XL prints an inception and an expiry beside each claim and three different
+    policies across the page. One document-level term cannot describe that, and
+    picking the commonest would put two thirds of the claims outside the term
+    they are reported under. Each pairing that actually appears is kept, which
+    is what R-09 needs to judge a date of loss against the right one.
+    """
+    starts = stated.get("policy_period_start", [])
+    ends = stated.get("policy_period_end", [])
+    periods: list[tuple[date, date]] = []
+    for start_text, end_text in dict.fromkeys(zip(starts, ends)):
+        start = parse_date(start_text, date_order).value
+        end = parse_date(end_text, date_order).value
+        if start and end and start <= end:
+            periods.append((start, end))
+    return sorted(set(periods))
+
+
+def _reads_as_column_labels(candidate: str, headers: Sequence[str]) -> bool:
+    """Whether this "carrier name" is really the table's own column headings.
+
+    A loss run exported from a spreadsheet begins with its header row, so the
+    scan of the top of page one reads column labels and returns them as the
+    company. No carrier is called "Status Currency Indemnity", and every word
+    of it appears in the headings above the table.
+    """
+    words = {word for word in candidate.lower().split() if word.isalpha()}
+    printed = {
+        word
+        for label in headers
+        for word in label.lower().split()
+        if word.isalpha()
+    }
+    return bool(words) and words <= printed
+
+
+def read_document_columns(
+    tables: Sequence[RawTable],
+) -> dict[str, list[str]]:
+    """Document-level facts a carrier printed as columns instead of a heading.
+
+    A spreadsheet export repeats the company, the insured, the policy and its
+    term on every claim. Those are document facts, and the canonical schema
+    holds them once -- so they are read once here, and only where the rows
+    agree. A column that says three different things across the page is
+    describing three policies, not one document, and the disagreement is
+    reported rather than resolved by picking the first.
+    """
+    furniture = page_furniture(tables)
+    values: dict[str, list[str]] = {}
+    for table in tables:
+        columns = {
+            index: field
+            for index, label in enumerate(table.headers)
+            if (field := guess_document_field(label))
+        }
+        if not columns:
+            continue
+        for row in table.rows:
+            # A footer printed on every page occupies the same columns as the
+            # claims and says nothing about the policy. Two of them are enough
+            # to make eighty-four rows look as though they disagree.
+            if _normalised(row) in furniture:
+                continue
+            for index, field in columns.items():
+                text = clean_text(row.cell(index))
+                if text:
+                    values.setdefault(field, []).append(text)
+    return values
+
+
+def agreed(values: Sequence[str]) -> str | None:
+    """The one thing these rows say, or None if they do not agree."""
+    distinct = {value for value in values if value}
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
 def collect_printed_totals(
     tables: Sequence[RawTable], mapping: ColumnMapping, locale: str | None
 ) -> dict[str, Decimal | None]:
@@ -643,12 +725,32 @@ def resolve_date_order(
     return table_order, header_order
 
 
+#: What carriers call a line of business when they do not use the abbreviation.
+_LOB_WORDS: tuple[tuple[str, LineOfBusiness], ...] = (
+    ("WORKERSCOMP", LineOfBusiness.WC),
+    ("WORKERSCOMPENSATION", LineOfBusiness.WC),
+    ("WORKMENSCOMP", LineOfBusiness.WC),
+    ("GENERALLIABILITY", LineOfBusiness.GL),
+    ("LIABILITY", LineOfBusiness.GL),
+    ("PUBLICLIABILITY", LineOfBusiness.GL),
+    ("AUTOMOBILE", LineOfBusiness.AUTO),
+    ("MOTOR", LineOfBusiness.AUTO),
+    ("COMMERCIALAUTO", LineOfBusiness.AUTO),
+    ("PROPERTY", LineOfBusiness.PROP),
+    ("UMBRELLA", LineOfBusiness.UMB),
+    ("EXCESS", LineOfBusiness.UMB),
+)
+
+
 def _line_of_business(text: str | None) -> LineOfBusiness | None:
     if not text:
         return None
     token = clean_text(text).upper().replace(" ", "")
     for member in LineOfBusiness:
         if token.startswith(member.value):
+            return member
+    for word, member in _LOB_WORDS:
+        if word in token:
             return member
     return LineOfBusiness.OTHER
 
@@ -752,6 +854,11 @@ def run_pipeline(
     dash_means_zero = bool(profile and profile.dash_means_zero)
 
     digital_tables = [table for table in tables if table.strategy != "vision"]
+
+    # Where the document states a fact in a column rather than a heading, that
+    # column is the better source: it is the document saying so directly, not
+    # a guess about which line of the letterhead names the carrier.
+    stated = read_document_columns(digital_tables)
     claims, row_warnings = build_claims(
         digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero
     )
@@ -847,7 +954,12 @@ def run_pipeline(
     declared = (metadata.currency or "").strip().upper()[:3]
     declared = declared if len(declared) == 3 and declared.isalpha() else ""
     symbols = {claim.currency for claim in claims if claim.currency}
-    if declared:
+    stated_currency = agreed(stated.get("currency", []))
+    if stated_currency and len(stated_currency) == 3 and stated_currency.isalpha():
+        # A currency column is the document naming its own currency, which
+        # beats a symbol scraped off the amounts.
+        currency = stated_currency.upper()
+    elif declared:
         currency = declared
     elif len(symbols) == 1:
         currency = next(iter(symbols))
@@ -855,16 +967,39 @@ def run_pipeline(
         currency = "USD"
     currencies_seen = sorted(symbols | ({declared} if declared else set()))
 
+    column_carrier = agreed(stated.get("carrier", []))
+    column_insured = agreed(stated.get("named_insured", []))
+    column_policy = agreed(stated.get("policy_number", []))
+    column_lob = agreed(stated.get("line_of_business", []))
+    column_start = parse_date(agreed(stated.get("policy_period_start", [])) or "",
+                              date_order).value
+    column_end = parse_date(agreed(stated.get("policy_period_end", [])) or "",
+                            date_order).value
+    if not declared_periods:
+        declared_periods = stated_periods(stated, date_order)
+    letterhead_carrier = metadata.carrier
+    if letterhead_carrier and _reads_as_column_labels(letterhead_carrier, headers):
+        # The top of page one *is* the table's own heading here, so the scan
+        # returned three column labels as the company's name.
+        letterhead_carrier = None
+    if "carrier" in stated:
+        # A column naming the company settles it, including when it names two.
+        # The letterhead scan reads the top of page one, which on a sheet like
+        # this is the first claim -- so it would report one of the two carriers
+        # as the document's, and file a third of the book under the wrong one.
+        letterhead_carrier = None
+
     document = LossRunDocument(
         document_id=ingested.document_id,
         source_filename=ingested.source_filename,
         file_sha256=ingested.sha256,
-        carrier=metadata.carrier,
-        named_insured=metadata.named_insured,
-        policy_number=metadata.policy_number,
-        policy_period_start=period_start_value,
-        policy_period_end=period_end_value,
-        line_of_business=_line_of_business(metadata.line_of_business),
+        carrier=column_carrier or letterhead_carrier,
+        named_insured=column_insured or metadata.named_insured,
+        policy_number=column_policy or metadata.policy_number,
+        policy_period_start=period_start_value or column_start,
+        policy_period_end=period_end_value or column_end,
+        line_of_business=_line_of_business(metadata.line_of_business)
+        or _line_of_business(column_lob),
         valuation_date=valuation.value,
         currency=currency,
         locale_hint=locale_inference.locale,

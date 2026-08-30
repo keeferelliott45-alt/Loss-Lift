@@ -633,11 +633,22 @@ def parse_status(raw: object) -> ClaimStatus:
     """Fold a carrier's status vocabulary onto the canonical set.
 
     Anything unrecognised is UNKNOWN, never a guess at the nearest match.
+
+    A status column is narrow and the column beside it is not, so on two of the
+    corpus documents the cell arrives as "Closed GIANCARLO DE ANGELIS" or
+    "Closed INSD, IV DID NOT HIT OV" -- the status, then whatever ran into it.
+    The status leads and the intrusion trails, so a cell whose first word is a
+    status word states that status. A cell that merely mentions one later does
+    not: a description reading "vehicle was open at the time" says nothing
+    about whether the claim is.
     """
     text = normalize_label(raw)
     if not text:
         return ClaimStatus.UNKNOWN
-    return _STATUS_VOCAB.get(text, ClaimStatus.UNKNOWN)
+    if text in _STATUS_VOCAB:
+        return _STATUS_VOCAB[text]
+    leading, _, rest = text.partition(" ")
+    return _STATUS_VOCAB.get(leading, ClaimStatus.UNKNOWN) if rest else ClaimStatus.UNKNOWN
 
 
 _TRUE_TOKENS = frozenset({"y", "yes", "true", "t", "1", "lit", "litigated", "in suit", "suit"})

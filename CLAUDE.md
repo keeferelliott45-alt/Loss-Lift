@@ -184,6 +184,13 @@ reached. A merged row records every printed line it came from.
 **Stage 2b — Vision extraction** (`core/extract_vision.py`)
 Render pages at 300 DPI with PyMuPDF, send to Gemini with the JSON schema. Only for scanned pages. Mark every field `source_method="vision"` and cap confidence at 0.85 regardless of model output.
 
+A loss run need not print its document-level facts in a letterhead. A
+spreadsheet export repeats the company, the insured, the policy and its term as
+**columns on every claim** — the same facts the export denormalises back onto
+every row (section 3). Those columns are read once onto the document, and only
+where the rows agree: a policy column saying three different things describes
+three policies, and each term it names is kept rather than one of them chosen.
+
 **Stage 3 — Column mapping** (`core/profiles.py`)
 1. Fingerprint the document: normalized text of the top 15% of page 1 + any carrier-name regex hits. Hash it.
 2. If a saved profile matches the fingerprint → apply it. **Zero LLM calls.**
@@ -191,6 +198,21 @@ Render pages at 300 DPI with PyMuPDF, send to Gemini with the JSON schema. Only 
 4. After the human confirms or corrects the mapping in the UI, save the profile to `data/profiles/{fingerprint}.json`.
 
 A profile stores: column-label → canonical-field map, date format, number locale, negative convention, header row index, footer-total row detection pattern, carrier name.
+
+Finding the columns is two questions, not one, and they have different answers.
+**Where** the columns are comes from the rows: a gutter is space they leave
+blank. **What** each one is comes from the header block, every line of it, with
+a label following its own words rather than the nearest column edge — money
+prints right-aligned under a left-aligned label and need not overlap its own
+column at all. Where the two disagree the reading that names more distinct
+fields wins, and a boundary falling inside a run of text the rows never break
+loses.
+
+One overlong cell must not close a boundary the rest of the page keeps. Where
+the header names a column twice and most of that column's rows leave a channel
+wider than the space they set between their own words, the column is cut there.
+Both sources have to agree: a two-word heading set wide over running prose is
+one column, and cutting it would halve every description.
 
 **Stage 4 — Normalize** (`core/normalize.py`)
 Numbers, dates, and status vocabulary (`O`/`OP`/`Open`/`OPEN` → `OPEN`; `C`/`CL`/`Closed` → `CLOSED`).
