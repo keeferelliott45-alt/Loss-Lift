@@ -156,6 +156,7 @@ def r01_incurred_identity(
                 rule_id="R-01",
                 severity=Severity.ERROR,
                 claim_number=claim.claim_number,
+                subject=claim.row_id,
                 field="incurred_total",
                 message=(
                     f"Incurred does not equal paid + reserve - recovery: "
@@ -199,6 +200,7 @@ def _component_sum_rule(
                 rule_id=rule_id,
                 severity=Severity.ERROR,
                 claim_number=claim.claim_number,
+                subject=claim.row_id,
                 field=total_field,
                 message=(
                     f"{_label(total_field).capitalize()} does not equal its parts: "
@@ -340,6 +342,7 @@ def r07_required_claim_fields(
                     rule_id="R-07",
                     severity=Severity.ERROR,
                     claim_number=claim.claim_number,
+                    subject=claim.row_id,
                     field=field_name,
                     message=(
                         f"{_label(field_name).capitalize()} is missing{because}. "
@@ -374,6 +377,7 @@ def r08_closed_with_reserve(
                 rule_id="R-08",
                 severity=Severity.WARN,
                 claim_number=claim.claim_number,
+                subject=claim.row_id,
                 field="reserve_total",
                 message=(
                     f"Claim is closed but still carries reserve of "
@@ -408,6 +412,7 @@ def r09_loss_outside_policy_period(
                     rule_id="R-09",
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
+                    subject=claim.row_id,
                     field="date_of_loss",
                     message=(
                         f"Date of loss {loss} falls outside the policy period "
@@ -433,6 +438,7 @@ def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
                     rule_id="R-10",
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
+                    subject=claim.row_id,
                     field="date_reported",
                     message=(
                         f"Reported {reported} is before the loss date {loss}."
@@ -450,6 +456,7 @@ def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
                             rule_id="R-10",
                             severity=Severity.WARN,
                             claim_number=claim.claim_number,
+                            subject=claim.row_id,
                             field=field_name,
                             message=(
                                 f"{_label(field_name).capitalize()} {value} is after "
@@ -559,6 +566,7 @@ def r13_outliers(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]
                     rule_id="R-13",
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
+                    subject=claim.row_id,
                     field=field_name,
                     message=(
                         f"{_label(field_name).capitalize()} {_fmt(value)} is far "
@@ -587,6 +595,7 @@ def r14_negative_paid(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
                 rule_id="R-14",
                 severity=Severity.INFO,
                 claim_number=claim.claim_number,
+                subject=claim.row_id,
                 field="paid_total",
                 message=(
                     f"Paid total is negative ({_fmt(claim.paid_total)}). This is "
@@ -631,6 +640,7 @@ def r15_unresolved_fields(
                     rule_id="R-15",
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
+                    subject=claim.row_id,
                     field=field_name,
                     message=(
                         f"{_label(field_name).capitalize()} could not be read "
@@ -690,6 +700,7 @@ def r17_no_money_either_side(
                 rule_id="R-17",
                 severity=Severity.WARN,
                 claim_number=claim.claim_number,
+                subject=claim.row_id,
                 field="paid_total",
                 message=(
                     "Nothing paid and nothing reserved. Expected for a "
@@ -832,6 +843,10 @@ def r21_ambiguous_column_mapping(
             Finding(
                 rule_id="R-21",
                 severity=Severity.ERROR,
+                # One finding per contested column, so each has to say which
+                # column it is. Otherwise dismissing "Incurred Medical" would
+                # answer for "Total Incurred" as well.
+                subject=f"column {record.source_index + 1}",
                 field=record.contested_field,
                 message=(
                     f"Column {record.source_index + 1}, printed \"{label}\", "

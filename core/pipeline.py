@@ -69,6 +69,7 @@ from core.schema import (
     RawRow,
     RawTable,
     ReconciliationResult,
+    Resolution,
     SourceMethod,
 )
 
@@ -1129,44 +1130,101 @@ def resolve_finding(
         result.reconciliation.findings, document.review_log
     ).headline()
     was = after = None
+    claim = claim_for(document, finding)
 
-    if action is ReviewAction.CORRECTED and finding.claim_number and finding.field:
-        claim = next(
-            (c for c in document.claims if c.claim_number == finding.claim_number), None
-        )
+    if action is ReviewAction.CORRECTED:
+        # Refused rather than recorded. A log line reading "corrected" against
+        # a finding that has no cell to correct describes a change nobody made,
+        # and an audit trail that says so about one decision cannot be trusted
+        # about the others.
+        if not finding.claim_number:
+            raise ValueError(
+                f"{finding.rule_id} is about the whole document rather than one "
+                f"row, so there is no cell here to correct. Confirm or dismiss "
+                f"it, or change the value in the claims table."
+            )
         if claim is None:
-            raise ValueError(f"No claim {finding.claim_number!r} to correct.")
+            raise ValueError(
+                f"No claim {finding.claim_number!r} to correct — it may have been "
+                f"renamed or deleted since this finding was raised."
+            )
+        if not finding.field:
+            raise ValueError(
+                f"{finding.rule_id} is about claim {finding.claim_number} as a "
+                f"whole rather than one of its fields, so there is no single "
+                f"cell here to correct."
+            )
+        if finding.field not in Claim.model_fields:
+            # A rule may flag something the claim does not store -- a printed
+            # claim count, a column that was never mapped. Writing it into the
+            # row would be dropped on the way in and logged as a correction
+            # that happened, which is the one thing an audit trail may not do.
+            raise ValueError(
+                f"{finding.rule_id} is about {finding.field!r}, which is not a "
+                f"field of a claim, so there is nothing here to correct."
+            )
         was = _as_text(getattr(claim, finding.field, None))
-        columns = review_columns(document)
-        records = to_records(document, columns)
+        records = to_records(document, review_columns(document))
+        # By identity, not by claim number: two rows can share a number, and
+        # the row this finding is about is not necessarily the first of them.
         row = next(
             record for record in records
-            if record.get("claim_number") == finding.claim_number
+            if record.get(ROW_ID_COLUMN) == claim.row_id
         )
         row[finding.field] = corrected_value
-        document = apply_edits(document, records)
-        corrected = next(
-            c for c in document.claims if c.claim_number == finding.claim_number
-        )
+        # The edit and the re-run both complete before either is visible. A
+        # document whose claims have moved and whose findings have not is worse
+        # than an edit that failed: it reads as reconciled against figures that
+        # are no longer there, and nothing says so.
+        edited = apply_edits(document, records, audit=False)
+        corrected = next(c for c in edited.claims if c.row_id == claim.row_id)
         after = _as_text(getattr(corrected, finding.field, None))
-        result.document = document
-        result.reconciliation = rerun_reconciliation(document)
+        reconciliation = rerun_reconciliation(edited)
+        result.document = document = edited
+        result.reconciliation = reconciliation
+        claim = corrected
 
-    document.review_log.record(
-        resolution_for(
-            finding,
-            action,
-            reviewer=reviewer,
-            note=note,
-            before=was,
-            after=after,
-            status_before=before_headline,
-            status_after=summarise_review(
-                result.reconciliation.findings, document.review_log
-            ).headline(),
-        )
+    entry = resolution_for(
+        finding,
+        action,
+        reviewer=reviewer,
+        note=note,
+        before=was,
+        after=after,
+        row_id=claim.row_id if claim else "",
+        where=claim.where() if claim else "",
+        status_before=before_headline,
+        status_after="",
     )
+    document.review_log.record(entry)
+    # Filled in after the entry is in the log, because this decision is part of
+    # what the document now reads as: dismissing the last open flag is what
+    # moves "flags to review" to "flags reviewed", and a status computed a
+    # moment earlier would record every decision as having changed nothing.
+    # Only this entry is touched, and only before anyone has seen it.
+    entry.status_after = summarise_review(
+        result.reconciliation.findings, document.review_log
+    ).headline()
     return result
+
+
+def claim_for(document: LossRunDocument, finding: Finding) -> Claim | None:
+    """The claim a finding is about, or None where it is about the document.
+
+    Findings carry the row's identity, so this is a lookup rather than a
+    search. The claim-number fallback is for findings a rule raises about a
+    *number* rather than a row — R-11's duplicate is about both rows at once —
+    and for anything constructed before the identity existed.
+    """
+    if finding.subject:
+        for claim in document.claims:
+            if claim.row_id == finding.subject:
+                return claim
+    if finding.claim_number:
+        for claim in document.claims:
+            if claim.claim_number == finding.claim_number:
+                return claim
+    return None
 
 
 def save_confirmed_mapping(
@@ -1229,6 +1287,10 @@ def sample_rows(tables: Sequence[RawTable], count: int = 3) -> list[list[str]]:
 #: traced back to the page it came from. Shown read-only.
 PROVENANCE_COLUMNS = ("_page", "_row", "_method")
 
+#: The claim's durable identity, carried through the editable table and never
+#: shown in it. See :attr:`core.schema.Claim.row_id`.
+ROW_ID_COLUMN = "_id"
+
 REVIEW_COLUMNS: tuple[str, ...] = (
     "claim_number",
     "date_of_loss",
@@ -1285,6 +1347,11 @@ def to_records(
         row["_page"] = claim.source_page
         row["_row"] = claim.source_row
         row["_method"] = claim.source_method.value
+        # Which row this is, carried through the table so an edit can be put
+        # back on the claim it came from. Not displayed: it answers a question
+        # the reviewer is not asking, and every other column on the row is one
+        # they may change, the claim number included.
+        row[ROW_ID_COLUMN] = claim.row_id
         records.append(row)
     return records
 
@@ -1367,17 +1434,36 @@ def apply_edits(
     *,
     locale: str | None = None,
     date_order: str | None = None,
+    audit: bool = True,
 ) -> LossRunDocument:
     """Rebuild the document from the edited table.
 
     A cell the human changed becomes ``source_method="manual"`` with full
     confidence and no outstanding issue — they are the authority, and the audit
     trail records that they were.
+
+    Every change made here is written to the review log, because this table is
+    the main editing surface and not a side door: a carrier's figure replaced
+    in the grid is the same act as one corrected against a finding, and an
+    export that shows the second and not the first is not an audit trail. A
+    deleted row is recorded with what it held, since that is the one change
+    nothing downstream can notice — no finding survives to name it, and R-05
+    only catches it when the carrier printed a claim count.
+
+    ``audit=False`` is for :func:`resolve_finding`, which records the same
+    change against the finding it was made about and would otherwise log it
+    twice.
     """
     locale = locale or (document.locale_hint if document.locale_confident else None)
     date_order = date_order or (
         document.date_order if document.date_order_confident else None
     )
+    # The row a record came from, found by the one thing about it a reviewer
+    # cannot edit. Matching on the claim number instead loses the original
+    # whenever the number is what changed -- which is the ordinary remedy for
+    # a duplicate -- and with it the printed cell text, the region on the page
+    # and the reasons its nulls are null.
+    by_identity = {claim.row_id: claim for claim in document.claims if claim.row_id}
     originals = {
         (claim.source_page, claim.source_row, claim.claim_number): claim
         for claim in document.claims
@@ -1390,8 +1476,12 @@ def apply_edits(
         if not claim_number:
             continue  # a row emptied out is a row deleted
 
-        key = (record.get("_page"), record.get("_row"), claim_number)
-        original = originals.get(key)
+        original = by_identity.get(str(record.get(ROW_ID_COLUMN) or ""))
+        # Records built by hand -- a test, a caller predating the identity --
+        # still match the way they always did.
+        if original is None:
+            key = (record.get("_page"), record.get("_row"), claim_number)
+            original = originals.get(key)
         if original is None and index < len(by_position):
             candidate = by_position[index]
             if candidate.claim_number == claim_number:
@@ -1403,6 +1493,7 @@ def apply_edits(
         edited = False
         touched: list[str] = []
         originals_read = dict(original.original_values) if original else {}
+        issues_read = dict(original.original_issues) if original else {}
         fields: dict[str, Any] = {}
 
         for name, value in record.items():
@@ -1412,7 +1503,11 @@ def apply_edits(
                 continue
             coerced, reason = _coerce(name, value, locale, date_order)
             previous = getattr(original, name, None) if original else None
-            fields[name] = coerced
+            # A figure the reviewer did not touch keeps the scale it was read
+            # at. The table round-trips money through float, so 8,400.00 comes
+            # back as 8400.0 -- the same amount, spelled with less of what the
+            # carrier printed, on a row nobody edited.
+            fields[name] = previous if coerced == previous else coerced
             if coerced != previous:
                 edited = True
                 touched.append(name)
@@ -1422,6 +1517,12 @@ def apply_edits(
                 # not the document's.
                 if original is not None and name not in originals_read:
                     originals_read[name] = _as_text(previous)
+                    # And why it was null, when it was. The reason is the
+                    # carrier's evidence about that cell just as much as the
+                    # text is, and popping it below would be the only copy.
+                    was_unreadable = original.field_issues.get(name)
+                    if was_unreadable is not None:
+                        issues_read[name] = was_unreadable
                 confidence[name] = 1.0
                 issues.pop(name, None)
                 if coerced is None and reason and reason is not NullReason.EMPTY:
@@ -1430,11 +1531,19 @@ def apply_edits(
                 issues[name] = original.field_issues[name]
 
         if original is not None and claim_number != original.claim_number:
+            # A renumbered claim is an edited field like any other, and the
+            # loop above skips it: the claim number is the row's label, so it
+            # is read before the fields rather than with them. Left out, the
+            # one change that alters what a row calls itself would be the one
+            # change nothing recorded.
             edited = True
+            touched.append("claim_number")
+            originals_read.setdefault("claim_number", original.claim_number)
 
         claims.append(
             Claim(
                 claim_number=claim_number,
+                row_id=original.row_id if original else "",
                 source_page=int(record.get("_page") or (original.source_page if original else 1)),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,
@@ -1443,6 +1552,7 @@ def apply_edits(
                     set(touched) | set(original.edited_fields if original else [])
                 ),
                 original_values=originals_read,
+                original_issues=issues_read,
                 # How the row was read, kept beside how it now reads. Without
                 # it, correcting one cell would leave the other nine unable to
                 # say whether they came off a text layer or out of a scan.
@@ -1466,4 +1576,94 @@ def apply_edits(
 
     updated = document.model_copy(deep=True)
     updated.claims = claims
+    if audit:
+        _record_edits(updated, document.claims, claims)
     return updated
+
+
+def _record_edits(
+    document: LossRunDocument,
+    before: Sequence[Claim],
+    after: Sequence[Claim],
+) -> None:
+    """Write what the table changed into the review log.
+
+    Keyed on the row rather than on any finding: nobody raised these, so there
+    is nothing for a later run to re-raise or retire. They are here to answer
+    "who replaced this figure, and what was it before".
+    """
+    was = {claim.row_id: claim for claim in before if claim.row_id}
+    now = {claim.row_id: claim for claim in after if claim.row_id}
+
+    for row_id, gone in was.items():
+        if row_id in now:
+            continue
+        document.review_log.record(
+            Resolution(
+                key=f"deleted|{row_id}",
+                action=ReviewAction.DELETED,
+                row_id=row_id,
+                where=gone.where(),
+                claim_number=gone.claim_number,
+                message=(
+                    f"Claim {gone.claim_number} was removed on the review screen, "
+                    f"read from {gone.where()}."
+                ),
+                before=_deleted_summary(gone),
+                after=None,
+            )
+        )
+
+    for row_id, current in now.items():
+        previous = was.get(row_id)
+        if previous is None:
+            document.review_log.record(
+                Resolution(
+                    key=f"added|{row_id}",
+                    action=ReviewAction.EDITED,
+                    row_id=row_id,
+                    where=current.where(),
+                    claim_number=current.claim_number,
+                    message=(
+                        f"Claim {current.claim_number} was added on the review "
+                        f"screen. The document is not its source."
+                    ),
+                    before=None,
+                    after=current.claim_number,
+                )
+            )
+            continue
+        for field_name in current.edited_fields:
+            was_value = _as_text(getattr(previous, field_name, None))
+            now_value = _as_text(getattr(current, field_name, None))
+            if was_value == now_value:
+                continue
+            document.review_log.record(
+                Resolution(
+                    key=f"edited|{row_id}|{field_name}",
+                    action=ReviewAction.EDITED,
+                    row_id=row_id,
+                    where=current.where(),
+                    claim_number=current.claim_number,
+                    field=field_name,
+                    message=(
+                        f"{field_name.replace('_', ' ').capitalize()} was changed "
+                        f"in the claims table, on the row read from "
+                        f"{current.where()}."
+                    ),
+                    before=was_value,
+                    after=now_value,
+                )
+            )
+
+
+def _deleted_summary(claim: Claim) -> str:
+    """What a removed row held, in one line, so the loss is visible."""
+    parts = [f"claim {claim.claim_number}"]
+    if claim.date_of_loss:
+        parts.append(f"loss {claim.date_of_loss.isoformat()}")
+    for field_name in ("paid_total", "reserve_total", "incurred_total"):
+        value = getattr(claim, field_name, None)
+        if value is not None:
+            parts.append(f"{field_name.replace('_', ' ')} {value}")
+    return ", ".join(parts)

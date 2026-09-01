@@ -227,14 +227,27 @@ def test_a_document_wide_finding_is_given_no_claim_evidence(broken):
 
 
 def test_review_history_survives_an_unrelated_edit(broken):
-    """Editing the table rebuilds every claim; the log is not a claim."""
+    """Editing the table rebuilds every claim; the log is not a claim.
+
+    The edit adds its own line, because replacing a carrier's figure in the
+    grid is the same act as correcting one against a finding. What must not
+    happen is the earlier decision being rewritten or dropped on the way.
+    """
     finding = _finding(broken, "R-01")
     result = resolve_finding(broken, finding, ReviewAction.CONFIRMED, note="kept")
     records = to_records(result.document, review_columns(result.document))
     records[0]["claimant_name"] = "Someone Else"
     updated = apply_edits(result.document, records)
-    assert len(updated.review_log.entries) == 1
-    assert updated.review_log.entries[0].note == "kept"
+
+    kept = updated.review_log.entries[0]
+    assert kept.note == "kept"
+    assert kept.action is ReviewAction.CONFIRMED
+    assert kept.rule_id == "R-01"
+
+    recorded = updated.review_log.entries[-1]
+    assert recorded.action is ReviewAction.EDITED
+    assert recorded.field == "claimant_name"
+    assert (recorded.before, recorded.after) == ("Adams, Cole", "Someone Else")
 
 
 def test_review_history_survives_a_reconciliation_rerun(broken):
@@ -265,7 +278,9 @@ def test_review_history_reaches_the_workbook(broken):
     assert row["Decision"] == "corrected"
     assert row["Originally extracted"] == f"{was:f}"
     assert row["Reviewer note"] == "misread on the page"
-    assert row["Reconciliation before"] != row["Reconciliation after"]
+    # Named for what it carries: the document's standing, which review
+    # progress moves and reconciliation is only part of.
+    assert row["Document status before"] != row["Document status after"]
     assert row["Reviewer"] == "local reviewer"
 
 
@@ -315,11 +330,21 @@ def test_resolving_needs_no_reviewer_identity(broken):
 
 
 def test_correcting_a_finding_without_a_field_is_refused(broken):
-    """A document-wide finding has no cell to correct, and none is guessed."""
+    """A document-wide finding has no cell to correct, and none is guessed.
+
+    Refused out loud, not absorbed. Recording "corrected" against a finding
+    that changed nothing puts an act in the audit trail that never happened,
+    which is worse than telling the reviewer this is not correctable.
+    """
     document_wide = next(
         f for f in broken.reconciliation.findings if not f.claim_number
     )
     before = broken.document.model_dump_json(exclude={"review_log"})
-    result = resolve_finding(broken, document_wide, ReviewAction.CORRECTED)
-    assert result.document.model_dump_json(exclude={"review_log"}) == before
-    assert result.document.review_log.entries[-1].before is None
+    with pytest.raises(ValueError, match="whole document"):
+        resolve_finding(broken, document_wide, ReviewAction.CORRECTED)
+    assert broken.document.model_dump_json(exclude={"review_log"}) == before
+    assert not broken.document.review_log.entries
+
+    # It is still reviewable, just not correctable.
+    result = resolve_finding(broken, document_wide, ReviewAction.CONFIRMED)
+    assert result.document.review_log.entries[-1].action is ReviewAction.CONFIRMED

@@ -169,8 +169,16 @@ def resolution_for(
     note: str = "",
     before: str | None = None,
     after: str | None = None,
+    row_id: str = "",
+    where: str = "",
 ) -> Resolution:
-    """Build the record of a decision from the finding it was taken about."""
+    """Build the record of a decision from the finding it was taken about.
+
+    Everything the finding asserted is copied in, not summarised. An audit
+    asking "what did this person actually agree to" gets the rule, the row, the
+    figures and the discrepancy as they stood, and can see for itself whether
+    the finding raised today is the same one.
+    """
     return Resolution(
         key=finding_key(finding),
         action=action,
@@ -181,6 +189,11 @@ def resolution_for(
         message=finding.message,
         claim_number=finding.claim_number,
         field=finding.field,
+        row_id=row_id,
+        where=where,
+        expected=None if finding.expected is None else str(finding.expected),
+        actual=None if finding.actual is None else str(finding.actual),
+        delta=None if finding.delta is None else str(finding.delta),
         before=before,
         after=after,
         status_before=status_before,

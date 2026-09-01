@@ -36,7 +36,8 @@ from core.summary import summarise_by_period
 
 if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
-from core.evidence import claim_evidence
+from core.evidence import Evidence, EvidenceKind, claim_evidence, confirm_region
+
 from core.review import ReviewAction, ReviewLog, finding_key
 from core.schema import (
     DATE_FIELDS,
@@ -162,6 +163,26 @@ def _document_values(document: LossRunDocument) -> list[Any]:
     return values
 
 
+
+def _unconfirmed(evidence: Evidence) -> Evidence:
+    """A region nobody could read back is reported as its page.
+
+    Not silently: the note says why, so a reader is told the difference
+    between "the row is here" and "the row is on this page somewhere".
+    """
+    return Evidence(
+        kind=EvidenceKind.PAGE,
+        method=evidence.method,
+        note=(
+            f"Read from page {evidence.page}. The exact region was not "
+            f"re-checked when this workbook was written, so the page is named "
+            f"and the row is not."
+        ),
+        page=evidence.page,
+        lines=list(evidence.lines),
+        text=evidence.text,
+    )
+
 _HEADER_FILL = PatternFill("solid", fgColor="1F2933")
 _HEADER_FONT = Font(color="FFFFFF", bold=True)
 _FINDING_FILL = PatternFill("solid", fgColor="FDE8C8")   # amber
@@ -194,9 +215,19 @@ def resolve_columns(
     return columns
 
 
-def _cell_value(claim: Claim, field_name: str) -> Any:
+def _cell_value(claim: Claim, field_name: str, source_path: Any = None) -> Any:
     if field_name == "source_evidence":
-        return claim_evidence(claim).describe()
+        evidence = claim_evidence(claim)
+        # Read the region back before writing it down, exactly as the review
+        # screen does before drawing it. The workbook outlives the upload and
+        # is the copy an underwriter files, so it must never be the more
+        # confident of the two. Without the file the region cannot be
+        # confirmed, and an unconfirmed one is reported as the page it is on.
+        if source_path is not None:
+            evidence = confirm_region(source_path, evidence, claim.claim_number)
+        elif evidence.kind is EvidenceKind.REGION:
+            evidence = _unconfirmed(evidence)
+        return evidence.describe()
     if field_name == "review_state":
         # Named per claim rather than per document: a row a person corrected
         # is a different thing from one nobody has touched, and the recipient
@@ -249,6 +280,7 @@ def _write_claims_sheet(
     document: LossRunDocument,
     columns: Sequence[str],
     result: ReconciliationResult | None,
+    source_path: Any = None,
 ) -> None:
     findings = _findings_index(result)
     widths: dict[int, int] = {}
@@ -267,7 +299,7 @@ def _write_claims_sheet(
 
     for row_index, claim in enumerate(document.claims, start=2):
         for column_index, field_name in enumerate(columns, start=1):
-            value = _cell_value(claim, field_name)
+            value = _cell_value(claim, field_name, source_path)
             cell = sheet.cell(row=row_index, column=column_index, value=value)
 
             if field_name in MONEY_FIELDS:
@@ -467,9 +499,13 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     decided is here. A recipient who only has the file can still tell which is
     which, which is the whole point of writing it down.
     """
-    headers = ["When", "Reviewer", "Rule", "Severity", "Claim number", "Field",
-               "What was flagged", "Decision", "Originally extracted",
-               "Corrected to", "Reconciliation before", "Reconciliation after",
+    # "Document status", not "Reconciliation": the headline says the worst true
+    # thing about the document, and dismissing the last flag moves it without
+    # anything having reconciled. Naming the column for the stronger of the two
+    # would be the report claiming the review had settled the figures.
+    headers = ["When", "Reviewer", "Rule", "Severity", "Claim number", "Where",
+               "Field", "What was flagged", "Decision", "Originally extracted",
+               "Corrected to", "Document status before", "Document status after",
                "Reviewer note"]
     widths = _header_row(sheet, headers)
 
@@ -481,6 +517,7 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
             entry.rule_id,
             entry.severity,
             entry.claim_number or "",
+            entry.where,
             _title(entry.field) if entry.field else "",
             entry.message,
             entry.action.value,
@@ -589,6 +626,7 @@ def build_workbook(
     redact: bool = False,
     include_provenance: bool = True,
     large_loss_threshold: Decimal = LARGE_LOSS_THRESHOLD,
+    source_path: Any = None,
 ) -> Workbook:
     """Build the workbook: claims, loss summary, exceptions and provenance."""
     columns = resolve_columns(
@@ -597,7 +635,7 @@ def build_workbook(
     workbook = Workbook()
     claims_sheet = workbook.active
     claims_sheet.title = "Claim Detail"
-    _write_claims_sheet(claims_sheet, document, columns, result)
+    _write_claims_sheet(claims_sheet, document, columns, result, source_path)
     _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
     _write_large_loss_sheet(
         workbook.create_sheet("Large Loss"), document, large_loss_threshold

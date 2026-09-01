@@ -42,6 +42,7 @@ from core.pipeline import (
     ColumnMapping,
     ExtractionResult,
     PROVENANCE_COLUMNS,
+    ROW_ID_COLUMN,
     apply_edits,
     rerun_reconciliation,
     review_columns,
@@ -148,6 +149,9 @@ def _state() -> dict[str, Any]:
     # their document, not here — a global error list turns one unmapped
     # document into forty red banners that bury the queue.
     st.session_state.setdefault("rejected", [])
+    # Things worth saying once about the last upload that are not failures —
+    # a file read a second time, say.
+    st.session_state.setdefault("notices", [])
     return st.session_state
 
 
@@ -559,14 +563,20 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
             if action is ReviewAction.CORRECTED and not str(corrected).strip():
                 st.error("Enter the corrected value, or choose confirm or dismiss.")
             else:
-                _store(
-                    resolve_finding(
-                        result, finding, action,
-                        note=note,
-                        corrected_value=corrected if action is ReviewAction.CORRECTED else None,
+                try:
+                    _store(
+                        resolve_finding(
+                            result, finding, action,
+                            note=note,
+                            corrected_value=corrected if action is ReviewAction.CORRECTED else None,
+                        )
                     )
-                )
-                st.rerun()
+                except ValueError as refused:
+                    # Nothing was changed and nothing was logged. Say which,
+                    # rather than recording a correction that corrected nothing.
+                    st.error(str(refused))
+                else:
+                    st.rerun()
 
 
 def _money(value: Any) -> str:
@@ -692,6 +702,7 @@ def _extract_uploads(uploads: list[Any]) -> None:
     exactly what made multi-file uploads look broken before."""
     state = _state()
     state["rejected"] = []
+    state["notices"] = []
     progress = st.progress(0.0, text="Reading documents")
     added = 0
 
@@ -699,6 +710,19 @@ def _extract_uploads(uploads: list[Any]) -> None:
         try:
             staged = ingest(upload.getvalue(), upload.name)
             result = run_pipeline(staged, use_llm=llm_enabled())
+            # The same file read a second time is a second document, with none
+            # of the first one's corrections or review history: nothing is kept
+            # between uploads (spec section 13). Said out loud, because the
+            # dangerous version of that is the reviewer assuming otherwise and
+            # exporting a document they believe they already fixed.
+            twin = _already_open(result.document.file_sha256)
+            if twin is not None:
+                state["notices"].append(
+                    f"{upload.name} is the same file as "
+                    f"{twin.document.source_filename}, already in the queue. It "
+                    f"was read again from scratch: corrections and review "
+                    f"history do not carry over between uploads."
+                )
             _store(result)
             state["staged"][result.document.document_id] = staged
             added += 1
@@ -720,6 +744,16 @@ def _extract_uploads(uploads: list[Any]) -> None:
     st.rerun()
 
 
+def _already_open(sha256: str) -> "ExtractionResult | None":
+    """A document already in the queue read from the identical file."""
+    state = _state()
+    for document_id in state["order"]:
+        existing = state["documents"].get(document_id)
+        if existing is not None and existing.document.file_sha256 == sha256:
+            return existing
+    return None
+
+
 def _queue_summary() -> None:
     state = _state()
     results = [state["documents"][did] for did in state["order"]]
@@ -728,6 +762,8 @@ def _queue_summary() -> None:
 
     if state.pop("last_added", None):
         st.success(f"Added {len(results)} total document(s) to the queue.")
+    for notice in state.pop("notices", []) or []:
+        st.info(notice)
 
     cols = st.columns(5)
     cols[0].metric("Documents", len(results))
@@ -953,6 +989,7 @@ def _build_batch_zip(document_ids: list[str], template: str, redact: bool) -> by
             payload = export_module.to_bytes(
                 result.document, result.reconciliation,
                 template=template, redact=redact,
+                source_path=result.source_path,
             )
             name = export_module.suggested_filename(result.document)
             if name in used_names:
@@ -1339,7 +1376,10 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     # A DataFrame so an empty amount renders as an empty cell rather than the
     # word "None": a blank and a zero must never look alike on this screen.
     edited = st.data_editor(
-        pd.DataFrame(records, columns=list(columns) + list(PROVENANCE_COLUMNS)),
+        pd.DataFrame(
+            records,
+            columns=list(columns) + list(PROVENANCE_COLUMNS) + [ROW_ID_COLUMN],
+        ),
         key=f"editor-{document_id}",
         num_rows="dynamic",
         width="stretch",
@@ -1416,6 +1456,10 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
         template=template,
         redact=redact,
         include_provenance=provenance,
+        # The file, so the workbook can read its own evidence back before it
+        # writes it down — the same check the review screen makes before it
+        # draws a highlight.
+        source_path=result.source_path,
     )
     st.download_button(
         "Download Excel",

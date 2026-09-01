@@ -13,7 +13,7 @@ from any stage without circular imports.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Annotated, Any, Iterable
 from uuid import uuid4
@@ -24,6 +24,7 @@ from pydantic import (
     ConfigDict,
     Field,
     field_validator,
+    model_validator,
 )
 
 # --------------------------------------------------------------------------
@@ -212,6 +213,15 @@ class Claim(BaseModel):
     source_row: int | None = None
     source_bbox: tuple[float, float, float, float] | None = None
 
+    #: Which physical row of the document this claim is, for as long as the
+    #: claim exists. Everything else on the row is something a reviewer may
+    #: change -- the claim number included, and carriers print the same one
+    #: twice -- so nothing else can say *which* claim a decision was about.
+    #: Assigned once from the page and line the claim was read from, never
+    #: regenerated, and readable as what it means: ``p3r17`` is page 3, line
+    #: 18 as printed. See :func:`assign_row_ids`.
+    row_id: str = ""
+
     #: Every printed line this claim was read from, when a carrier spreads one
     #: claim over several. ``source_row`` names the line carrying the claim
     #: number; these name all of them, so a reviewer looking at a seven-line
@@ -230,6 +240,13 @@ class Claim(BaseModel):
     original_values: dict[str, str] = Field(default_factory=dict)
     field_confidence: dict[str, float] = Field(default_factory=dict)
     field_issues: dict[str, NullReason] = Field(default_factory=dict)
+
+    #: Why a field was null, for every field a person has since filled in.
+    #: Typing a number over an unreadable cell answers the question; it does
+    #: not un-ask it, and an audit still needs to know the carrier printed
+    #: something LossLift could not resolve. Kept beside
+    #: :attr:`original_values` for the same reason.
+    original_issues: dict[str, NullReason] = Field(default_factory=dict)
     raw_cells: dict[str, str] = Field(default_factory=dict)
     currency: str | None = None
 
@@ -237,6 +254,18 @@ class Claim(BaseModel):
     #: claim-level ``source_method`` says "manual" once any cell is corrected,
     #: which is true of the row and false of its other nine fields.
     read_method: SourceMethod | None = None
+
+    def where(self) -> str:
+        """Where this claim came from, in words an audit can read.
+
+        The same place :attr:`row_id` names, said rather than encoded. Lines
+        are numbered as the page prints them, from one.
+        """
+        if self.source_method is SourceMethod.MANUAL and self.read_method is None:
+            return "added on the review screen"
+        if self.source_row is None:
+            return f"page {self.source_page}"
+        return f"page {self.source_page}, line {self.source_row + 1}"
 
     def provenance_of(self, field_name: str) -> SourceMethod:
         """How this particular field came to hold its value.
@@ -256,6 +285,10 @@ class Claim(BaseModel):
     def original_of(self, field_name: str) -> str | None:
         """What the extractor read, for a field a person has since changed."""
         return self.original_values.get(field_name)
+
+    def original_issue_of(self, field_name: str) -> NullReason | None:
+        """Why the extractor left a field null, before a person filled it in."""
+        return self.original_issues.get(field_name)
 
     @property
     def confidence(self) -> float:
@@ -308,6 +341,51 @@ class Claim(BaseModel):
 
     def needs_review(self) -> bool:
         return any(reason in REVIEW_REASONS for reason in self.field_issues.values())
+
+
+def assign_row_ids(claims: Iterable["Claim"]) -> None:
+    """Give every claim that lacks one an identity, in place.
+
+    The identity is the claim's own evidence, written down: the page and the
+    line it was read from. That is the one thing about a row a reviewer cannot
+    edit, which is what makes it the only safe answer to "which claim was this
+    decision about". A claim number is not — carriers print the same one twice,
+    and a reviewer correcting a duplicate changes it.
+
+    Two properties matter and are both deliberate:
+
+    * **Nothing is ever reassigned.** A claim that already has an identity
+      keeps it through every edit, so a decision recorded against it stays
+      attached to the row it was taken about.
+    * **It is not opaque.** ``p3r17`` is page 3, line 18 as printed, and
+      :meth:`Claim.where` says the same thing in words. An audit that cannot
+      explain what an identifier means has not really identified anything, so
+      no uuid appears here.
+
+    A row typed on the review screen has no page to name and says so. Where a
+    page and line genuinely cannot separate two rows the identity is suffixed
+    rather than duplicated, because two claims sharing one is the failure this
+    exists to prevent.
+    """
+    claims = list(claims)
+    taken = {claim.row_id for claim in claims if claim.row_id}
+    added = 0
+    for claim in claims:
+        if claim.row_id:
+            continue
+        if claim.source_method is SourceMethod.MANUAL and claim.read_method is None:
+            added += 1
+            stem = f"added{added}"
+        elif claim.source_row is None:
+            stem = f"p{claim.source_page}"
+        else:
+            stem = f"p{claim.source_page}r{claim.source_row}"
+        identity, suffix = stem, 1
+        while identity in taken:
+            suffix += 1
+            identity = f"{stem}-{suffix}"
+        taken.add(identity)
+        claim.row_id = identity
 
 
 # --------------------------------------------------------------------------
@@ -428,6 +506,20 @@ class LossRunDocument(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
+    @model_validator(mode="after")
+    def _identify_rows(self) -> "LossRunDocument":
+        """Every claim on the document can name the row it is.
+
+        Here rather than in each extractor because there is more than one way
+        into a document — two extraction paths, the review screen, a test — and
+        a claim that reached one of them without an identity would be a claim
+        no decision could safely attach to. ``validate_assignment`` means this
+        also runs when the review screen replaces the claim list, so a row
+        added by hand is identified the moment it exists.
+        """
+        assign_row_ids(self.claims)
+        return self
+
     @field_validator("currency")
     @classmethod
     def _iso_4217(cls, value: str) -> str:
@@ -492,6 +584,13 @@ class Finding(BaseModel):
     severity: Severity
     message: str
     claim_number: str | None = None
+    #: What on the document this finding is about, in terms that survive being
+    #: edited: a claim's :attr:`~Claim.row_id`, or the printed column a mapping
+    #: rule contests. The claim number cannot do this job — two rows can share
+    #: one, and correcting a duplicate changes it — and neither can the
+    #: finding's position, since the engine rebuilds the list on every edit.
+    #: Empty where a finding is genuinely about the whole document.
+    subject: str = ""
     field: str | None = None
     expected: Decimal | int | str | None = None
     actual: Decimal | int | str | None = None
@@ -529,17 +628,60 @@ class ReviewAction(str, Enum):
     #: Looked at, and the finding does not apply. The claim stays, the data
     #: stays, and the finding stays on the record as raised.
     DISMISSED = "dismissed"
+    #: A cell changed in the claims table rather than against a finding. Not a
+    #: decision about anything the engine raised, but it is still somebody
+    #: replacing a carrier's figure, so it belongs in the same record.
+    EDITED = "edited"
+    #: A whole row removed on the review screen. Recorded with what it held,
+    #: because a claim that leaves without a trace is the one kind of change
+    #: nothing downstream can notice.
+    DELETED = "deleted"
+
+
+def _asserted(finding: "Finding") -> tuple[str | None, str | None, str | None]:
+    """What a finding materially claims, as text an audit can read back."""
+    return (
+        None if finding.expected is None else str(finding.expected),
+        None if finding.actual is None else str(finding.actual),
+        None if finding.delta is None else str(finding.delta),
+    )
+
+
+def _same_amount(one: str | None, other: str | None) -> bool:
+    """Whether two recorded figures say the same thing.
+
+    Numerically where both are numbers, because a document that round-trips
+    through the review table comes back with the same money at a different
+    scale — ``8400.00`` and ``8400.0`` are one figure, and a decision about it
+    has not been overtaken by a re-run that wrote it differently.
+    """
+    if one == other:
+        return True
+    if one is None or other is None:
+        return False
+    try:
+        return Decimal(one) == Decimal(other)
+    except (InvalidOperation, ValueError):
+        return one.strip() == other.strip()
 
 
 def finding_key(finding: "Finding") -> str:
     """What identifies a finding across a re-run.
 
     Not its position: the engine rebuilds the list whenever a cell changes, and
-    a resolution attached to index 4 would slide onto a different finding. The
-    rule, the claim and the field are what the finding is *about*, and they
-    survive re-running.
+    a resolution attached to index 4 would slide onto a different finding. What
+    survives re-running is the rule, the thing on the document it is about, and
+    the field — so those are the key.
+
+    ``subject`` is what makes the middle term trustworthy. Keyed on the claim
+    number instead, a rule that raises one finding per contested column keys
+    them all alike: Liberty prints "Incurred Medical", "Incurred Expense" and
+    "Total Incurred", R-21 says so three times, and one dismissal would answer
+    for all three including the real incurred column.
     """
-    return "|".join((finding.rule_id, finding.claim_number or "", finding.field or ""))
+    return "|".join(
+        (finding.rule_id, finding.subject or finding.claim_number or "", finding.field or "")
+    )
 
 
 class Resolution(BaseModel):
@@ -562,6 +704,20 @@ class Resolution(BaseModel):
     claim_number: str | None = None
     field: str | None = None
 
+    #: Which physical row this was about, and the same thing in words. The
+    #: claim number alone cannot answer it: two rows can carry one number, and
+    #: correcting a duplicate changes the number itself, so an audit reading
+    #: back "claim FM-0003" would not know which of them moved.
+    row_id: str = ""
+    where: str = ""
+
+    #: What the finding asserted when the decision was taken. A reviewer
+    #: confirming a $10,000 discrepancy has not confirmed a $2,223 one, so
+    #: these are compared before the decision is allowed to still apply.
+    expected: str | None = None
+    actual: str | None = None
+    delta: str | None = None
+
     #: Set only for a correction.
     before: str | None = None
     after: str | None = None
@@ -573,7 +729,35 @@ class Resolution(BaseModel):
 
     @property
     def changed_a_value(self) -> bool:
-        return self.action is ReviewAction.CORRECTED and self.before != self.after
+        return (
+            self.action
+            in (ReviewAction.CORRECTED, ReviewAction.EDITED, ReviewAction.DELETED)
+            and self.before != self.after
+        )
+
+    def still_applies_to(self, finding: "Finding") -> bool:
+        """Whether this decision was taken about what the finding now says.
+
+        A resolution is attached to a finding by identity, which survives an
+        edit on purpose — that is how "somebody looked at R-01 on this row"
+        outlives a change elsewhere on the page. But identity is not the whole
+        of what a reviewer agreed to. Correct one figure and R-01 can go on
+        failing on the same row for a different amount, and the decision taken
+        about the old amount would silently cover the new one.
+
+        So the material claim is compared too: what the rule expected, what it
+        found, and by how much. Where they differ the finding is open again and
+        the old decision stays in the log as what it was, a decision about a
+        different number.
+        """
+        recorded = (self.expected, self.actual, self.delta)
+        if not any(value is not None for value in recorded):
+            # Recorded before the finding carried a material claim, or a rule
+            # that makes none. Identity is all there is to go on.
+            return True
+        return all(
+            _same_amount(was, now) for was, now in zip(recorded, _asserted(finding))
+        )
 
 
 class ReviewLog(BaseModel):
@@ -599,7 +783,9 @@ class ReviewLog(BaseModel):
 
     def action_for(self, finding: "Finding") -> ReviewAction:
         latest = self.latest_for(finding_key(finding))
-        return latest.action if latest else ReviewAction.OPEN
+        if latest is None or not latest.still_applies_to(finding):
+            return ReviewAction.OPEN
+        return latest.action
 
     def is_resolved(self, finding: "Finding") -> bool:
         return self.action_for(finding) is not ReviewAction.OPEN

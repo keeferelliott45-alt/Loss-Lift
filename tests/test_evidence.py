@@ -151,22 +151,40 @@ def test_a_document_wide_finding_does_not_pretend_to_a_row(upright):
     assert evidence.bbox is None
 
 
-def test_provenance_reaches_the_workbook(upright):
-    """The export outlives the upload, so it carries the evidence in words."""
-    columns = ["claim_number", "incurred_total"]
-    data = to_bytes(upright.document, template=columns, include_provenance=True)
+def _source_location(document, **kwargs) -> str:
     import io
 
     from openpyxl import load_workbook
 
+    data = to_bytes(
+        document,
+        template=["claim_number", "incurred_total"],
+        include_provenance=True,
+        **kwargs,
+    )
     sheet = load_workbook(io.BytesIO(data))["Claim Detail"]
     headers = [cell.value for cell in sheet[1]]
     assert "Source location" in headers
     assert "Extraction" in headers
-    column = headers.index("Source location") + 1
-    stated = sheet.cell(row=2, column=column).value
+    return sheet.cell(row=2, column=headers.index("Source location") + 1).value
+
+
+def test_provenance_reaches_the_workbook(upright):
+    """The export outlives the upload, so it carries the evidence in words.
+
+    A region is written down only when it has been read back, which needs the
+    file. Given it, the workbook names the rectangle; without it, the workbook
+    names the page and stops — the same degradation the review screen makes,
+    for the same reason. Guessing in the direction of precision is how a
+    filed workbook ends up pointing at a row nobody checked.
+    """
+    stated = _source_location(upright.document, source_path=upright.source_path)
     assert stated.startswith("page 1")
     assert "at (" in stated
+
+    unverified = _source_location(upright.document)
+    assert unverified.startswith("page 1")
+    assert "at (" not in unverified
 
 
 def test_provenance_reaches_the_review_table(upright):
