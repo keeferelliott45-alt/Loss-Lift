@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
-from core.extract_digital import DocumentMetadata
+from core.extract_digital import _COUNT_PATTERNS, _first_match, DocumentMetadata
 from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
     DateOrderInference,
@@ -573,12 +573,36 @@ def agreed(values: Sequence[str]) -> str | None:
     return next(iter(distinct)) if len(distinct) == 1 else None
 
 
+def _covers(row_text: str, claim_count: int | None) -> int:
+    """Whether a totals row says it covers the claims that were extracted.
+
+    A total is only worth checking against claims it actually totals. Loss runs
+    arrive inside board packets holding several of them, and a row reading
+    "Totals: 10 ... 226,605.00" belongs to whichever run has ten claims in it,
+    not to the twenty-eight that were read. Comparing the two reports a
+    quarter-million-pound discrepancy that nobody made.
+
+    Returns 1 when the row names the same count, -1 when it names a different
+    one, and 0 when it names none and so says nothing either way.
+    """
+    if claim_count is None:
+        return 0
+    printed = _first_match(row_text, _COUNT_PATTERNS)
+    stated = parse_int(printed) if printed else None
+    if stated is None:
+        return 0
+    return 1 if stated == claim_count else -1
+
+
 def collect_printed_totals(
-    tables: Sequence[RawTable], mapping: ColumnMapping, locale: str | None
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    claim_count: int | None = None,
 ) -> dict[str, Decimal | None]:
     """Read the footer totals row — the numbers R-04 checks against."""
     best: dict[str, Decimal | None] = {}
-    best_rank = (0, 0)
+    best_rank = (0, 0, 0)
     for table in tables:
         table_mapping = mapping_for(table, mapping)
         for row in table.total_rows:
@@ -594,8 +618,14 @@ def collect_printed_totals(
                     totals[field_name] = parsed.value
             # Documents grouped by policy period print a subtotal per section
             # and one grand total. Only the grand total covers every claim, so
-            # it outranks a subtotal no matter which was seen first.
-            rank = (1 if GRAND_TOTAL_PATTERN.search(row.text()) else 0, len(totals))
+            # it outranks a subtotal no matter which was seen first. A row that
+            # names a different claim count outranks nothing: whatever it
+            # totals, it is not these claims.
+            rank = (
+                _covers(row.text(), claim_count),
+                1 if GRAND_TOTAL_PATTERN.search(row.text()) else 0,
+                len(totals),
+            )
             if totals and rank > best_rank:
                 best, best_rank = totals, rank
     return best
@@ -918,7 +948,7 @@ def run_pipeline(
             and text not in furniture
         )
 
-    printed_totals = collect_printed_totals(tables, mapping, locale)
+    printed_totals = collect_printed_totals(tables, mapping, locale, len(claims))
 
     # Recoveries: settle the carrier's sign convention before anything is
     # reconciled, and apply it to the printed totals too — otherwise R-04

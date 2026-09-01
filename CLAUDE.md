@@ -199,6 +199,15 @@ three policies, and each term it names is kept rather than one of them chosen.
 
 A profile stores: column-label → canonical-field map, date format, number locale, negative convention, header row index, footer-total row detection pattern, carrier name.
 
+Every measurement of the page is stated in the page's own units, never in
+points. A wide carrier sheet is routinely fitted onto A4 before it is sent, and
+everything comes down with it: two-point glyphs, gutters under a point, lines
+two points apart. Nothing about the table has changed, so nothing about the
+reading may. A threshold in absolute points is several characters wide on such
+a page and swallows every column on it — including the tolerance the word
+extractor itself uses, which at its default joins one column to the next and
+one line to the line below.
+
 Finding the columns is two questions, not one, and they have different answers.
 **Where** the columns are comes from the rows: a gutter is space they leave
 blank. **What** each one is comes from the header block, every line of it, with
@@ -257,6 +266,7 @@ Default money tolerance: `Decimal("0.01")`. Make it configurable per profile —
 | R-02 | `paid_indemnity + paid_medical + paid_expense == paid_total` where components exist | ERROR |
 | R-03 | `reserve_indemnity + reserve_medical + reserve_expense == reserve_total` | ERROR |
 | R-04 | Column sum equals the printed footer total, per money column | ERROR |
+| | The total has to be a total *of these claims*. Board packets bind several loss runs together, and a totals row naming a claim count that is not the count extracted belongs to one of the others — checking against it reports a discrepancy nobody made, on the one rule that verifies against something the carrier printed. | |
 | R-05 | Extracted row count equals printed claim count | ERROR |
 | R-06 | `valuation_date` present | ERROR |
 | R-07 | `claim_number` / `date_of_loss` / `incurred_total` non-null | ERROR |

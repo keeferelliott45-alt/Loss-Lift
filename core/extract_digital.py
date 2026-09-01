@@ -43,8 +43,11 @@ TOTAL_ROW_PATTERN = re.compile(r"\b(?:grand\s+)?(?:report\s+)?totals?\b", re.IGN
 #: without matching a loss description that merely mentions a total.
 TRAILING_TOTAL_LABEL = re.compile(r"\btotals?\s*:", re.IGNORECASE)
 
-#: Minimum blank width, in points, that counts as a column gutter.
-MIN_GUTTER = 4.0
+#: How far outside its column a word may sit and still belong to it, as a
+#: multiple of the page's character width. Money printed right-aligned under a
+#: left-aligned label overhangs its column slightly; a whole character's worth
+#: of slack takes it back without reaching into the next column.
+COLUMN_SLACK_FACTOR = 1.0
 
 #: Words closer than this many multiples of a character width belong together.
 CELL_GAP_FACTOR = 1.8
@@ -125,6 +128,43 @@ def _to_words(raw_words: Iterable[dict[str, Any]]) -> list[Word]:
     return words
 
 
+#: The text size pdfplumber's own default word tolerances are calibrated for.
+#: Its defaults are three points of slack, which is a third of a character on
+#: ordinary body text and three whole characters on a page set at a fifth of it.
+NOMINAL_TEXT_SIZE = 10.0
+
+#: pdfplumber's default x and y tolerance for grouping characters into words.
+NOMINAL_WORD_TOLERANCE = 3.0
+
+
+def page_words(page: pdfplumber.page.Page) -> list[Word]:
+    """The page's words, grouped at a tolerance that suits its own text size.
+
+    A loss run is often a wide sheet fitted onto A4, and the whole page comes
+    down with it: two-point glyphs, gutters under a point, lines two points
+    apart. Grouping characters into words with three points of slack then joins
+    one column to the next and one line to the one below, and the page arrives
+    as interleaved letters -- "ComEpuarnoyp eSEan" for a company and its
+    programme name printed side by side.
+
+    The slack is never loosened beyond pdfplumber's own default, only tightened
+    in proportion to text that is smaller than the default assumes.
+    """
+    tolerance = NOMINAL_WORD_TOLERANCE
+    sizes = [char["size"] for char in page.chars if char.get("size")]
+    if sizes:
+        scale = statistics.median(sizes) / NOMINAL_TEXT_SIZE
+        tolerance = min(NOMINAL_WORD_TOLERANCE, NOMINAL_WORD_TOLERANCE * scale)
+    return _to_words(
+        page.extract_words(
+            use_text_flow=False,
+            keep_blank_chars=False,
+            x_tolerance=tolerance,
+            y_tolerance=tolerance,
+        )
+    )
+
+
 def _median_char_width(words: Sequence[Word]) -> float:
     widths = [
         (word.x1 - word.x0) / len(word.text) for word in words if word.text
@@ -164,7 +204,7 @@ def split_words(
     line: Line, char_width: float, gap_factor: float = CELL_GAP_FACTOR
 ) -> list[list[Word]]:
     """Group one line's words into cells on the wide gaps between them."""
-    threshold = max(MIN_GUTTER, gap_factor * char_width)
+    threshold = gap_factor * char_width
     cells: list[list[Word]] = []
     buffer: list[Word] = []
     for word in line.words:
@@ -202,7 +242,7 @@ def column_bounds(lines: Sequence[Line], char_width: float) -> list[tuple[float,
         return []
 
     spans.sort()
-    gutter = max(MIN_GUTTER, char_width * COLUMN_GUTTER_FACTOR)
+    gutter = char_width * COLUMN_GUTTER_FACTOR
     merged: list[list[float]] = [spans[0][:]]
     for start, end in spans[1:]:
         if start - merged[-1][1] < gutter:
@@ -288,7 +328,7 @@ def subdivided(
     a centred two-word heading is not two columns, and rows leave gaps between
     ordinary words all the time.
     """
-    gutter = max(MIN_GUTTER, char_width * COLUMN_GUTTER_FACTOR)
+    gutter = char_width * COLUMN_GUTTER_FACTOR
     labels = [
         cell
         for line in block
@@ -342,11 +382,12 @@ def label_bounds(
                 if min(span[1], end) - max(span[0], start) > 0
             ]
             for word in cell:
+                slack = char_width * COLUMN_SLACK_FACTOR
                 target = next(
                     (
                         index
                         for index, (start, end) in enumerate(bounds)
-                        if start - MIN_GUTTER <= word.middle <= end + MIN_GUTTER
+                        if start - slack <= word.middle <= end + slack
                     ),
                     None,
                 )
@@ -401,7 +442,11 @@ def _detached_footer_removed(lines: Sequence[Line]) -> list[Line]:
         return list(lines)
     tops = [min(word.top for word in line.words) for line in lines]
     gaps = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
-    limit = 2 * statistics.median(gaps)
+    # The tightest gap is the table's own pitch. A median is drawn upwards by
+    # the very gap being looked for: on a two-row table the footer's own
+    # distance is half the sample, and it ends up setting the limit it has to
+    # exceed. The smallest gap cannot be, and rows sit at one pitch anyway.
+    limit = 2 * max(min(gaps), 1.0)
     end = len(lines)
     while end > 2 and gaps[end - 2] > limit:
         end -= 1
@@ -425,14 +470,20 @@ def _bounds_from_header(
 
 
 def assign_to_columns(
-    line: Line, bounds: Sequence[tuple[float, float]]
+    line: Line, bounds: Sequence[tuple[float, float]], char_width: float = 4.0
 ) -> list[str]:
-    """Place each word in the column whose span contains its midpoint."""
+    """Place each word in the column whose span contains its midpoint.
+
+    ``char_width`` sets how far outside a column a word may sit and still
+    belong to it. Stated in points instead, that slack is four characters wide
+    on a page whose glyphs are one point wide -- most of a column.
+    """
+    slack = char_width * COLUMN_SLACK_FACTOR
     buckets: list[list[Word]] = [[] for _ in bounds]
     for word in line.words:
         target = None
         for index, (start, end) in enumerate(bounds):
-            if start - MIN_GUTTER <= word.middle <= end + MIN_GUTTER:
+            if start - slack <= word.middle <= end + slack:
                 target = index
                 break
         if target is None:
@@ -790,7 +841,9 @@ def _agrees(value: str, label: str) -> bool:
 
 
 def _fitting_slice(
-    line: Line, slices: Sequence[tuple[list[tuple[float, float]], list[str]]]
+    line: Line,
+    slices: Sequence[tuple[list[tuple[float, float]], list[str]]],
+    char_width: float,
 ) -> int:
     """Which record line's columns this stray line was printed under.
 
@@ -806,7 +859,7 @@ def _fitting_slice(
 
     def score(index: int) -> tuple[int, int]:
         bounds, labels = slices[index]
-        cells = assign_to_columns(line, bounds)
+        cells = assign_to_columns(line, bounds, char_width)
         return (
             sum(
                 1
@@ -930,7 +983,7 @@ def _extract_record_table(
     def placed(line: Line, position: int) -> list[str]:
         """The line's words in their own slice of the record's columns."""
         row = [""] * width
-        assigned = assign_to_columns(line, slices[position][0])
+        assigned = assign_to_columns(line, slices[position][0], char_width)
         row[offsets[position] : offsets[position] + len(assigned)] = assigned
         return row
 
@@ -965,7 +1018,7 @@ def _extract_record_table(
         if looks_like_header([text for text, _, _ in cells[line.index]]):
             continue  # a header repeated mid-page
         row = RawRow(
-            cells=placed(line, _fitting_slice(line, slices)),
+            cells=placed(line, _fitting_slice(line, slices, char_width)),
             page=page_number,
             line_index=line.index,
             bbox=line.bbox,
@@ -990,7 +1043,7 @@ def _extract_positioned_table(
     page: pdfplumber.page.Page, page_number: int
 ) -> RawTable | None:
     """Word-position clustering, for tables drawn without rules."""
-    words = _to_words(page.extract_words(use_text_flow=False, keep_blank_chars=False))
+    words = page_words(page)
     if not words:
         return None
 
@@ -1086,7 +1139,7 @@ def _extract_positioned_table(
         named = (
             label_bounds(block, candidate, char_width)
             if labels
-            else assign_to_columns(header_line, candidate)
+            else assign_to_columns(header_line, candidate, char_width)
         )
         # Where two readings name the same number of columns, the better one
         # is the one that recovers more of the schema: two columns both read
@@ -1118,7 +1171,7 @@ def _extract_positioned_table(
     # to the label that says which total they are.
     pending_label: RawRow | None = None
     for line in body:
-        cells = assign_to_columns(line, bounds)
+        cells = assign_to_columns(line, bounds, char_width)
         is_total = _is_total_line(line)
         money_here = _money_token_count(line)
 

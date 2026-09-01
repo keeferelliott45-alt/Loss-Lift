@@ -243,3 +243,76 @@ def test_document_reconciles_clean(result):
     ]
     assert errors == []
     assert result.reconciliation.status is DocumentStatus.CLEAN
+
+# --------------------------------------------------------------------------
+# Two loss runs in one packet
+# --------------------------------------------------------------------------
+
+
+def _build_packet(path) -> None:
+    """One run of three claims, then another run of ten, each with its totals.
+
+    Board packets and broker submissions carry several loss runs bound
+    together. Only one of them was read here, and the other one's totals row is
+    wider -- it prints a paid and a reserve where the first prints an incurred.
+    Ranking totals rows by how many amounts they carry hands the document the
+    wrong one, and R-04 then reports a discrepancy nobody made.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=792, height=612)
+    _write(page, "ACME PUBLIC RISK POOL", 40, 30)
+    _write(page, "Numbers As of 12/31/2024", 40, 44)
+    for x, upper, lower in COLUMNS:
+        if upper:
+            _write(page, upper, x, 86)
+        _write(page, lower, x, 98)
+    y = 120
+    for number, claimant, loss, status, paid in (
+        ("P-01", "Alpha, A", "3/4/2024", "Closed", 1000),
+        ("P-02", "Bravo, B", "7/15/2024", "Open", 2000),
+        ("P-03", "Cee, C", "9/1/2024", "Open", 3000),
+    ):
+        for (x, _, _), value in zip(
+            COLUMNS,
+            (number, claimant, loss, status, _money(paid), _money(0),
+             _money(0), _money(paid)),
+        ):
+            _write(page, value, x, y)
+        y += 11
+    _write(page, "Report Totals", 40, y + 6)
+    _write(page, "Claim Count : 3", 130, y + 6)
+    _write(page, _money(6000), COLUMNS[7][0], y + 6)
+
+    # The second run, on its own page. Its totals row is marked exactly as the
+    # first one's is -- both are the grand total of the run they belong to --
+    # and it carries four amounts where the first carries one.
+    second = doc.new_page(width=792, height=612)
+    for x, upper, lower in COLUMNS:
+        if upper:
+            _write(second, upper, x, 86)
+        _write(second, lower, x, 98)
+    _write(second, "Report Totals", 40, 120)
+    _write(second, "Claim Count : 10", 130, 120)
+    for (x, _, _), value in zip(COLUMNS[4:], (226605, 7506, 25259, 32766)):
+        _write(second, _money(value), x, 120)
+    doc.save(str(path))
+    doc.close()
+
+
+@pytest.fixture(scope="module")
+def packet(tmp_path_factory):
+    path = tmp_path_factory.mktemp("packet") / "packet.pdf"
+    _build_packet(path)
+    return run_pipeline(path, use_vision=False)
+
+
+def test_totals_from_another_run_are_not_checked_against_these_claims(packet):
+    """The total that names this run's claim count is the one that counts."""
+    assert len(packet.document.claims) == 3
+    assert packet.document.printed_totals.get("incurred_total") == Decimal("6000.00")
+    assert Decimal("226605.00") not in set(packet.document.printed_totals.values())
+
+
+def test_no_discrepancy_is_reported_against_a_foreign_total(packet):
+    findings = [f for f in packet.reconciliation.findings if f.rule_id == "R-04"]
+    assert findings == []
