@@ -30,7 +30,10 @@ def extracted(golden_dir):
 
 def test_sheets_in_order(extracted):
     workbook = build_workbook(extracted.document, extracted.reconciliation)
-    assert workbook.sheetnames == ["Claim Detail", "Loss Summary", "Large Loss", "Exceptions", "Source Info"]
+    assert workbook.sheetnames == [
+        "Claim Detail", "Loss Summary", "Large Loss", "Exceptions",
+        "Review History", "Source Info",
+    ]
 
 
 def test_claims_sheet_has_a_row_per_claim(extracted):
@@ -166,7 +169,10 @@ def test_bytes_round_trip_through_openpyxl(extracted, tmp_path):
     path = tmp_path / "out.xlsx"
     path.write_bytes(payload)
     workbook = load_workbook(path)
-    assert workbook.sheetnames == ["Claim Detail", "Loss Summary", "Large Loss", "Exceptions", "Source Info"]
+    assert workbook.sheetnames == [
+        "Claim Detail", "Loss Summary", "Large Loss", "Exceptions",
+        "Review History", "Source Info",
+    ]
 
 
 def test_write_xlsx_creates_the_file(extracted, tmp_path):

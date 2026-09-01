@@ -48,8 +48,15 @@ from core.records import (
     leading_identifier,
 )
 from core.reconcile import ReconcileConfig, reconcile
+from core.review import (
+    LOCAL_REVIEWER,
+    ReviewAction,
+    resolution_for,
+    summarise_review,
+)
 from core.schema import (
     DATE_FIELDS,
+    Finding,
     MONEY_FIELDS,
     Claim,
     ClaimStatus,
@@ -1095,6 +1102,73 @@ def rerun_reconciliation(
     return reconcile(document, config or ReconcileConfig())
 
 
+def resolve_finding(
+    result: ExtractionResult,
+    finding: Finding,
+    action: ReviewAction,
+    *,
+    note: str = "",
+    corrected_value: Any = None,
+    reviewer: str = LOCAL_REVIEWER,
+) -> ExtractionResult:
+    """Record what a reviewer decided about one finding, and act on it.
+
+    Confirming and dismissing change no data at all: they add a line to the
+    log saying somebody looked, and the rule engine is never told. Correcting
+    changes one cell and then runs *every* rule again over the result — not the
+    rules that look related, because working out which rules a value can reach
+    is exactly the kind of cleverness that quietly stops re-checking something.
+    The engine is cheap and correctness is not.
+
+    Either way the finding survives. If it still holds after a correction the
+    engine raises it again, and the log shows a reviewer tried; if it no longer
+    holds, the log shows what the value was before.
+    """
+    document = result.document
+    before_headline = summarise_review(
+        result.reconciliation.findings, document.review_log
+    ).headline()
+    was = after = None
+
+    if action is ReviewAction.CORRECTED and finding.claim_number and finding.field:
+        claim = next(
+            (c for c in document.claims if c.claim_number == finding.claim_number), None
+        )
+        if claim is None:
+            raise ValueError(f"No claim {finding.claim_number!r} to correct.")
+        was = _as_text(getattr(claim, finding.field, None))
+        columns = review_columns(document)
+        records = to_records(document, columns)
+        row = next(
+            record for record in records
+            if record.get("claim_number") == finding.claim_number
+        )
+        row[finding.field] = corrected_value
+        document = apply_edits(document, records)
+        corrected = next(
+            c for c in document.claims if c.claim_number == finding.claim_number
+        )
+        after = _as_text(getattr(corrected, finding.field, None))
+        result.document = document
+        result.reconciliation = rerun_reconciliation(document)
+
+    document.review_log.record(
+        resolution_for(
+            finding,
+            action,
+            reviewer=reviewer,
+            note=note,
+            before=was,
+            after=after,
+            status_before=before_headline,
+            status_after=summarise_review(
+                result.reconciliation.findings, document.review_log
+            ).headline(),
+        )
+    )
+    return result
+
+
 def save_confirmed_mapping(
     result: ExtractionResult,
     mapping: ColumnMapping | None = None,
@@ -1274,6 +1348,19 @@ def _coerce(
     return parse_text(value), None
 
 
+def _as_text(value: Any) -> str:
+    """A value as the audit trail should keep it: readable, and never a float."""
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return f"{value:f}"
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
 def apply_edits(
     document: LossRunDocument,
     records: Sequence[dict[str, Any]],
@@ -1315,6 +1402,7 @@ def apply_edits(
         raw_cells = dict(original.raw_cells) if original else {}
         edited = False
         touched: list[str] = []
+        originals_read = dict(original.original_values) if original else {}
         fields: dict[str, Any] = {}
 
         for name, value in record.items():
@@ -1328,6 +1416,12 @@ def apply_edits(
             if coerced != previous:
                 edited = True
                 touched.append(name)
+                # What the extractor read, kept before the correction lands on
+                # top of it. Only the first correction records one: a second
+                # edit of the same cell is a person changing their own answer,
+                # not the document's.
+                if original is not None and name not in originals_read:
+                    originals_read[name] = _as_text(previous)
                 confidence[name] = 1.0
                 issues.pop(name, None)
                 if coerced is None and reason and reason is not NullReason.EMPTY:
@@ -1347,6 +1441,15 @@ def apply_edits(
                 source_lines=list(original.source_lines) if original else [],
                 edited_fields=sorted(
                     set(touched) | set(original.edited_fields if original else [])
+                ),
+                original_values=originals_read,
+                # How the row was read, kept beside how it now reads. Without
+                # it, correcting one cell would leave the other nine unable to
+                # say whether they came off a text layer or out of a scan.
+                read_method=(
+                    original.read_method or original.source_method
+                    if original is not None
+                    else None
                 ),
                 source_method=(
                     SourceMethod.MANUAL

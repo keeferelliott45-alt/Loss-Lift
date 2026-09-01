@@ -116,9 +116,11 @@ def claim_evidence(claim: Claim, field: str | None = None) -> Evidence:
 
     # A claim marked manual is one of two different things: added on the review
     # screen, which has no source at all, or read off the page and then
-    # corrected in a cell, which still has the row it was read from. Only the
-    # first can honestly say the document is not its source.
-    if claim.source_method is SourceMethod.MANUAL and claim.source_bbox is None:
+    # corrected in a cell, which still has whatever it was read from. Only the
+    # first can honestly say the document is not its source, and what tells
+    # them apart is whether there was ever a reading -- not whether there is a
+    # rectangle, since a claim read off a scan never had one either.
+    if claim.source_method is SourceMethod.MANUAL and claim.read_method is None:
         return Evidence(
             kind=EvidenceKind.TYPED,
             method=SourceMethod.MANUAL,
@@ -133,7 +135,7 @@ def claim_evidence(claim: Claim, field: str | None = None) -> Evidence:
         named = ", ".join(_label(name) for name in claim.edited_fields)
         edited = f" Since edited on the review screen: {named}."
 
-    if claim.source_method is SourceMethod.VISION:
+    if (claim.read_method or claim.source_method) is SourceMethod.VISION:
         return Evidence(
             kind=EvidenceKind.PAGE,
             method=method,
@@ -141,6 +143,7 @@ def claim_evidence(claim: Claim, field: str | None = None) -> Evidence:
                 f"Read from a scan of page {claim.source_page} by the vision model, "
                 f"which reports what the page says and not where on it the words "
                 f"sit. The page can be shown; the row cannot be marked on it."
+                + edited
             ),
             page=claim.source_page,
             lines=lines,

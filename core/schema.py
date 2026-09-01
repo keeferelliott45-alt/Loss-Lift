@@ -222,21 +222,40 @@ class Claim(BaseModel):
     #: this is kept per field rather than collapsing the whole row to manual:
     #: editing one amount must not cost the other nine their provenance.
     edited_fields: list[str] = Field(default_factory=list)
+
+    #: What the extractor read, for every field a person has since changed.
+    #: The corrected value replaces the old one in the field itself; this keeps
+    #: the original so the two can always be told apart, which is the whole
+    #: point of the audit trail.
+    original_values: dict[str, str] = Field(default_factory=dict)
     field_confidence: dict[str, float] = Field(default_factory=dict)
     field_issues: dict[str, NullReason] = Field(default_factory=dict)
     raw_cells: dict[str, str] = Field(default_factory=dict)
     currency: str | None = None
 
+    #: How a claim was read, when a person has since edited part of it. The
+    #: claim-level ``source_method`` says "manual" once any cell is corrected,
+    #: which is true of the row and false of its other nine fields.
+    read_method: SourceMethod | None = None
+
     def provenance_of(self, field_name: str) -> SourceMethod:
         """How this particular field came to hold its value.
 
-        A claim read off the page and then corrected in one cell is not wholly
-        manual and not wholly digital. Asking per field is the only way to
-        answer honestly which is which.
+        The authoritative answer, and the only honest one: a claim read off the
+        page and then corrected in one cell is manual in that cell and digital
+        in the rest. ``source_method`` describes the row -- it says manual as
+        soon as any cell is touched -- so it cannot answer for a field.
+
+        A claim a person added outright has no reading behind it, and every
+        field of it is manual.
         """
         if field_name in self.edited_fields:
             return SourceMethod.MANUAL
-        return self.source_method
+        return self.read_method or self.source_method
+
+    def original_of(self, field_name: str) -> str | None:
+        """What the extractor read, for a field a person has since changed."""
+        return self.original_values.get(field_name)
 
     @property
     def confidence(self) -> float:
@@ -386,6 +405,11 @@ class LossRunDocument(BaseModel):
     #: meaning could not be settled. R-21 reads this.
     column_mapping: list[ColumnMappingRecord] = Field(default_factory=list)
 
+    #: What reviewers decided, kept on the document so it survives an edit and
+    #: reaches the export. Never consulted by the rule engine: a decision about
+    #: a finding is not evidence about a claim.
+    review_log: ReviewLog = Field(default_factory=lambda: ReviewLog())
+
     claims: list[Claim] = Field(default_factory=list)
 
     # Parsing context, carried so the UI and the rules can explain themselves.
@@ -477,6 +501,115 @@ class Finding(BaseModel):
     def __str__(self) -> str:  # pragma: no cover - convenience only
         where = f" [{self.claim_number}]" if self.claim_number else ""
         return f"{self.rule_id} {self.severity.value}{where}: {self.message}"
+
+
+# --------------------------------------------------------------------------
+# Review — what a person decided, kept apart from what the document said
+# --------------------------------------------------------------------------
+
+#: Used where no reviewer identity is available. There are no accounts yet, and
+#: inventing a name would put someone's word behind a decision they never made.
+LOCAL_REVIEWER = "local reviewer"
+
+
+class ReviewAction(str, Enum):
+    """What a reviewer did about a finding.
+
+    ``OPEN`` is the absence of the others rather than a stored value: a finding
+    nobody has touched has no resolution at all.
+    """
+
+    OPEN = "open"
+    #: Looked at, and the document is right — a genuine large loss, a real
+    #: reopened claim. Nothing about the data changes.
+    CONFIRMED = "confirmed"
+    #: Looked at, and the extraction was wrong. A value was corrected and every
+    #: rule was run again over the corrected value.
+    CORRECTED = "corrected"
+    #: Looked at, and the finding does not apply. The claim stays, the data
+    #: stays, and the finding stays on the record as raised.
+    DISMISSED = "dismissed"
+
+
+def finding_key(finding: "Finding") -> str:
+    """What identifies a finding across a re-run.
+
+    Not its position: the engine rebuilds the list whenever a cell changes, and
+    a resolution attached to index 4 would slide onto a different finding. The
+    rule, the claim and the field are what the finding is *about*, and they
+    survive re-running.
+    """
+    return "|".join((finding.rule_id, finding.claim_number or "", finding.field or ""))
+
+
+class Resolution(BaseModel):
+    """One reviewer decision, and everything needed to reconstruct it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    action: ReviewAction
+    reviewer: str = LOCAL_REVIEWER
+    at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    note: str = ""
+
+    #: The finding as it was raised, kept verbatim. The engine will raise it
+    #: again on the next run if it still holds and will not if it does not;
+    #: either way this is what the reviewer was looking at when they decided.
+    rule_id: str = ""
+    severity: str = ""
+    message: str = ""
+    claim_number: str | None = None
+    field: str | None = None
+
+    #: Set only for a correction.
+    before: str | None = None
+    after: str | None = None
+
+    #: The reconciliation status either side of the decision, so a reader can
+    #: see whether the document's position actually moved.
+    status_before: str = ""
+    status_after: str = ""
+
+    @property
+    def changed_a_value(self) -> bool:
+        return self.action is ReviewAction.CORRECTED and self.before != self.after
+
+
+class ReviewLog(BaseModel):
+    """Every decision taken on one document, oldest first.
+
+    Append-only. A reviewer changing their mind adds an entry; nothing is
+    rewritten, because the question an audit answers is what was decided and
+    when, not what the last word was.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[Resolution] = Field(default_factory=list)
+
+    def record(self, resolution: Resolution) -> None:
+        self.entries.append(resolution)
+
+    def latest_for(self, key: str) -> Resolution | None:
+        for entry in reversed(self.entries):
+            if entry.key == key:
+                return entry
+        return None
+
+    def action_for(self, finding: "Finding") -> ReviewAction:
+        latest = self.latest_for(finding_key(finding))
+        return latest.action if latest else ReviewAction.OPEN
+
+    def is_resolved(self, finding: "Finding") -> bool:
+        return self.action_for(finding) is not ReviewAction.OPEN
+
+    def unresolved(self, findings: "Iterable[Finding]") -> list["Finding"]:
+        return [finding for finding in findings if not self.is_resolved(finding)]
+
+    @property
+    def corrections(self) -> list[Resolution]:
+        return [entry for entry in self.entries if entry.changed_a_value]
 
 
 class ReconciliationResult(BaseModel):

@@ -378,3 +378,29 @@ def test_every_claim_on_a_cropped_page_is_locatable(cropped):
         assert confirmed.kind is EvidenceKind.REGION, (
             f"{claim.claim_number}: {confirmed.note}"
         )
+
+def test_a_vision_claim_edited_in_one_cell_keeps_vision_for_the_rest():
+    """The contract, on the path most likely to get it wrong.
+
+    A scanned claim corrected in one cell is manual there and still read by
+    the vision model everywhere else. Reporting the whole row as manual would
+    hide that the other nine figures came out of an image.
+    """
+    claim = Claim(
+        claim_number="V-2", source_page=9,
+        source_method=SourceMethod.MANUAL, read_method=SourceMethod.VISION,
+        edited_fields=["paid_total"],
+        raw_cells={"paid_total": "100.00", "reserve_total": "50.00"},
+        original_values={"paid_total": "10.00"},
+    )
+    assert claim.provenance_of("paid_total") is SourceMethod.MANUAL
+    assert claim.provenance_of("reserve_total") is SourceMethod.VISION
+
+    corrected = claim_evidence(claim, "paid_total")
+    assert corrected.kind is EvidenceKind.TYPED
+
+    untouched = claim_evidence(claim, "reserve_total")
+    assert untouched.kind is EvidenceKind.PAGE
+    assert untouched.method is SourceMethod.VISION
+    assert untouched.bbox is None
+    assert "vision model" in untouched.note

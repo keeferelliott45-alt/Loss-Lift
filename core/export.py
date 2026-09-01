@@ -37,6 +37,7 @@ from core.summary import summarise_by_period
 if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
 from core.evidence import claim_evidence
+from core.review import ReviewAction, ReviewLog, finding_key
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -130,6 +131,8 @@ COLUMN_TITLES: dict[str, str] = {
     "source_page": "Source page",
     "source_method": "Extraction",
     "source_evidence": "Source location",
+    "original_value": "Originally extracted",
+    "review_state": "Review",
 }
 
 MONEY_FORMAT = '#,##0.00;[Red](#,##0.00)'
@@ -187,13 +190,22 @@ def resolve_columns(
         # "Source location" names the lines and, where the extractor recorded
         # one, the region on the page. The workbook outlives the upload, so it
         # has to carry the evidence in words rather than rely on the file.
-        columns += ["source_page", "source_method", "source_evidence"]
+        columns += ["source_page", "source_method", "source_evidence", "review_state"]
     return columns
 
 
 def _cell_value(claim: Claim, field_name: str) -> Any:
     if field_name == "source_evidence":
         return claim_evidence(claim).describe()
+    if field_name == "review_state":
+        # Named per claim rather than per document: a row a person corrected
+        # is a different thing from one nobody has touched, and the recipient
+        # of the workbook cannot ask.
+        if not claim.edited_fields:
+            return "as extracted"
+        return "corrected: " + ", ".join(
+            name.replace("_", " ") for name in claim.edited_fields
+        )
     value = getattr(claim, field_name, None)
     if value is None:
         return None
@@ -294,10 +306,18 @@ def _write_claims_sheet(
 
 
 def _write_exceptions_sheet(
-    sheet: Worksheet, result: ReconciliationResult | None
+    sheet: Worksheet,
+    result: ReconciliationResult | None,
+    log: ReviewLog | None = None,
 ) -> None:
+    """Every finding as raised, and what a reviewer decided about it.
+
+    The finding is never removed because somebody resolved it. A recipient has
+    to be able to see both what was flagged and what was done, and a sheet that
+    quietly dropped the resolved ones would answer only half of that.
+    """
     headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
-               "Expected", "Actual", "Delta", "Page"]
+               "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note"]
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
@@ -317,6 +337,8 @@ def _write_exceptions_sheet(
             float(finding.actual) if isinstance(finding.actual, Decimal) else finding.actual,
             float(finding.delta) if finding.delta is not None else None,
             finding.page,
+            (log.action_for(finding).value if log else ReviewAction.OPEN.value),
+            (entry.note if log and (entry := log.latest_for(finding_key(finding))) else ""),
         ]
         for column_index, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)
@@ -435,6 +457,46 @@ def _write_large_loss_sheet(
     _autosize(sheet, widths)
 
 
+
+def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
+    """Every decision a reviewer took, oldest first.
+
+    This is the sheet that keeps the three kinds of fact apart once the
+    workbook leaves LossLift: what the carrier printed is in "Originally
+    extracted", what LossLift made of it is in the finding, and what a person
+    decided is here. A recipient who only has the file can still tell which is
+    which, which is the whole point of writing it down.
+    """
+    headers = ["When", "Reviewer", "Rule", "Severity", "Claim number", "Field",
+               "What was flagged", "Decision", "Originally extracted",
+               "Corrected to", "Reconciliation before", "Reconciliation after",
+               "Reviewer note"]
+    widths = _header_row(sheet, headers)
+
+    entries = document.review_log.entries
+    for row_index, entry in enumerate(entries, start=2):
+        _fill_row(sheet, row_index, [
+            entry.at.strftime("%Y-%m-%d %H:%M UTC"),
+            entry.reviewer,
+            entry.rule_id,
+            entry.severity,
+            entry.claim_number or "",
+            _title(entry.field) if entry.field else "",
+            entry.message,
+            entry.action.value,
+            entry.before if entry.before is not None else "",
+            entry.after if entry.after is not None else "",
+            entry.status_before,
+            entry.status_after,
+            entry.note,
+        ], widths)
+
+    if not entries:
+        sheet.cell(row=2, column=1, value="Nobody has reviewed a finding on this document yet.")
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
 def _write_source_sheet(
     sheet: Worksheet,
     document: LossRunDocument,
@@ -540,7 +602,10 @@ def build_workbook(
     _write_large_loss_sheet(
         workbook.create_sheet("Large Loss"), document, large_loss_threshold
     )
-    _write_exceptions_sheet(workbook.create_sheet("Exceptions"), result)
+    _write_exceptions_sheet(
+        workbook.create_sheet("Exceptions"), result, document.review_log
+    )
+    _write_review_sheet(workbook.create_sheet("Review History"), document)
     _write_source_sheet(
         workbook.create_sheet("Source Info"),
         document,

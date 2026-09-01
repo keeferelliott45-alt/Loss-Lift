@@ -23,6 +23,13 @@ import pandas as pd
 import streamlit as st
 
 from core import export as export_module
+from core.review import (
+    EXTRACTION_RULES,
+    finding_key,
+    FINANCIAL_RULES,
+    ReviewAction,
+    summarise_review,
+)
 from core.evidence import (
     claim_evidence,
     confirm_region,
@@ -31,6 +38,7 @@ from core.evidence import (
 )
 from core.ingest import IngestError, discard, ingest
 from core.pipeline import (
+    resolve_finding,
     ColumnMapping,
     ExtractionResult,
     PROVENANCE_COLUMNS,
@@ -49,6 +57,7 @@ from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
     MONEY_FIELDS,
+    Claim,
     ClaimStatus,
     Severity,
 )
@@ -190,13 +199,11 @@ def _status_of(result: ExtractionResult) -> str:
 # ambiguous value, or a duplicate the extractor produced, is evidence the
 # document could not be read cleanly, not a business condition worth an
 # underwriter's judgement -- which is what "flag" means here.
-_DATA_QUALITY_RULES = {
-    "R-01", "R-02", "R-03", "R-04", "R-05", "R-06", "R-07",  # arithmetic + required fields
-    "R-11", "R-12",  # duplicates caused by extraction
-    "R-15",          # unreadable / ambiguous -- the document, not the claim
-    "R-20",          # nothing extracted at all -- never a clean document
-    "R-21",          # a source column's meaning could not be settled
-}
+# The split lives in core/review.py so the queue pill, the reconciliation card
+# and the export cannot drift apart. Financial rules ask whether the numbers
+# add up; extraction rules ask whether the document could be read at all.
+# Together they are what blocks the reconciled badge -- exactly as before.
+_DATA_QUALITY_RULES = FINANCIAL_RULES | EXTRACTION_RULES
 
 
 def _is_data_issue(finding) -> bool:
@@ -403,6 +410,163 @@ def _evidence_panel(result: ExtractionResult, document_id: str) -> None:
             st.info("There is no page to show for this one.")
         else:
             st.image(image, width="stretch")
+
+
+_ACTION_LABELS = {
+    ReviewAction.CONFIRMED: "Confirm — the document is right",
+    ReviewAction.CORRECTED: "Correct the value",
+    ReviewAction.DISMISSED: "Dismiss — does not apply",
+}
+
+
+def _review_status_bar(result: ExtractionResult) -> None:
+    """Four readings, side by side and never merged into one.
+
+    A document that does not reconcile has not become healthy because somebody
+    read every warning, and one whose warnings are all outstanding has not
+    stopped balancing. Each column answers its own question.
+    """
+    summary = summarise_review(
+        result.reconciliation.findings, result.document.review_log
+    )
+    columns = st.columns(4)
+    columns[0].metric(
+        "Extraction",
+        "clean" if summary.extraction.passes else f"{summary.extraction.total} issue(s)",
+    )
+    columns[1].metric(
+        "Financial reconciliation",
+        "ties" if summary.financial.passes else f"{summary.financial.total} failing",
+    )
+    columns[2].metric("Underwriting flags", summary.underwriting.total or "none")
+    columns[3].metric(
+        "Reviewed", f"{summary.reviewed} of {summary.total}" if summary.total else "—"
+    )
+    if summary.total and summary.fully_reviewed and not summary.financial.passes:
+        st.caption(
+            "Every finding has been reviewed. The document still does not "
+            "reconcile — reviewing a finding records that somebody looked at "
+            "it, not that the figures now agree."
+        )
+
+
+def _review_workspace(result: ExtractionResult, document_id: str) -> None:
+    """One finding at a time: what, why, where from, and what to do about it."""
+    document = result.document
+    findings = result.reconciliation.findings
+    if not findings:
+        st.success("No findings to review.")
+        return
+
+    log = document.review_log
+    outstanding = [f for f in findings if not log.is_resolved(f)]
+    show_all = st.toggle(
+        "Include findings already reviewed",
+        key=f"review-all-{document_id}",
+        value=not outstanding,
+    )
+    queue = findings if show_all else outstanding
+    if not queue:
+        st.success("Every finding has been reviewed.")
+        return
+
+    def _label(finding) -> str:
+        mark = "" if log.is_resolved(finding) else "• "
+        return (
+            f"{mark}{finding.rule_id} · {finding.claim_number or 'document'}"
+            f" — {finding.message[:60]}"
+        )
+
+    picked = st.selectbox(
+        f"{len(outstanding)} finding(s) awaiting review",
+        list(range(len(queue))),
+        format_func=lambda index: _label(queue[index]),
+        key=f"review-pick-{document_id}",
+    )
+    finding = queue[picked]
+    claim = next(
+        (c for c in document.claims if c.claim_number == finding.claim_number), None
+    )
+
+    st.markdown(f"**{finding.rule_id}** — {finding.message}")
+    if finding.expected is not None or finding.actual is not None:
+        cols = st.columns(3)
+        cols[0].metric("Expected", _money(finding.expected))
+        cols[1].metric("Found", _money(finding.actual))
+        cols[2].metric("Difference", _money(finding.delta))
+
+    evidence = finding_evidence(document, finding)
+    if result.source_path and finding.claim_number:
+        evidence = confirm_region(result.source_path, evidence, finding.claim_number)
+
+    left, right = st.columns([2, 3])
+    with left:
+        if claim is not None and finding.field:
+            st.markdown(f"**Claim {claim.claim_number}** · {_FIELD_LABELS.get(finding.field, finding.field)}")
+            raw = claim.raw_cells.get(finding.field)
+            st.markdown("Text on the page:")
+            st.code(raw if raw else "(nothing in this column)", language=None)
+            st.markdown(f"Read as: `{getattr(claim, finding.field, None)}`")
+            was = claim.original_of(finding.field)
+            if was is not None:
+                st.markdown(f"Originally extracted: `{was}` — since corrected")
+            issue = claim.field_issues.get(finding.field)
+            if issue is not None:
+                st.markdown(f"Why it is null: `{issue.value}`")
+        st.caption(evidence.note)
+        st.markdown(f"Source: {evidence.describe()} · `{evidence.method.value}`")
+    with right:
+        image = (
+            render_evidence(result.source_path, evidence)
+            if result.source_path and Path(result.source_path).exists()
+            else None
+        )
+        if image is not None:
+            st.image(image, width="stretch")
+        else:
+            st.info("The page cannot be shown; the record above is kept.")
+
+    previous = log.latest_for(finding_key(finding))
+    if previous is not None:
+        st.info(
+            f"Reviewed {previous.at.strftime('%Y-%m-%d %H:%M UTC')} by "
+            f"{previous.reviewer}: **{previous.action.value}**"
+            + (f" — {previous.note}" if previous.note else "")
+        )
+
+    correctable = claim is not None and finding.field in Claim.model_fields
+    choices = [ReviewAction.CONFIRMED, ReviewAction.DISMISSED]
+    if correctable:
+        choices.insert(1, ReviewAction.CORRECTED)
+
+    with st.form(key=f"review-form-{document_id}-{finding_key(finding)}"):
+        action = st.radio(
+            "What do you want to do?",
+            choices,
+            format_func=lambda choice: _ACTION_LABELS[choice],
+            key=f"review-action-{document_id}",
+        )
+        corrected = None
+        if correctable:
+            corrected = st.text_input(
+                f"Corrected {_FIELD_LABELS.get(finding.field, finding.field)} "
+                f"(only used if you choose to correct)",
+                value="",
+                key=f"review-value-{document_id}",
+            )
+        note = st.text_area("Note (optional)", key=f"review-note-{document_id}")
+        if st.form_submit_button("Record decision"):
+            if action is ReviewAction.CORRECTED and not str(corrected).strip():
+                st.error("Enter the corrected value, or choose confirm or dismiss.")
+            else:
+                _store(
+                    resolve_finding(
+                        result, finding, action,
+                        note=note,
+                        corrected_value=corrected if action is ReviewAction.CORRECTED else None,
+                    )
+                )
+                st.rerun()
 
 
 def _money(value: Any) -> str:
@@ -707,6 +871,16 @@ def _queue_row(document_id: str) -> None:
             unsafe_allow_html=True,
         )
         status_col.markdown(_status_pill(result), unsafe_allow_html=True)
+        summary = summarise_review(result.reconciliation.findings, document.review_log)
+        if summary.total:
+            # The headline names the worst thing that is true, so a document
+            # that does not reconcile is described that way however much of it
+            # has been reviewed. Progress sits beside it, never in place of it.
+            progress = (
+                "all reviewed" if summary.fully_reviewed
+                else f"{summary.outstanding} to review"
+            )
+            status_col.caption(f"{summary.headline()} · {progress}")
         claims.write(str(len(document.claims)))
         incurred.write(f"{document.column_total('incurred_total'):,.2f}")
         valuation.write(
@@ -1145,6 +1319,11 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         expanded=bool(findings),
     ):
         _findings_table(result)
+
+    _review_status_bar(result)
+
+    with st.expander("Review findings", expanded=bool(result.reconciliation.findings)):
+        _review_workspace(result, document_id)
 
     with st.expander("Source evidence", expanded=False):
         _evidence_panel(result, document_id)

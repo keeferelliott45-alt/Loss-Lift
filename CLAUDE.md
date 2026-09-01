@@ -41,6 +41,17 @@ Read these before making any architectural decision.
    they were read from.
 3. **Fail loud, never silently.** A field that can't be parsed is `null` with a reason, never `0`. `0.00` and "no data" are different facts and confusing them causes wrong loss ratios.
 4. **The human is the last mile.** Every cell is editable before export. The app assists; it is never the source of truth. This is also the legal posture.
+   Three kinds of fact are held, and none may ever wear another's clothes:
+   **what the carrier printed**, **what LossLift made of it**, and **what a
+   person decided afterwards**. The first two live on the claim — a corrected
+   field keeps the extracted value beside it, and provenance is answered per
+   field, so one edited cell never costs the other nine theirs. The third lives
+   in `core/review.py`, and the rule engine is never told it exists: a
+   resolution is recorded beside a finding, never in place of it. Reviewing is
+   not reconciling. A reviewer confirming a large loss has not made the
+   document tie, and a document must never read healthier than the checks that
+   were run against it. Only a changed value moves a reconciliation result, and
+   then only because every rule ran again over it.
 5. **Learn per carrier.** Each carrier's format, once mapped and human-confirmed, is saved as a reusable profile. This is the compounding moat — the 40th document from Travelers should need zero LLM calls.
 6. **Never train on or retain customer data by default.** Files are deleted after export unless the user opts in.
 

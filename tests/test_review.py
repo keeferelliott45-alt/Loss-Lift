@@ -65,6 +65,13 @@ def test_editing_a_cell_reruns_the_checks(broken):
 
 
 def test_an_edited_cell_is_marked_manual(broken):
+    """The contract: provenance is answered per field, not per row.
+
+    ``source_method`` describes the row and says manual as soon as any cell is
+    corrected. That is true of the row and false of its other nine fields, so
+    it is not the authority — ``provenance_of`` is. A corrected cell is manual;
+    everything beside it still came off the page and still says so.
+    """
     records = to_records(broken.document)
     index = next(i for i, r in enumerate(records) if r["claim_number"] == "FM-0003")
     records[index]["incurred_total"] = 31400.00
@@ -72,9 +79,42 @@ def test_an_edited_cell_is_marked_manual(broken):
 
     edited = next(c for c in updated.claims if c.claim_number == "FM-0003")
     untouched = next(c for c in updated.claims if c.claim_number == "FM-0001")
-    assert edited.source_method is SourceMethod.MANUAL
+
+    assert edited.provenance_of("incurred_total") is SourceMethod.MANUAL
+    assert edited.provenance_of("paid_total") is SourceMethod.DIGITAL
     assert edited.confidence_for("incurred_total") == 1.0
+    assert untouched.provenance_of("incurred_total") is SourceMethod.DIGITAL
+    # The row is still marked, so nothing downstream loses sight of the edit.
+    assert edited.source_method is SourceMethod.MANUAL
     assert untouched.source_method is SourceMethod.DIGITAL
+
+
+def test_the_extracted_value_survives_the_correction(broken):
+    """A correction must never erase what the carrier's page actually said."""
+    records = to_records(broken.document)
+    index = next(i for i, r in enumerate(records) if r["claim_number"] == "FM-0003")
+    was = broken.document.claims[index].incurred_total
+    records[index]["incurred_total"] = 31400.00
+    edited = apply_edits(broken.document, records).claims[index]
+
+    assert edited.incurred_total == Decimal("31400.00")
+    assert edited.original_of("incurred_total") == f"{was:f}"
+    assert edited.original_of("paid_total") is None
+
+
+def test_a_second_edit_does_not_overwrite_the_extracted_value(broken):
+    """The original is the document's answer, not the reviewer's last one."""
+    records = to_records(broken.document)
+    was = broken.document.claims[0].incurred_total
+    records[0]["incurred_total"] = 100.0
+    once = apply_edits(broken.document, records)
+
+    again = to_records(once)
+    again[0]["incurred_total"] = 200.0
+    twice = apply_edits(once, again)
+
+    assert twice.claims[0].incurred_total == Decimal("200.00")
+    assert twice.claims[0].original_of("incurred_total") == f"{was:f}"
 
 
 def test_edited_money_stays_decimal(broken):
@@ -129,7 +169,10 @@ def test_a_new_row_is_manual(broken):
 
     updated = apply_edits(broken.document, records)
     added = next(c for c in updated.claims if c.claim_number == "FM-9999")
+    # Added outright: there is no reading behind any of it.
     assert added.source_method is SourceMethod.MANUAL
+    assert added.provenance_of("incurred_total") is SourceMethod.MANUAL
+    assert added.provenance_of("paid_total") is SourceMethod.MANUAL
     assert added.incurred_total == Decimal("500.00")
 
 
