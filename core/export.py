@@ -36,6 +36,7 @@ from core.summary import summarise_by_period
 
 if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
+from core.evidence import claim_evidence
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -128,6 +129,7 @@ COLUMN_TITLES: dict[str, str] = {
     "litigation_flag": "In suit",
     "source_page": "Source page",
     "source_method": "Extraction",
+    "source_evidence": "Source location",
 }
 
 MONEY_FORMAT = '#,##0.00;[Red](#,##0.00)'
@@ -182,11 +184,16 @@ def resolve_columns(
     if redact:
         columns = [name for name in columns if name not in REDACTED_FIELDS]
     if include_provenance:
-        columns += ["source_page", "source_method"]
+        # "Source location" names the lines and, where the extractor recorded
+        # one, the region on the page. The workbook outlives the upload, so it
+        # has to carry the evidence in words rather than rely on the file.
+        columns += ["source_page", "source_method", "source_evidence"]
     return columns
 
 
 def _cell_value(claim: Claim, field_name: str) -> Any:
+    if field_name == "source_evidence":
+        return claim_evidence(claim).describe()
     value = getattr(claim, field_name, None)
     if value is None:
         return None

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from pathlib import Path
 from decimal import Decimal
 from typing import Any
 
@@ -22,6 +23,12 @@ import pandas as pd
 import streamlit as st
 
 from core import export as export_module
+from core.evidence import (
+    claim_evidence,
+    confirm_region,
+    finding_evidence,
+    render_evidence,
+)
 from core.ingest import IngestError, discard, ingest
 from core.pipeline import (
     ColumnMapping,
@@ -325,6 +332,77 @@ def _findings_table(result: ExtractionResult) -> None:
             for finding in findings
         ]
         st.dataframe(rows, hide_index=True, width="stretch")
+
+
+def _evidence_panel(result: ExtractionResult, document_id: str) -> None:
+    """Show the page a claim or a finding was read from, with its row marked.
+
+    The question a reviewer asks of any figure is where it came from, and the
+    only satisfying answer is the carrier's own page with the line marked on
+    it. Where the row cannot be marked -- a scanned page the vision model read,
+    or a rectangle that does not survive being read back -- the page is still
+    shown and the reason is said, rather than marking a plausible-looking row.
+    """
+    document = result.document
+    findings = result.reconciliation.findings
+    if not document.claims and not findings:
+        return
+
+    choices: list[tuple[str, Any]] = [
+        (f"Claim {claim.claim_number}", ("claim", index))
+        for index, claim in enumerate(document.claims)
+    ] + [
+        (f"{finding.rule_id} · {finding.claim_number or 'document'}", ("finding", index))
+        for index, finding in enumerate(findings)
+    ]
+    labels = [label for label, _ in choices]
+    picked = st.selectbox(
+        "Show me where this came from",
+        labels,
+        key=f"evidence-pick-{document_id}",
+        index=0,
+    )
+    kind, index = dict(choices)[picked]
+
+    if kind == "claim":
+        claim = document.claims[index]
+        fields = [""] + sorted(claim.raw_cells)
+        field = st.selectbox(
+            "Field (optional)",
+            fields,
+            key=f"evidence-field-{document_id}",
+            format_func=lambda name: _FIELD_LABELS.get(name, name) if name else "the whole row",
+        )
+        evidence = claim_evidence(claim, field or None)
+        expect = claim.claim_number
+    else:
+        finding = findings[index]
+        evidence = finding_evidence(document, finding)
+        expect = finding.claim_number or ""
+
+    if result.source_path and expect:
+        evidence = confirm_region(result.source_path, evidence, expect)
+
+    left, right = st.columns([2, 3])
+    with left:
+        st.markdown(f"**Source** — {evidence.describe()}")
+        st.caption(evidence.note)
+        st.markdown(f"Extraction: `{evidence.method.value}`")
+        if evidence.text:
+            st.markdown("Text on the page:")
+            st.code(evidence.text, language=None)
+    with right:
+        if not result.source_path or not Path(result.source_path).exists():
+            st.info(
+                "The uploaded file has been deleted, so the page cannot be shown. "
+                "The page number, line and cell text above are kept."
+            )
+            return
+        image = render_evidence(result.source_path, evidence)
+        if image is None:
+            st.info("There is no page to show for this one.")
+        else:
+            st.image(image, width="stretch")
 
 
 def _money(value: Any) -> str:
@@ -1067,6 +1145,9 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         expanded=bool(findings),
     ):
         _findings_table(result)
+
+    with st.expander("Source evidence", expanded=False):
+        _evidence_panel(result, document_id)
 
     st.markdown("**Claims**")
     st.caption(

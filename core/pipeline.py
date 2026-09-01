@@ -121,6 +121,12 @@ class ExtractionResult:
     tables: list[RawTable] = field(default_factory=list)
     profile: CarrierProfile | None = None
     warnings: list[str] = field(default_factory=list)
+    #: The staged upload, while it is still on disk. Evidence is shown from the
+    #: document itself, so the review screen needs a way back to it. Session
+    #: state, not part of the canonical model: the file is deleted after export
+    #: (spec section 9) and this becomes None, without taking the page numbers,
+    #: regions and cell text with it.
+    source_path: Path | None = None
 
     @property
     def needs_mapping(self) -> bool:
@@ -262,6 +268,7 @@ def build_claim(
         source_page=row.page,
         source_row=row.line_index,
         source_bbox=row.bbox,
+        source_lines=list(row.source_lines),
         source_method=source_method,
         field_issues=issues,
         field_confidence=confidence,
@@ -1061,6 +1068,7 @@ def run_pipeline(
         reconciliation=reconcile(document, config),
         mapping=mapping,
         classification=classification,
+        source_path=ingested.path,
         locale=locale_inference,
         date_order=date_inference,
         recovery_sign=recovery_sign,
@@ -1306,6 +1314,7 @@ def apply_edits(
         confidence = dict(original.field_confidence) if original else {}
         raw_cells = dict(original.raw_cells) if original else {}
         edited = False
+        touched: list[str] = []
         fields: dict[str, Any] = {}
 
         for name, value in record.items():
@@ -1318,6 +1327,7 @@ def apply_edits(
             fields[name] = coerced
             if coerced != previous:
                 edited = True
+                touched.append(name)
                 confidence[name] = 1.0
                 issues.pop(name, None)
                 if coerced is None and reason and reason is not NullReason.EMPTY:
@@ -1334,6 +1344,10 @@ def apply_edits(
                 source_page=int(record.get("_page") or (original.source_page if original else 1)),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,
+                source_lines=list(original.source_lines) if original else [],
+                edited_fields=sorted(
+                    set(touched) | set(original.edited_fields if original else [])
+                ),
                 source_method=(
                     SourceMethod.MANUAL
                     if edited or original is None

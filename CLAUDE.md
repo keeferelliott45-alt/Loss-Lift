@@ -27,6 +27,18 @@ Read these before making any architectural decision.
 1. **Never let an LLM read a number it doesn't have to.** For text-layer PDFs, numbers come from deterministic parsing (`pdfplumber`). The LLM's job is *structure* — which column is "Paid Indemnity", where the table starts, what the valuation date is. Vision extraction of numbers is a fallback for scanned documents only, and it is always flagged as lower confidence.
    "Extraction into the canonical schema" therefore means **structural mapping** — deciding which printed column carries which canonical field — and never reading the values themselves off the page. A pipeline stage that says "extract" is mapping columns; the money is read by `pdfplumber` either way.
 2. **Every number carries provenance.** Page number, bounding box or line index, and extraction method (`digital` | `vision` | `manual`). Without an audit trail an underwriter cannot use this.
+   `core/evidence.py` turns that record into the page itself with the row
+   marked on it. Two libraries describe a page differently — one measures from
+   the media box and one from the crop box, and a rotated page reports its
+   words turned and its text unturned — so a rectangle can be arithmetically
+   perfect and name the wrong row. **Every region is read back before it is
+   shown, and withdrawn if the claim is not inside it**: the page is still
+   offered, and the reason is said. Marking the wrong row is worse than marking
+   none. A page read by the vision model has no rectangle at all, because the
+   model is asked what the page says and not where the words sit; that is
+   reported as a page, never approximated into a region. Provenance is answered
+   **per field**, so correcting one cell does not cost the other nine the line
+   they were read from.
 3. **Fail loud, never silently.** A field that can't be parsed is `null` with a reason, never `0`. `0.00` and "no data" are different facts and confusing them causes wrong loss ratios.
 4. **The human is the last mile.** Every cell is editable before export. The app assists; it is never the source of truth. This is also the legal posture.
 5. **Learn per carrier.** Each carrier's format, once mapped and human-confirmed, is saved as a reusable profile. This is the compounding moat — the 40th document from Travelers should need zero LLM calls.

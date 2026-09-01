@@ -211,10 +211,32 @@ class Claim(BaseModel):
     source_method: SourceMethod = SourceMethod.DIGITAL
     source_row: int | None = None
     source_bbox: tuple[float, float, float, float] | None = None
+
+    #: Every printed line this claim was read from, when a carrier spreads one
+    #: claim over several. ``source_row`` names the line carrying the claim
+    #: number; these name all of them, so a reviewer looking at a seven-line
+    #: Liberty record can see which lines it was assembled from.
+    source_lines: list[int] = Field(default_factory=list)
+
+    #: Fields a person typed. The rest of the claim still came off the page, so
+    #: this is kept per field rather than collapsing the whole row to manual:
+    #: editing one amount must not cost the other nine their provenance.
+    edited_fields: list[str] = Field(default_factory=list)
     field_confidence: dict[str, float] = Field(default_factory=dict)
     field_issues: dict[str, NullReason] = Field(default_factory=dict)
     raw_cells: dict[str, str] = Field(default_factory=dict)
     currency: str | None = None
+
+    def provenance_of(self, field_name: str) -> SourceMethod:
+        """How this particular field came to hold its value.
+
+        A claim read off the page and then corrected in one cell is not wholly
+        manual and not wholly digital. Asking per field is the only way to
+        answer honestly which is which.
+        """
+        if field_name in self.edited_fields:
+            return SourceMethod.MANUAL
+        return self.source_method
 
     @property
     def confidence(self) -> float:
