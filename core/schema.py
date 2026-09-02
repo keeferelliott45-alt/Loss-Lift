@@ -15,6 +15,8 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+import json
+import re
 from typing import Annotated, Any, Iterable
 from uuid import uuid4
 
@@ -94,6 +96,21 @@ class Severity(str, Enum):
     ERROR = "ERROR"
     WARN = "WARN"
     INFO = "INFO"
+
+
+class FindingScope(str, Enum):
+    """What kind of document object a finding identifies."""
+
+    CLAIM = "claim"
+    CLAIM_GROUP = "claim_group"
+    DOCUMENT = "document"
+    COLUMN = "column"
+
+
+class FindingCategory(str, Enum):
+    FINANCIAL = "financial"
+    EXTRACTION = "extraction"
+    UNDERWRITING = "underwriting"
 
 
 class DocumentStatus(str, Enum):
@@ -518,6 +535,14 @@ class LossRunDocument(BaseModel):
         added by hand is identified the moment it exists.
         """
         assign_row_ids(self.claims)
+        identities = [claim.row_id for claim in self.claims]
+        if len(identities) != len(set(identities)):
+            duplicates = sorted(
+                {identity for identity in identities if identities.count(identity) > 1}
+            )
+            raise ValueError(
+                "claim row_id values must be unique: " + ", ".join(duplicates)
+            )
         return self
 
     @field_validator("currency")
@@ -578,24 +603,67 @@ class LossRunDocument(BaseModel):
 class Finding(BaseModel):
     """One reconciliation result (spec section 6)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     rule_id: str
     severity: Severity
     message: str
+    scope: FindingScope
+    category: FindingCategory
     claim_number: str | None = None
     #: What on the document this finding is about, in terms that survive being
     #: edited: a claim's :attr:`~Claim.row_id`, or the printed column a mapping
     #: rule contests. The claim number cannot do this job — two rows can share
     #: one, and correcting a duplicate changes it — and neither can the
     #: finding's position, since the engine rebuilds the list on every edit.
-    #: Empty where a finding is genuinely about the whole document.
-    subject: str = ""
+    subject: str
+    #: Distinguishes independent checks by one rule on the same subject/field.
+    #: For example, R-10 checks both report-before-loss and after-valuation.
+    condition: str = "primary"
+    related_rows: tuple[str, ...] = ()
     field: str | None = None
     expected: Decimal | int | str | None = None
     actual: Decimal | int | str | None = None
     delta: Decimal | None = None
     page: int | None = None
+
+    @model_validator(mode="after")
+    def _identity_is_complete(self) -> "Finding":
+        """Refuse findings whose identity cannot safely survive a re-run."""
+        if not self.subject.strip():
+            raise ValueError("finding subject must be non-empty and explainable")
+        if not self.condition.strip():
+            raise ValueError("finding condition must be non-empty")
+        if self.category is FindingCategory.FINANCIAL and self.severity is not Severity.ERROR:
+            raise ValueError("financial reconciliation failures must have ERROR severity")
+        if self.category is FindingCategory.UNDERWRITING and self.severity is Severity.ERROR:
+            raise ValueError("underwriting observations cannot have ERROR severity")
+        claim_scopes = {FindingScope.CLAIM, FindingScope.CLAIM_GROUP}
+        if self.scope in claim_scopes and not self.claim_number:
+            raise ValueError(f"{self.scope.value} findings require a claim number")
+        if self.scope not in claim_scopes and self.claim_number is not None:
+            raise ValueError(
+                f"{self.scope.value} findings cannot carry a claim number"
+            )
+        if self.scope is not FindingScope.CLAIM_GROUP and self.related_rows:
+            raise ValueError("only claim-group findings may identify related rows")
+        if self.scope is FindingScope.DOCUMENT and self.subject != "document":
+            raise ValueError("document findings must use subject='document'")
+        if self.scope is FindingScope.CLAIM_GROUP:
+            if (len(self.related_rows) < 2 or any(not row for row in self.related_rows)
+                    or len(set(self.related_rows)) != len(self.related_rows)):
+                raise ValueError("claim-group findings require distinct physical row identities")
+            expected = f"claim-number:{self.claim_number}"
+            if self.subject != expected:
+                raise ValueError(
+                    f"claim-group subject must be {expected!r}, got {self.subject!r}"
+                )
+        if self.scope is FindingScope.COLUMN:
+            if not re.fullmatch(r"column [1-9][0-9]*", self.subject) or not self.field:
+                raise ValueError(
+                    "column findings require subject='column N' and a canonical field"
+                )
+        return self
 
     def __str__(self) -> str:  # pragma: no cover - convenience only
         where = f" [{self.claim_number}]" if self.claim_number else ""
@@ -679,8 +747,14 @@ def finding_key(finding: "Finding") -> str:
     "Total Incurred", R-21 says so three times, and one dismissal would answer
     for all three including the real incurred column.
     """
-    return "|".join(
-        (finding.rule_id, finding.subject or finding.claim_number or "", finding.field or "")
+    # A JSON tuple is readable and cannot collide when a label contains a
+    # delimiter. Concatenating with '|' made boundary placement ambiguous.
+    return json.dumps(
+        [finding.rule_id, finding.category.value, finding.scope.value,
+         finding.subject, finding.field or "", finding.condition,
+         sorted(finding.related_rows)],
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
@@ -751,10 +825,12 @@ class Resolution(BaseModel):
         different number.
         """
         recorded = (self.expected, self.actual, self.delta)
+        if self.severity != finding.severity.value:
+            return False
         if not any(value is not None for value in recorded):
             # Recorded before the finding carried a material claim, or a rule
             # that makes none. Identity is all there is to go on.
-            return True
+            return self.message == finding.message
         return all(
             _same_amount(was, now) for was, now in zip(recorded, _asserted(finding))
         )
@@ -952,5 +1028,3 @@ class RawTable(BaseModel):
     @property
     def column_count(self) -> int:
         return len(self.headers)
-
-

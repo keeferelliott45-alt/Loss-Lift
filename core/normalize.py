@@ -31,7 +31,7 @@ DateOrder = Literal["mdy", "dmy", "ymd"]
 # --------------------------------------------------------------------------
 
 #: Dash-ish characters that mean "minus" or "placeholder" in carrier reports.
-_DASHES = "−–—‐‑‒⁃"
+_DASHES = "−–—‐‑‒⁃\u00ad"
 _DASH_TRANSLATION = {ord(ch): "-" for ch in _DASHES}
 
 #: Currency symbol -> ISO 4217.  Two-character symbols are matched first.

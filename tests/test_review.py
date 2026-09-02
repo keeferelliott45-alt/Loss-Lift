@@ -151,12 +151,13 @@ def test_unparseable_input_is_recorded_with_a_reason(broken):
     assert updated.claims[0].issue("incurred_total") is NullReason.UNPARSEABLE
 
 
-def test_emptying_the_claim_number_deletes_the_row(broken):
+def test_emptying_the_claim_number_cannot_delete_carrier_evidence(broken):
     records = to_records(broken.document)
     before = len(records)
     records[1]["claim_number"] = ""
-    updated = apply_edits(broken.document, records)
-    assert len(updated.claims) == before - 1
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        apply_edits(broken.document, records)
+    assert len(broken.document.claims) == before
 
 
 def test_a_new_row_is_manual(broken):

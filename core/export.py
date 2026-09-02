@@ -349,7 +349,8 @@ def _write_exceptions_sheet(
     quietly dropped the resolved ones would answer only half of that.
     """
     headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
-               "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note"]
+               "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note",
+               "Subject", "Condition", "Category"]
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
@@ -370,7 +371,11 @@ def _write_exceptions_sheet(
             float(finding.delta) if finding.delta is not None else None,
             finding.page,
             (log.action_for(finding).value if log else ReviewAction.OPEN.value),
-            (entry.note if log and (entry := log.latest_for(finding_key(finding))) else ""),
+            (entry.note if log and (entry := log.latest_for(finding_key(finding)))
+             and entry.still_applies_to(finding) else ""),
+            finding.subject,
+            finding.condition,
+            finding.category.value,
         ]
         for column_index, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)
@@ -504,15 +509,16 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     # anything having reconciled. Naming the column for the stronger of the two
     # would be the report claiming the review had settled the figures.
     headers = ["When", "Reviewer", "Rule", "Severity", "Claim number", "Where",
-               "Field", "What was flagged", "Decision", "Originally extracted",
-               "Corrected to", "Document status before", "Document status after",
-               "Reviewer note"]
+               "Field", "What was flagged", "Decision", "Value before",
+               "Value after", "Document status before", "Document status after",
+               "Reviewer note", "Finding identity", "Physical row",
+               "Expected", "Actual", "Delta"]
     widths = _header_row(sheet, headers)
 
     entries = document.review_log.entries
     for row_index, entry in enumerate(entries, start=2):
         _fill_row(sheet, row_index, [
-            entry.at.strftime("%Y-%m-%d %H:%M UTC"),
+            entry.at.isoformat(timespec="microseconds"),
             entry.reviewer,
             entry.rule_id,
             entry.severity,
@@ -526,6 +532,11 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
             entry.status_before,
             entry.status_after,
             entry.note,
+            entry.key,
+            entry.row_id,
+            entry.expected,
+            entry.actual,
+            entry.delta,
         ], widths)
 
     if not entries:

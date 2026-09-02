@@ -72,11 +72,7 @@ UNDERWRITING = "underwriting"
 
 def bucket_of(finding: Finding) -> str:
     """Which of the three questions this finding belongs to."""
-    if finding.rule_id in FINANCIAL_RULES:
-        return FINANCIAL
-    if finding.rule_id in EXTRACTION_RULES:
-        return EXTRACTION
-    return UNDERWRITING
+    return finding.category.value
 
 
 @dataclass(frozen=True)

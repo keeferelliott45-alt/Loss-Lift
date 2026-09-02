@@ -24,9 +24,8 @@ import streamlit as st
 
 from core import export as export_module
 from core.review import (
-    EXTRACTION_RULES,
     finding_key,
-    FINANCIAL_RULES,
+    bucket_of,
     ReviewAction,
     summarise_review,
 )
@@ -43,8 +42,9 @@ from core.pipeline import (
     ExtractionResult,
     PROVENANCE_COLUMNS,
     ROW_ID_COLUMN,
-    apply_edits,
-    rerun_reconciliation,
+    REVIEW_COLUMNS,
+    claim_for,
+    edit_claims,
     review_columns,
     run_pipeline,
     sample_rows,
@@ -58,7 +58,6 @@ from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
     MONEY_FIELDS,
-    Claim,
     ClaimStatus,
     Severity,
 )
@@ -207,11 +206,8 @@ def _status_of(result: ExtractionResult) -> str:
 # and the export cannot drift apart. Financial rules ask whether the numbers
 # add up; extraction rules ask whether the document could be read at all.
 # Together they are what blocks the reconciled badge -- exactly as before.
-_DATA_QUALITY_RULES = FINANCIAL_RULES | EXTRACTION_RULES
-
-
 def _is_data_issue(finding) -> bool:
-    return finding.rule_id in _DATA_QUALITY_RULES
+    return bucket_of(finding) != "underwriting"
 
 
 def _split_findings(findings: list) -> tuple[list, list]:
@@ -334,6 +330,8 @@ def _findings_table(result: ExtractionResult) -> None:
                 "Bucket": "Data issue" if _is_data_issue(finding) else "Flag",
                 "Rule": finding.rule_id,
                 "Claim": finding.claim_number or "—",
+                "Subject": finding.subject,
+                "Condition": finding.condition,
                 "Field": _FIELD_LABELS.get(finding.field or "", finding.field or "—"),
                 "What happened": finding.message,
                 "Expected": _money(finding.expected),
@@ -488,9 +486,7 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
         key=f"review-pick-{document_id}",
     )
     finding = queue[picked]
-    claim = next(
-        (c for c in document.claims if c.claim_number == finding.claim_number), None
-    )
+    claim = claim_for(document, finding)
 
     st.markdown(f"**{finding.rule_id}** — {finding.message}")
     if finding.expected is not None or finding.actual is not None:
@@ -533,12 +529,14 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
     previous = log.latest_for(finding_key(finding))
     if previous is not None:
         st.info(
-            f"Reviewed {previous.at.strftime('%Y-%m-%d %H:%M UTC')} by "
+            ("Reviewed " if previous.still_applies_to(finding)
+             else "Earlier decision — no longer applies: ")
+            + f"{previous.at.strftime('%Y-%m-%d %H:%M:%S UTC')} by "
             f"{previous.reviewer}: **{previous.action.value}**"
             + (f" — {previous.note}" if previous.note else "")
         )
 
-    correctable = claim is not None and finding.field in Claim.model_fields
+    correctable = claim is not None and finding.field in REVIEW_COLUMNS
     choices = [ReviewAction.CONFIRMED, ReviewAction.DISMISSED]
     if correctable:
         choices.insert(1, ReviewAction.CORRECTED)
@@ -1368,7 +1366,8 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     st.markdown("**Claims**")
     st.caption(
         "Edit any cell. The checks re-run as soon as you do. Cells LossLift "
-        "could not read are marked in the exceptions above."
+        "could not read are marked in the exceptions above. Carrier rows cannot "
+        "be deleted; their source evidence must remain in the audit trail."
     )
 
     columns = review_columns(result.document)
@@ -1390,10 +1389,14 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
 
     edited_records = edited.to_dict("records")
     if edited_records != records:
-        updated = apply_edits(result.document, edited_records)
-        result.document = updated
-        result.reconciliation = rerun_reconciliation(updated)
-        st.rerun()
+        previous_document = result.document
+        try:
+            edit_claims(result, edited_records)
+        except ValueError as refused:
+            st.error(str(refused))
+        else:
+            if result.document is not previous_document:
+                st.rerun()
 
 
 def _column_config(columns: list[str]) -> dict[str, Any]:
@@ -1401,12 +1404,15 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
     for name in columns:
         label = _FIELD_LABELS.get(name, name)
         if name in MONEY_FIELDS:
-            config[name] = st.column_config.NumberColumn(label, format="%.2f")
+            config[name] = st.column_config.TextColumn(
+                label,
+                help="Enter the amount exactly as printed; locale and credit formats are accepted.",
+            )
         elif name in DATE_FIELDS:
             config[name] = st.column_config.DateColumn(label, format="YYYY-MM-DD")
         elif name == "claim_status":
             config[name] = st.column_config.SelectboxColumn(
-                label, options=["OPEN", "CLOSED", "REOPENED", "UNKNOWN"]
+                label, options=[status.value for status in ClaimStatus]
             )
         elif name == "litigation_flag":
             config[name] = st.column_config.CheckboxColumn(label)
@@ -1418,6 +1424,7 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
     config["_method"] = st.column_config.TextColumn(
         "Read by", disabled=True, width="small"
     )
+    config[ROW_ID_COLUMN] = st.column_config.TextColumn("Physical row", disabled=True)
     return config
 
 

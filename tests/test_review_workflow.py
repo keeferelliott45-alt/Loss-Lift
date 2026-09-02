@@ -276,7 +276,7 @@ def test_review_history_reaches_the_workbook(broken):
     row = {name: sheet.cell(row=2, column=index + 1).value
            for index, name in enumerate(headers)}
     assert row["Decision"] == "corrected"
-    assert row["Originally extracted"] == f"{was:f}"
+    assert row["Value before"] == f"{was:f}"
     assert row["Reviewer note"] == "misread on the page"
     # Named for what it carries: the document's standing, which review
     # progress moves and reconciliation is only part of.

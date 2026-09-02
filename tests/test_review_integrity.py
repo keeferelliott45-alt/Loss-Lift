@@ -206,14 +206,20 @@ def test_correcting_a_claim_number_records_the_change_it_made(broken):
     """
     _collide(broken, broken.document.claims[0].claim_number)
     duplicate = _finding(broken, "R-11")
-    result = resolve_finding(
-        broken, duplicate, ReviewAction.CORRECTED, corrected_value="NEW-999"
-    )
-    entry = result.document.review_log.entries[-1]
+    with pytest.raises(ValueError, match="multiple physical rows"):
+        resolve_finding(
+            broken, duplicate, ReviewAction.CORRECTED, corrected_value="NEW-999"
+        )
+    records = to_records(broken.document, review_columns(broken.document))
+    selected_id = records[0]["_id"]
+    records[0]["claim_number"] = "NEW-999"
+    document = apply_edits(broken.document, records)
+    entry = document.review_log.entries[-1]
+    assert entry.row_id == selected_id
     assert entry.after == "NEW-999"
     assert entry.before != entry.after
     assert entry.changed_a_value
-    assert "NEW-999" in [claim.claim_number for claim in result.document.claims]
+    assert "NEW-999" in [claim.claim_number for claim in document.claims]
 
 
 # --------------------------------------------------------------------------
@@ -286,17 +292,15 @@ def test_editing_a_cell_in_the_table_reaches_the_audit_trail(broken):
     assert entry.changed_a_value
 
 
-def test_deleting_a_row_records_what_was_deleted(broken):
+def test_deleting_a_row_is_refused_without_losing_carrier_evidence(broken):
     doomed = broken.document.claims[1]
     records = to_records(broken.document, review_columns(broken.document))
     records = [r for r in records if r["claim_number"] != doomed.claim_number]
-    document = apply_edits(broken.document, records)
-    assert len(document.claims) == len(broken.document.claims) - 1
-    entry = document.review_log.entries[-1]
-    assert entry.action is ReviewAction.DELETED
-    assert entry.row_id == doomed.row_id
-    assert entry.where == doomed.where()
-    assert str(doomed.incurred_total) in entry.before
+    before = broken.document.model_dump(mode="json")
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        apply_edits(broken.document, records)
+    assert broken.document.model_dump(mode="json") == before
+    assert next(c for c in broken.document.claims if c.row_id == doomed.row_id) == doomed
 
 
 def test_a_partly_applied_correction_changes_nothing(broken, monkeypatch):
@@ -319,6 +323,57 @@ def test_a_partly_applied_correction_changes_nothing(broken, monkeypatch):
         c.incurred_total for c in claims_before
     ]
     assert not broken.document.review_log.entries
+
+
+def test_a_failed_audit_write_does_not_publish_a_correction(broken, monkeypatch):
+    from core.schema import ReviewLog
+
+    finding = _finding(broken, "R-01")
+    before = broken.document.model_dump(mode="json")
+    reconciliation = broken.reconciliation
+
+    def fail_audit(self, entry):
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr(ReviewLog, "record", fail_audit)
+    with pytest.raises(RuntimeError, match="audit storage"):
+        resolve_finding(
+            broken, finding, ReviewAction.CORRECTED, corrected_value="31400.00"
+        )
+    assert broken.document.model_dump(mode="json") == before
+    assert broken.reconciliation is reconciliation
+
+
+def test_evidence_uses_the_physical_row_even_with_duplicate_claim_numbers(broken):
+    from core.evidence import finding_evidence
+
+    finding = _finding(broken, "R-01")
+    _collide(broken, finding.claim_number)
+    finding = _finding(broken, "R-01")
+    target = next(c for c in broken.document.claims if c.row_id == finding.subject)
+    evidence = finding_evidence(broken.document, finding)
+    assert evidence.page == target.source_page
+    assert evidence.bbox == target.source_bbox
+    assert evidence.text == target.raw_cells.get(finding.field, "")
+
+
+def test_review_decision_does_not_survive_changed_severity(broken):
+    from core.schema import Severity
+
+    finding = _finding(broken, "R-01")
+    resolve_finding(broken, finding, ReviewAction.CONFIRMED)
+    changed = finding.model_copy(update={"severity": Severity.WARN})
+    assert not broken.document.review_log.is_resolved(changed)
+
+
+def test_money_editor_records_preserve_exact_decimal_spelling(broken):
+    amount = Decimal("9007199254740993.0100")
+    broken.document.claims[0].incurred_total = amount
+    records = to_records(broken.document, review_columns(broken.document))
+    assert records[0]["incurred_total"] == "9007199254740993.0100"
+    unchanged = apply_edits(broken.document, records)
+    assert unchanged.claims[0].incurred_total.as_tuple() == amount.as_tuple()
+    assert unchanged.review_log.entries == []
 
 
 # --------------------------------------------------------------------------
@@ -422,10 +477,12 @@ def test_correcting_an_unreadable_cell_keeps_why_it_was_unreadable(broken):
 
 def test_correcting_something_a_claim_does_not_store_is_refused(broken):
     """A rule can flag what no cell holds, and no cell is invented for it."""
-    from core.schema import Finding, Severity
+    from core.schema import Finding, FindingScope, Severity
 
     invented = Finding(
         rule_id="R-05",
+        category="financial",
+        scope=FindingScope.CLAIM,
         severity=Severity.ERROR,
         claim_number=broken.document.claims[0].claim_number,
         subject=broken.document.claims[0].row_id,

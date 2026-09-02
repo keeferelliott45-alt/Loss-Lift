@@ -84,6 +84,38 @@ def test_a_document_with_no_claims_is_never_clean():
     assert result.status is DocumentStatus.NEEDS_REVIEW
 
 
+def test_future_rule_with_wrong_physical_subject_fails_loudly(monkeypatch):
+    import core.reconcile as engine
+    from core.schema import Finding, FindingScope
+
+    doc = build_doc([good_claim("A"), good_claim("B")])
+    wrong = Finding(
+        rule_id="R-22", scope=FindingScope.CLAIM,
+        category="extraction",
+        subject=doc.claims[1].row_id, claim_number="A",
+        severity=Severity.ERROR, message="bad row association",
+    )
+    monkeypatch.setattr(engine, "_RULES", [("R-22", lambda d, c: [wrong])])
+    with pytest.raises(ValueError, match="belongs to claim"):
+        engine.reconcile(doc)
+
+
+def test_future_rule_cannot_publish_duplicate_finding_identities(monkeypatch):
+    import core.reconcile as engine
+    from core.schema import Finding, FindingScope
+
+    one = Finding(
+        rule_id="R-22", scope=FindingScope.DOCUMENT, subject="document",
+        category="financial",
+        field="paid_total", severity=Severity.ERROR,
+        message="first discrepancy", expected=Decimal("10"), actual=Decimal("20"),
+    )
+    two = one.model_copy(update={"expected": Decimal("30"), "message": "second discrepancy"})
+    monkeypatch.setattr(engine, "_RULES", [("R-22", lambda d, c: [one, two])])
+    with pytest.raises(ValueError, match="duplicate finding identities"):
+        engine.reconcile(build_doc())
+
+
 def test_a_document_with_claims_does_not_trip_the_empty_rule():
     result = reconcile(build_doc([good_claim()]))
     assert "R-20" not in {f.rule_id for f in result.findings}

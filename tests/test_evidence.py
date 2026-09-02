@@ -133,9 +133,13 @@ def test_a_finding_points_at_the_claim_it_is_about(upright):
     """A reviewer clicking an exception should land on the row that caused it."""
     document = upright.document
     claim = document.claims[0]
+    from core.schema import FindingScope
     finding = Finding(
-        rule_id="R-01", severity=Severity.ERROR, message="…",
-        claim_number=claim.claim_number, field="incurred_total",
+        rule_id="R-01", scope=FindingScope.CLAIM,
+        category="financial",
+        severity=Severity.ERROR, message="…",
+        claim_number=claim.claim_number, subject=claim.row_id,
+        field="incurred_total",
     )
     evidence = finding_evidence(document, finding)
     assert evidence.page == claim.source_page
@@ -145,7 +149,12 @@ def test_a_finding_points_at_the_claim_it_is_about(upright):
 
 def test_a_document_wide_finding_does_not_pretend_to_a_row(upright):
     """R-06 is about the document. There is no row to mark, so none is."""
-    finding = Finding(rule_id="R-06", severity=Severity.ERROR, message="…")
+    from core.schema import FindingScope
+    finding = Finding(
+        rule_id="R-06", scope=FindingScope.DOCUMENT, subject="document",
+        category="extraction",
+        severity=Severity.ERROR, message="…"
+    )
     evidence = finding_evidence(upright.document, finding)
     assert evidence.kind is EvidenceKind.NONE
     assert evidence.bbox is None

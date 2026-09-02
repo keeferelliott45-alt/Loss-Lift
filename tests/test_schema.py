@@ -14,6 +14,7 @@ from core.schema import (
     ClaimStatus,
     ExtractionMethod,
     Finding,
+    FindingScope,
     LossRunDocument,
     NullReason,
     Severity,
@@ -130,6 +131,9 @@ def test_sum_present():
 def test_finding_round_trips():
     finding = Finding(
         rule_id="R-01",
+        category="financial",
+        scope=FindingScope.CLAIM,
+        subject="p1r1",
         severity=Severity.ERROR,
         message="does not add up",
         claim_number="C1",
@@ -140,6 +144,53 @@ def test_finding_round_trips():
     )
     assert isinstance(finding.expected, Decimal)
     assert "R-01" in str(finding)
+
+
+def test_claim_finding_cannot_be_constructed_without_physical_identity():
+    with pytest.raises(ValidationError, match="subject"):
+        Finding(
+            rule_id="R-22",
+            category="extraction",
+            scope=FindingScope.CLAIM,
+            severity=Severity.ERROR,
+            message="unsafe future rule",
+            claim_number="DUPLICATE",
+            subject="",
+        )
+
+
+def test_document_finding_has_one_explicit_explainable_identity():
+    with pytest.raises(ValidationError, match="subject='document'"):
+        Finding(
+            rule_id="R-22",
+            category="extraction",
+            scope=FindingScope.DOCUMENT,
+            severity=Severity.ERROR,
+            message="unsafe future rule",
+            subject="claim 1",
+        )
+
+
+def test_document_rejects_duplicate_preassigned_row_identity():
+    claims = [
+        Claim(claim_number="A", row_id="p1r1"),
+        Claim(claim_number="B", row_id="p1r1"),
+    ]
+    with pytest.raises(ValidationError, match="row_id values must be unique"):
+        LossRunDocument(source_filename="x.pdf", file_sha256="a" * 64, claims=claims)
+
+
+def test_future_rule_must_declare_category_and_valid_severity():
+    with pytest.raises(ValidationError, match="category"):
+        Finding(
+            rule_id="R-22", scope=FindingScope.DOCUMENT, subject="document",
+            severity=Severity.ERROR, message="missing classification",
+        )
+    with pytest.raises(ValidationError, match="underwriting observations"):
+        Finding(
+            rule_id="R-22", scope=FindingScope.DOCUMENT, subject="document",
+            category="underwriting", severity=Severity.ERROR, message="invalid pair",
+        )
 
 
 def test_canonical_fields_all_exist_on_claim():

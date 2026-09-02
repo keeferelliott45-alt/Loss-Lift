@@ -27,10 +27,13 @@ from core.schema import (
     ClaimStatus,
     DocumentStatus,
     Finding,
+    FindingScope,
+    FindingCategory,
     LossRunDocument,
     NullReason,
     ReconciliationResult,
     Severity,
+    finding_key,
     sum_present,
 )
 
@@ -154,6 +157,8 @@ def r01_incurred_identity(
         findings.append(
             Finding(
                 rule_id="R-01",
+                category=FindingCategory.FINANCIAL,
+                scope=FindingScope.CLAIM,
                 severity=Severity.ERROR,
                 claim_number=claim.claim_number,
                 subject=claim.row_id,
@@ -198,6 +203,8 @@ def _component_sum_rule(
         findings.append(
             Finding(
                 rule_id=rule_id,
+                category=FindingCategory.FINANCIAL,
+                scope=FindingScope.CLAIM,
                 severity=Severity.ERROR,
                 claim_number=claim.claim_number,
                 subject=claim.row_id,
@@ -259,6 +266,9 @@ def r04_footer_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
         findings.append(
             Finding(
                 rule_id="R-04",
+                category=FindingCategory.FINANCIAL,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
                 severity=Severity.ERROR,
                 field=field_name,
                 message=(
@@ -287,6 +297,9 @@ def r05_claim_count(doc: LossRunDocument, config: ReconcileConfig) -> list[Findi
     return [
         Finding(
             rule_id="R-05",
+            category=FindingCategory.FINANCIAL,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
             severity=Severity.ERROR,
             field="claim_count",
             message=(
@@ -313,6 +326,9 @@ def r06_valuation_date(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
     return [
         Finding(
             rule_id="R-06",
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
             severity=Severity.ERROR,
             field="valuation_date",
             message=(
@@ -340,6 +356,8 @@ def r07_required_claim_fields(
             findings.append(
                 Finding(
                     rule_id="R-07",
+                    category=FindingCategory.EXTRACTION,
+                    scope=FindingScope.CLAIM,
                     severity=Severity.ERROR,
                     claim_number=claim.claim_number,
                     subject=claim.row_id,
@@ -375,6 +393,8 @@ def r08_closed_with_reserve(
         findings.append(
             Finding(
                 rule_id="R-08",
+                category=FindingCategory.UNDERWRITING,
+                scope=FindingScope.CLAIM,
                 severity=Severity.WARN,
                 claim_number=claim.claim_number,
                 subject=claim.row_id,
@@ -410,6 +430,8 @@ def r09_loss_outside_policy_period(
             findings.append(
                 Finding(
                     rule_id="R-09",
+                    category=FindingCategory.UNDERWRITING,
+                    scope=FindingScope.CLAIM,
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
                     subject=claim.row_id,
@@ -436,6 +458,9 @@ def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
             findings.append(
                 Finding(
                     rule_id="R-10",
+                    category=FindingCategory.UNDERWRITING,
+                    scope=FindingScope.CLAIM,
+                    condition="reported-before-loss",
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
                     subject=claim.row_id,
@@ -454,6 +479,9 @@ def r10_date_ordering(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
                     findings.append(
                         Finding(
                             rule_id="R-10",
+                            category=FindingCategory.UNDERWRITING,
+                            scope=FindingScope.CLAIM,
+                            condition="after-valuation",
                             severity=Severity.WARN,
                             claim_number=claim.claim_number,
                             subject=claim.row_id,
@@ -491,12 +519,17 @@ def r11_duplicate_claim_numbers(
         findings.append(
             Finding(
                 rule_id="R-11",
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.CLAIM_GROUP,
                 severity=Severity.ERROR,
                 claim_number=number,
+                subject=f"claim-number:{number}",
+                related_rows=tuple(sorted(claim.row_id for claim in claims)),
                 field="claim_number",
                 message=(
                     f"Claim number appears {len(claims)} times on page {pages[0]}. "
-                    f"Delete the duplicate row or correct the number."
+                    "Review the physical rows and correct a misread number in "
+                    "the claims table. Source rows cannot be deleted."
                 ),
                 expected=1,
                 actual=len(claims),
@@ -519,13 +552,17 @@ def r12_cross_page_duplicate(
         findings.append(
             Finding(
                 rule_id="R-12",
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.CLAIM_GROUP,
                 severity=Severity.WARN,
                 claim_number=number,
+                subject=f"claim-number:{number}",
+                related_rows=tuple(sorted(claim.row_id for claim in claims)),
                 field="claim_number",
                 message=(
                     f"Claim appears on pages {', '.join(str(p) for p in pages)}. "
-                    f"This is usually a row continued across a page break — keep "
-                    f"one row and delete the other."
+                    "This may be a row continued across a page break. Review "
+                    "both source rows; source evidence must not be deleted."
                 ),
                 expected=1,
                 actual=len(claims),
@@ -564,6 +601,8 @@ def r13_outliers(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]
             findings.append(
                 Finding(
                     rule_id="R-13",
+                    category=FindingCategory.UNDERWRITING,
+                    scope=FindingScope.CLAIM,
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
                     subject=claim.row_id,
@@ -593,6 +632,8 @@ def r14_negative_paid(doc: LossRunDocument, config: ReconcileConfig) -> list[Fin
         findings.append(
             Finding(
                 rule_id="R-14",
+                category=FindingCategory.UNDERWRITING,
+                scope=FindingScope.CLAIM,
                 severity=Severity.INFO,
                 claim_number=claim.claim_number,
                 subject=claim.row_id,
@@ -620,6 +661,9 @@ def r15_unresolved_fields(
         findings.append(
             Finding(
                 rule_id="R-15",
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
                 severity=Severity.WARN,
                 field=field_name,
                 message=(
@@ -638,6 +682,8 @@ def r15_unresolved_fields(
             findings.append(
                 Finding(
                     rule_id="R-15",
+                    category=FindingCategory.EXTRACTION,
+                    scope=FindingScope.CLAIM,
                     severity=Severity.WARN,
                     claim_number=claim.claim_number,
                     subject=claim.row_id,
@@ -664,6 +710,9 @@ def r16_mixed_currency(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
     return [
         Finding(
             rule_id="R-16",
+            category=FindingCategory.UNDERWRITING,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
             severity=Severity.WARN,
             field="currency",
             message=(
@@ -698,6 +747,8 @@ def r17_no_money_either_side(
         findings.append(
             Finding(
                 rule_id="R-17",
+                category=FindingCategory.UNDERWRITING,
+                scope=FindingScope.CLAIM,
                 severity=Severity.WARN,
                 claim_number=claim.claim_number,
                 subject=claim.row_id,
@@ -742,6 +793,9 @@ def r18_unstated_basis(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
             findings.append(
                 Finding(
                     rule_id="R-18",
+                    category=FindingCategory.UNDERWRITING,
+                    scope=FindingScope.DOCUMENT,
+                    subject="document",
                     severity=Severity.WARN,
                     field=field_name,
                     message=message,
@@ -772,6 +826,9 @@ def r19_stitching_row_count(
     return [
         Finding(
             rule_id="R-19",
+            category=FindingCategory.UNDERWRITING,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
             severity=Severity.WARN,
             message=(
                 f"Pages held {expected} claim row(s) but {actual} came through "
@@ -804,6 +861,9 @@ def r20_no_claims_extracted(
     return [
         Finding(
             rule_id="R-20",
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
             severity=Severity.ERROR,
             message=(
                 "No claims were read from this document. Either the account "
@@ -842,6 +902,8 @@ def r21_ambiguous_column_mapping(
         findings.append(
             Finding(
                 rule_id="R-21",
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.COLUMN,
                 severity=Severity.ERROR,
                 # One finding per contested column, so each has to say which
                 # column it is. Otherwise dismissing "Incurred Medical" would
@@ -879,7 +941,57 @@ def reconcile(
     for rule_id, fn in _RULES:
         if rule_id in config.disabled_rules:
             continue
-        findings.extend(fn(doc, config))
+        produced = fn(doc, config)
+        for finding in produced:
+            # Revalidate even instances built with Pydantic's explicit
+            # model_construct/model_copy escape hatches.
+            Finding.model_validate(finding.model_dump())
+            if finding.rule_id != rule_id:
+                raise ValueError(
+                    f"rule {rule_id} returned a finding labelled {finding.rule_id}"
+                )
+            if finding.scope is FindingScope.CLAIM:
+                matching = [c for c in doc.claims if c.row_id == finding.subject]
+                if len(matching) != 1:
+                    raise ValueError(
+                        f"{rule_id} claim subject {finding.subject!r} does not "
+                        "identify exactly one physical row"
+                    )
+                if matching[0].claim_number != finding.claim_number:
+                    raise ValueError(
+                        f"{rule_id} subject {finding.subject!r} belongs to claim "
+                        f"{matching[0].claim_number!r}, not {finding.claim_number!r}"
+                    )
+                if finding.page is not None and finding.page != matching[0].source_page:
+                    raise ValueError(
+                        f"{rule_id} page {finding.page} disagrees with the physical "
+                        f"row {finding.subject!r} on page {matching[0].source_page}"
+                    )
+            elif finding.scope is FindingScope.CLAIM_GROUP:
+                members = {c.row_id for c in doc.claims if c.claim_number == finding.claim_number}
+                if members != set(finding.related_rows):
+                    raise ValueError(f"{rule_id} group does not match its physical claim rows")
+            elif finding.scope is FindingScope.COLUMN:
+                index = int(finding.subject.split()[1]) - 1
+                matching_columns = [
+                    record for record in doc.column_mapping
+                    if record.source_index == index
+                    and finding.field in {record.canonical_field, record.contested_field}
+                ]
+                if len(matching_columns) != 1:
+                    raise ValueError(
+                        f"{rule_id} column subject {finding.subject!r} does not "
+                        "identify exactly one mapped source column"
+                    )
+        findings.extend(produced)
+
+    keys = [finding_key(finding) for finding in findings]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(
+            "reconciliation produced duplicate finding identities: "
+            + ", ".join(duplicates)
+        )
 
     findings.sort(
         key=lambda f: (

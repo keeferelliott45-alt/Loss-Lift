@@ -427,3 +427,10 @@ def test_a_status_followed_by_intruding_text_still_reads():
     assert parse_status("Reopened GIORGIO GORGONE") is ClaimStatus.REOPENED
     assert parse_status("vehicle was open at the time") is ClaimStatus.UNKNOWN
     assert parse_status("struck a parked vehicle") is ClaimStatus.UNKNOWN
+
+
+def test_pdf_soft_hyphen_is_a_hyphen_in_identifiers_and_credit_amounts():
+    from core.normalize import clean_text
+
+    assert clean_text("EU\u00ad901") == "EU-901"
+    assert parse_money("200,00\u00ad", "eu").value == Decimal("-200.00")

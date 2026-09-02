@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pymupdf
 
-from core.schema import Claim, Finding, LossRunDocument, SourceMethod
+from core.schema import Claim, Finding, FindingScope, LossRunDocument, SourceMethod
 
 #: How large a rendered page is, and how much room the highlight leaves round
 #: the words it marks.
@@ -184,10 +184,8 @@ def finding_evidence(document: LossRunDocument, finding: Finding) -> Evidence:
     about any one row, so it points no further than the page, and often not
     even that far. Saying so is better than marking an arbitrary row.
     """
-    if finding.claim_number:
-        claim = next(
-            (c for c in document.claims if c.claim_number == finding.claim_number), None
-        )
+    if finding.scope is FindingScope.CLAIM:
+        claim = next((c for c in document.claims if c.row_id == finding.subject), None)
         if claim is not None:
             return claim_evidence(claim, finding.field)
 

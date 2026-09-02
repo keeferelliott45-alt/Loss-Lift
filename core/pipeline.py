@@ -57,6 +57,7 @@ from core.review import (
 from core.schema import (
     DATE_FIELDS,
     Finding,
+    FindingScope,
     MONEY_FIELDS,
     Claim,
     ClaimStatus,
@@ -1103,6 +1104,29 @@ def rerun_reconciliation(
     return reconcile(document, config or ReconcileConfig())
 
 
+def edit_claims(
+    result: ExtractionResult, records: Sequence[dict[str, Any]]
+) -> ExtractionResult:
+    """Commit a grid edit, reconciliation and audit chronology together."""
+    before = summarise_review(
+        result.reconciliation.findings, result.document.review_log
+    ).headline()
+    old_entries = len(result.document.review_log.entries)
+    document = apply_edits(result.document, records)
+    if len(document.review_log.entries) == old_entries:
+        # pandas/Arrow can change null/date representations without a reviewer
+        # changing a value. Do not publish or re-run for that round trip.
+        return result
+    reconciliation = rerun_reconciliation(document, _config_for(result.profile))
+    after = summarise_review(reconciliation.findings, document.review_log).headline()
+    for entry in document.review_log.entries[old_entries:]:
+        entry.status_before = before
+        entry.status_after = after
+    result.document = document
+    result.reconciliation = reconciliation
+    return result
+
+
 def resolve_finding(
     result: ExtractionResult,
     finding: Finding,
@@ -1125,18 +1149,25 @@ def resolve_finding(
     engine raises it again, and the log shows a reviewer tried; if it no longer
     holds, the log shows what the value was before.
     """
-    document = result.document
+    original_document = result.document
+    document = original_document.model_copy(deep=True)
+    reconciliation = result.reconciliation
     before_headline = summarise_review(
-        result.reconciliation.findings, document.review_log
+        result.reconciliation.findings, original_document.review_log
     ).headline()
     was = after = None
-    claim = claim_for(document, finding)
+    claim = claim_for(original_document, finding)
 
     if action is ReviewAction.CORRECTED:
         # Refused rather than recorded. A log line reading "corrected" against
         # a finding that has no cell to correct describes a change nobody made,
         # and an audit trail that says so about one decision cannot be trusted
         # about the others.
+        if finding.scope is FindingScope.CLAIM_GROUP:
+            raise ValueError(
+                f"{finding.rule_id} concerns multiple physical rows. Select the "
+                "specific row in the claims table before correcting its number."
+            )
         if not finding.claim_number:
             raise ValueError(
                 f"{finding.rule_id} is about the whole document rather than one "
@@ -1163,8 +1194,10 @@ def resolve_finding(
                 f"{finding.rule_id} is about {finding.field!r}, which is not a "
                 f"field of a claim, so there is nothing here to correct."
             )
-        was = _as_text(getattr(claim, finding.field, None))
-        records = to_records(document, review_columns(document))
+        if finding.field not in REVIEW_COLUMNS:
+            raise ValueError(f"{finding.field!r} is not an editable claim value")
+        was = _audit_value(claim, finding.field)
+        records = to_records(original_document, review_columns(original_document))
         # By identity, not by claim number: two rows can share a number, and
         # the row this finding is about is not necessarily the first of them.
         row = next(
@@ -1176,13 +1209,16 @@ def resolve_finding(
         # document whose claims have moved and whose findings have not is worse
         # than an edit that failed: it reads as reconciled against figures that
         # are no longer there, and nothing says so.
-        edited = apply_edits(document, records, audit=False)
+        edited = apply_edits(original_document, records, audit=False)
         corrected = next(c for c in edited.claims if c.row_id == claim.row_id)
-        after = _as_text(getattr(corrected, finding.field, None))
-        reconciliation = rerun_reconciliation(edited)
-        result.document = document = edited
-        result.reconciliation = reconciliation
+        after = _audit_value(corrected, finding.field)
+        if was == after:
+            raise ValueError("No value changed. Confirm or dismiss the finding instead.")
+        reconciliation = rerun_reconciliation(edited, _config_for(result.profile))
+        document = edited
         claim = corrected
+    elif claim is not None:
+        claim = next(c for c in document.claims if c.row_id == claim.row_id)
 
     entry = resolution_for(
         finding,
@@ -1203,26 +1239,25 @@ def resolve_finding(
     # moment earlier would record every decision as having changed nothing.
     # Only this entry is touched, and only before anyone has seen it.
     entry.status_after = summarise_review(
-        result.reconciliation.findings, document.review_log
+        reconciliation.findings, document.review_log
     ).headline()
+    # Publish only after editing, reconciliation and audit writing all finish.
+    # Any failure above leaves the caller's previous valid pair untouched.
+    result.document = document
+    result.reconciliation = reconciliation
     return result
 
 
 def claim_for(document: LossRunDocument, finding: Finding) -> Claim | None:
     """The claim a finding is about, or None where it is about the document.
 
-    Findings carry the row's identity, so this is a lookup rather than a
-    search. The claim-number fallback is for findings a rule raises about a
-    *number* rather than a row — R-11's duplicate is about both rows at once —
-    and for anything constructed before the identity existed.
+    Findings about one physical row carry that row's identity. Group and
+    document findings deliberately return no claim: choosing the first row
+    sharing a number recreates the duplicate-number bug.
     """
-    if finding.subject:
+    if finding.scope is FindingScope.CLAIM:
         for claim in document.claims:
             if claim.row_id == finding.subject:
-                return claim
-    if finding.claim_number:
-        for claim in document.claims:
-            if claim.claim_number == finding.claim_number:
                 return claim
     return None
 
@@ -1337,9 +1372,10 @@ def to_records(
         for name in names:
             value = getattr(claim, name, None)
             if isinstance(value, Decimal):
-                # float is presentation only; apply_edits converts back through
-                # str() so no float artefact ever reaches a reconciliation.
-                row[name] = float(value)
+                # Keep the exact decimal spelling through the UI boundary.
+                # Streamlit numbers are binary floats and cannot preserve
+                # either arbitrary precision or the carrier's written scale.
+                row[name] = format(value, "f")
             elif hasattr(value, "value"):
                 row[name] = value.value
             else:
@@ -1428,6 +1464,15 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
+def _audit_value(claim: Claim, field_name: str) -> str:
+    """A value and, when null, the reason needed to reconstruct its meaning."""
+    value = getattr(claim, field_name, None)
+    if value is not None:
+        return _as_text(value)
+    reason = claim.field_issues.get(field_name, NullReason.EMPTY)
+    return f"null ({reason.value})"
+
+
 def apply_edits(
     document: LossRunDocument,
     records: Sequence[dict[str, Any]],
@@ -1446,9 +1491,8 @@ def apply_edits(
     the main editing surface and not a side door: a carrier's figure replaced
     in the grid is the same act as one corrected against a finding, and an
     export that shows the second and not the first is not an audit trail. A
-    deleted row is recorded with what it held, since that is the one change
-    nothing downstream can notice — no finding survives to name it, and R-05
-    only catches it when the carrier printed a claim count.
+    removed row is refused: a short audit summary cannot replace its complete
+    carrier evidence, and R-05 only notices when a printed count exists.
 
     ``audit=False`` is for :func:`resolve_finding`, which records the same
     change against the finding it was made about and would otherwise log it
@@ -1464,6 +1508,18 @@ def apply_edits(
     # a duplicate -- and with it the printed cell text, the region on the page
     # and the reasons its nulls are null.
     by_identity = {claim.row_id: claim for claim in document.claims if claim.row_id}
+    if any(ROW_ID_COLUMN in record for record in records):
+        returned_ids = {
+            str(record.get(ROW_ID_COLUMN) or "") for record in records
+            if record.get(ROW_ID_COLUMN)
+        }
+        removed = [claim for row_id, claim in by_identity.items() if row_id not in returned_ids]
+        if removed:
+            named = ", ".join(f"{claim.claim_number} ({claim.where()})" for claim in removed)
+            raise ValueError(
+                "Claim rows cannot be deleted because that would discard carrier "
+                f"evidence. Restore the row before continuing: {named}."
+            )
     originals = {
         (claim.source_page, claim.source_row, claim.claim_number): claim
         for claim in document.claims
@@ -1494,21 +1550,37 @@ def apply_edits(
         touched: list[str] = []
         originals_read = dict(original.original_values) if original else {}
         issues_read = dict(original.original_issues) if original else {}
-        fields: dict[str, Any] = {}
+        fields: dict[str, Any] = original.model_dump(exclude={
+            "claim_number", "row_id", "source_page", "source_row", "source_bbox",
+            "source_lines", "edited_fields", "original_values", "original_issues",
+            "read_method", "source_method", "field_issues", "field_confidence",
+            "raw_cells", "currency",
+        }) if original else {}
 
         for name, value in record.items():
             if name in PROVENANCE_COLUMNS or name == "claim_number":
                 continue
-            if name not in Claim.model_fields:
+            if name not in REVIEW_COLUMNS:
                 continue
-            coerced, reason = _coerce(name, value, locale, date_order)
             previous = getattr(original, name, None) if original else None
+            if (isinstance(previous, Decimal) and isinstance(value, str)
+                    and value == format(previous, "f")):
+                # Canonical text already on the screen is not fresh locale
+                # input. In an EU document, 1.234 may otherwise become 1234.
+                coerced, reason = previous, None
+            else:
+                coerced, reason = _coerce(name, value, locale, date_order)
             # A figure the reviewer did not touch keeps the scale it was read
             # at. The table round-trips money through float, so 8,400.00 comes
             # back as 8400.0 -- the same amount, spelled with less of what the
             # carrier printed, on a row nobody edited.
             fields[name] = previous if coerced == previous else coerced
-            if coerced != previous:
+            explicit_null_change = (
+                coerced is None and previous is None and reason is not None
+                and isinstance(value, str) and bool(value.strip())
+                and reason != issues.get(name, NullReason.EMPTY)
+            )
+            if coerced != previous or explicit_null_change:
                 edited = True
                 touched.append(name)
                 # What the extractor read, kept before the correction lands on
@@ -1574,6 +1646,12 @@ def apply_edits(
             )
         )
 
+    retained_ids = {claim.row_id for claim in claims if claim.row_id}
+    if any(claim.row_id not in retained_ids for claim in document.claims):
+        raise ValueError(
+            "Claim rows cannot be deleted or have their claim number cleared; "
+            "restore the row so its carrier evidence remains available."
+        )
     updated = document.model_copy(deep=True)
     updated.claims = claims
     if audit:
@@ -1634,8 +1712,8 @@ def _record_edits(
             )
             continue
         for field_name in current.edited_fields:
-            was_value = _as_text(getattr(previous, field_name, None))
-            now_value = _as_text(getattr(current, field_name, None))
+            was_value = _audit_value(previous, field_name)
+            now_value = _audit_value(current, field_name)
             if was_value == now_value:
                 continue
             document.review_log.record(

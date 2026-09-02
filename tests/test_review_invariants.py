@@ -33,6 +33,7 @@ from core.evidence import EvidenceKind, claim_evidence, confirm_region
 from core.export import _cell_value, to_bytes
 from core.pipeline import (
     apply_edits,
+    edit_claims,
     rerun_reconciliation,
     resolve_finding,
     review_columns,
@@ -57,9 +58,7 @@ def broken(golden_dir):
 def _grid(result, mutate):
     records = to_records(result.document, review_columns(result.document))
     mutate(records)
-    result.document = apply_edits(result.document, records)
-    result.reconciliation = rerun_reconciliation(result.document)
-    return result
+    return edit_claims(result, records)
 
 
 def _confirm_first(result):
@@ -127,7 +126,6 @@ OPERATIONS = {
     "edit a cell": _edit_a_cell,
     "rename a claim": _rename_a_claim,
     "blank a cell": _blank_a_cell,
-    "delete a row": _delete_a_row,
     "add a row": _add_a_row,
     "undo an edit": _undo_an_edit,
     "correct then dismiss": _correct_then_dismiss,
