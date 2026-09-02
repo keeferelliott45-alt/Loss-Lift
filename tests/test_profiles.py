@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from datetime import date
 
 import pytest
 
-from core.pipeline import run_pipeline, save_confirmed_mapping
+from core.pipeline import (
+    build_claims,
+    build_mapping,
+    run_pipeline,
+    save_confirmed_mapping,
+)
 from core.profiles import (
     CarrierProfile,
     LLMUnavailable,
@@ -26,7 +32,15 @@ from core.profiles import (
     sanitise_profile,
     save_profile,
 )
-from core.schema import CANONICAL_FIELDS
+from core.reconcile import reconcile
+from core.schema import (
+    CANONICAL_FIELDS,
+    Claim,
+    DocumentStatus,
+    LossRunDocument,
+    RawRow,
+    RawTable,
+)
 
 
 class CountingClient:
@@ -198,13 +212,6 @@ def test_saved_profile_contains_only_structure(profiles_dir):
     assert "Alvarez" not in path.read_text()
 
 
-def test_field_for_tolerates_whitespace_and_case(profiles_dir):
-    profile = CarrierProfile(fingerprint="x", column_map={"Claim Number": "claim_number"})
-    assert profile.field_for("Claim Number") == "claim_number"
-    assert profile.field_for("  claim   number ") == "claim_number"
-    assert profile.field_for("Something Else") is None
-
-
 def test_list_profiles_skips_corrupt_files(profiles_dir):
     save_profile(CarrierProfile(fingerprint="good", carrier="Acme Ins"), profiles_dir)
     (profiles_dir / "broken.json").write_text("{not json")
@@ -212,11 +219,233 @@ def test_list_profiles_skips_corrupt_files(profiles_dir):
     assert [p.carrier for p in profiles] == ["Acme Ins"]
 
 
-def test_profile_from_mapping_drops_unmapped_columns():
+def test_profile_from_mapping_preserves_unmapped_column_identity():
     profile = profile_from_mapping(
         "fp", ["Claim Number", "Junk"], {0: "claim_number", 1: None}
     )
-    assert profile.column_map == {"Claim Number": "claim_number"}
+    assert [column.canonical_field for column in profile.columns] == [
+        "claim_number",
+        None,
+    ]
+
+
+# --- Structural source-column identity ------------------------------------
+
+REPEATED_HEADERS = ["Claim Number", "Date of Loss", "Paid", "Total", "Total"]
+REPEATED_MAPPING = {
+    0: "claim_number",
+    1: "date_of_loss",
+    2: "paid_total",
+    3: "reserve_total",
+    4: "incurred_total",
+}
+
+
+def _saved_repeated_profile(profiles_dir):
+    profile = profile_from_mapping(
+        "repeat-total",
+        REPEATED_HEADERS,
+        REPEATED_MAPPING,
+        confirmed_by_human=True,
+    )
+    save_profile(profile, profiles_dir)
+    loaded = load_profile("repeat-total", profiles_dir)
+    assert loaded is not None
+    return profile, loaded
+
+
+def _document_from_profile(profile, cells, headers=REPEATED_HEADERS):
+    mapping = build_mapping(headers, profile, profile.fingerprint)
+    table = RawTable(
+        page=1,
+        headers=list(headers),
+        rows=[RawRow(page=1, cells=list(cells))],
+    )
+    claims, warnings = build_claims([table], mapping, "us", "mdy")
+    assert warnings == []
+    document = LossRunDocument(
+        source_filename="repeated-total.pdf",
+        file_sha256="structure-only",
+        valuation_date=date(2024, 12, 31),
+        policy_period_start=date(2024, 1, 1),
+        policy_period_end=date(2024, 12, 31),
+        claims=claims,
+        column_mapping=mapping.decisions,
+    )
+    return mapping, document
+
+
+def test_identically_labelled_columns_keep_distinct_source_identities(profiles_dir):
+    profile, _ = _saved_repeated_profile(profiles_dir)
+
+    assert [column.canonical_field for column in profile.columns] == [
+        "claim_number",
+        "date_of_loss",
+        "paid_total",
+        "reserve_total",
+        "incurred_total",
+    ]
+    assert [column.source_index for column in profile.columns] == list(range(5))
+
+
+def test_three_total_columns_keep_their_compound_header_identity():
+    headers = [
+        "Claim Number",
+        "Total Reserves",
+        "Total Recoveries",
+        "Total Incurred",
+    ]
+    profile = profile_from_mapping(
+        "compound-totals",
+        headers,
+        {
+            0: "claim_number",
+            1: "reserve_total",
+            2: "recovery_total",
+            3: "incurred_total",
+        },
+    )
+
+    mapping = build_mapping(headers, profile, "compound-totals")
+
+    assert mapping.fields == {
+        0: "claim_number",
+        1: "reserve_total",
+        2: "recovery_total",
+        3: "incurred_total",
+    }
+
+
+def test_repeated_label_profile_round_trip_reproduces_exact_mapping(profiles_dir):
+    _, loaded = _saved_repeated_profile(profiles_dir)
+
+    mapping = build_mapping(REPEATED_HEADERS, loaded, "repeat-total")
+
+    assert mapping.source == "profile"
+    assert mapping.fields == REPEATED_MAPPING
+
+
+def test_reused_profile_maps_new_financial_values_without_loss(profiles_dir):
+    _, loaded = _saved_repeated_profile(profiles_dir)
+
+    mapping, document = _document_from_profile(
+        loaded,
+        ["CLM-0002", "04/15/2024", "200.00", "75.00", "275.00"],
+    )
+    claim = document.claims[0]
+
+    assert mapping.source == "profile"
+    assert claim.paid_total == 200
+    assert claim.reserve_total == 75
+    assert claim.incurred_total == 275
+    assert reconcile(document).status is DocumentStatus.CLEAN
+
+
+@pytest.mark.parametrize(
+    "changed_headers",
+    [
+        REPEATED_HEADERS[:-1],
+        [*REPEATED_HEADERS, "Total"],
+        ["Claim Number", "Paid", "Date of Loss", "Total", "Total"],
+    ],
+    ids=["missing-column", "additional-repeated-column", "changed-order"],
+)
+def test_profile_structure_drift_falls_back_and_requires_review(
+    profiles_dir, changed_headers
+):
+    _, loaded = _saved_repeated_profile(profiles_dir)
+
+    mapping = build_mapping(changed_headers, loaded, "changed-structure")
+    document = LossRunDocument(
+        source_filename="drift.pdf",
+        file_sha256="drift",
+        valuation_date=date(2024, 12, 31),
+        claims=[
+            Claim(
+                claim_number="CLM-DRIFT",
+                date_of_loss=date(2024, 3, 1),
+                incurred_total=100,
+            )
+        ],
+        column_mapping=mapping.decisions,
+    )
+
+    assert mapping.source == "profile_mismatch"
+    assert mapping.is_usable(), "profile drift must fall back, not stop extraction"
+    assert "R-21" in reconcile(document).rule_ids()
+    assert reconcile(document).status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_legacy_unique_header_profile_remains_safe():
+    profile = CarrierProfile(
+        fingerprint="unique-flat",
+        version=1,
+        column_map={
+            "Claim Number": "claim_number",
+            "Paid": "paid_total",
+            "Incurred": "incurred_total",
+        },
+    )
+
+    mapping = build_mapping(
+        ["Claim Number", "Paid", "Incurred"], profile, "unique-flat"
+    )
+
+    assert mapping.source == "profile"
+    assert mapping.fields == {
+        0: "claim_number",
+        1: "paid_total",
+        2: "incurred_total",
+    }
+
+
+def test_legacy_profile_from_repeated_labels_is_invalidated():
+    """Version 1 has already lost which Total meant reserve; do not reinterpret it."""
+    profile = CarrierProfile(
+        fingerprint="legacy-repeated",
+        version=1,
+        column_map={
+            "Claim Number": "claim_number",
+            "Date of Loss": "date_of_loss",
+            "Paid": "paid_total",
+            "Total": "incurred_total",
+        },
+    )
+
+    mapping = build_mapping(REPEATED_HEADERS, profile, "legacy-repeated")
+
+    assert mapping.source == "profile_mismatch"
+    assert any(record.mapping_issue for record in mapping.decisions)
+
+
+def test_profile_that_duplicates_a_canonical_target_is_not_applied():
+    profile = CarrierProfile(
+        fingerprint="duplicate-target",
+        version=1,
+        column_map={"Paid": "paid_total", "Payment": "paid_total"},
+    )
+
+    mapping = build_mapping(["Paid", "Payment"], profile, "duplicate-target")
+
+    assert mapping.source == "profile_mismatch"
+    assert any(record.mapping_issue for record in mapping.decisions)
+
+
+def test_repeated_label_profile_cannot_hide_lost_financial_data(profiles_dir):
+    """Before the fix, reserve 50 vanished and this document returned CLEAN."""
+    _, loaded = _saved_repeated_profile(profiles_dir)
+
+    mapping, document = _document_from_profile(
+        loaded,
+        ["CLM-0001", "03/01/2024", "100.00", "50.00", "100.00"],
+    )
+    claim = document.claims[0]
+    result = reconcile(document)
+
+    assert mapping.fields == REPEATED_MAPPING
+    assert claim.reserve_total == 50
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+    assert "R-01" in result.rule_ids()
 
 
 # --- LLM mapping -----------------------------------------------------------
@@ -372,7 +601,11 @@ def test_saving_a_mapping_records_the_formats_it_learned(golden_dir, profiles_di
     assert profile.date_order == "dmy"
     assert profile.currency == "EUR"
     assert profile.confirmed_by_human is True
-    assert profile.column_map["Total Incurred"] == "incurred_total"
+    incurred = next(
+        column for column in profile.columns
+        if column.source_header == "Total Incurred"
+    )
+    assert incurred.canonical_field == "incurred_total"
 
     reloaded = load_profile(profile.fingerprint, profiles_dir)
     assert reloaded.number_locale == "eu"

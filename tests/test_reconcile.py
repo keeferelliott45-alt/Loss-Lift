@@ -68,7 +68,7 @@ def test_a_clean_document_is_clean():
 
 
 def test_every_rule_is_registered():
-    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 22)]
+    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 23)]
 
 
 def test_a_document_with_no_claims_is_never_clean():
@@ -119,6 +119,49 @@ def test_future_rule_cannot_publish_duplicate_finding_identities(monkeypatch):
 def test_a_document_with_claims_does_not_trip_the_empty_rule():
     result = reconcile(build_doc([good_claim()]))
     assert "R-20" not in {f.rule_id for f in result.findings}
+
+
+def test_one_failed_source_page_blocks_an_otherwise_clean_document():
+    """Processed pages cannot prove what an unreadable source page contained."""
+    document = build_doc(
+        [good_claim()],
+        page_count=3,
+        processed_pages=[1, 3],
+        failed_pages=[2],
+    )
+
+    result = reconcile(document)
+
+    assert [finding.rule_id for finding in result.errors] == ["R-22"]
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_every_successfully_processed_source_page_allows_clean_status():
+    document = build_doc(
+        [good_claim()],
+        page_count=2,
+        processed_pages=[1, 2],
+    )
+
+    result = reconcile(document)
+
+    assert "R-22" not in result.rule_ids()
+    assert result.status is DocumentStatus.CLEAN
+
+
+def test_a_source_page_without_any_recorded_outcome_blocks_clean_status():
+    document = build_doc(
+        [good_claim()],
+        page_count=2,
+        processed_pages=[1],
+    )
+
+    result = reconcile(document)
+
+    finding = next(item for item in result.errors if item.rule_id == "R-22")
+    assert finding.page == 2
+    assert finding.actual == "no processing outcome was recorded"
+    assert result.status is DocumentStatus.NEEDS_REVIEW
 
 
 # --- R-01 ------------------------------------------------------------------

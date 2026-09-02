@@ -29,7 +29,7 @@ from core.extract_vision import (
     vision_enabled,
 )
 from core.pipeline import run_pipeline
-from core.schema import ExtractionMethod, SourceMethod
+from core.schema import DocumentStatus, ExtractionMethod, SourceMethod
 from tests.golden import fixtures as fx
 from tests.golden.generate import cell_text, format_money
 
@@ -213,11 +213,57 @@ def test_without_a_key_the_message_says_what_to_do(golden_dir, monkeypatch):
         extract_page(rendered)
 
 
-def test_one_bad_page_does_not_lose_the_good_ones(golden_dir):
-    payloads = [transcription(fx.SCANNED), "not json at all"]
-    model = StandInModel(lambda call: payloads[min(call - 1, 1)])
-    tables = extract_scanned_pages(golden_dir / "scanned.pdf", [1, 1], client=model)
-    assert len(tables) == 1
+def test_partial_vision_failure_is_returned_with_the_good_pages(golden_dir, tmp_path):
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    path = tmp_path / "three-scans.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    payloads = [
+        transcription(fx.SCANNED),
+        "not json at all",
+        transcription(fx.SCANNED),
+    ]
+    model = StandInModel(lambda call: payloads[call - 1])
+    extraction = extract_scanned_pages(path, [1, 2, 3], client=model)
+
+    assert [table.page for table in extraction] == [1, 3]
+    assert list(extraction.failures) == [2]
+    assert "Page 2" in extraction.failures[2]
+
+
+def test_partial_vision_failure_reaches_pipeline_reconciliation(
+    golden_dir, tmp_path
+):
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    path = tmp_path / "three-scans.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    payloads = [
+        transcription(fx.SCANNED),
+        "not json at all",
+        transcription(fx.SCANNED),
+    ]
+    model = StandInModel(lambda call: payloads[call - 1])
+    result = run_pipeline(path, use_vision=True, vision_extractor=_extractor(model))
+
+    assert result.document.processed_pages == [1, 3]
+    assert result.document.failed_pages == [2]
+    assert result.document.skipped_pages == []
+    assert any("Page 2" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_all_pages_failing_is_reported(golden_dir):
@@ -244,6 +290,9 @@ def test_a_scanned_document_extracts_through_vision(golden_dir, scanned_model):
     document = result.document
     assert document.extraction_method is ExtractionMethod.VISION
     assert document.scanned_pages == [1]
+    assert document.processed_pages == [1]
+    assert document.failed_pages == []
+    assert document.skipped_pages == []
     assert len(document.claims) == len(fx.SCANNED.claims)
     assert document.claims[0].claim_number == "GL-2024-0001"
 
@@ -316,7 +365,51 @@ def test_footer_totals_from_a_scan_still_drive_r04(golden_dir, scanned_model):
 def test_vision_off_says_what_was_skipped(golden_dir):
     result = run_pipeline(golden_dir / "scanned.pdf", use_vision=False)
     assert result.document.claims == []
+    assert result.document.processed_pages == []
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == [1]
     assert any("scans" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+
+
+def test_a_successfully_processed_irrelevant_page_is_not_a_failure(
+    golden_dir, tmp_path
+):
+    document = pymupdf.open(golden_dir / "us_basic.pdf")
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "This intentionally irrelevant cover page contains no claim table. "
+        "It was still processed successfully.",
+    )
+    path = tmp_path / "claims-and-cover.pdf"
+    document.save(path)
+    document.close()
+
+    result = run_pipeline(path, use_vision=False)
+
+    assert result.document.processed_pages == [1, 2]
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == []
+    assert 2 not in {table.page for table in result.tables}
+    assert result.reconciliation.status is DocumentStatus.CLEAN
+
+
+def test_a_fully_failed_extraction_preserves_every_failed_page(golden_dir):
+    def failing(pdf_path, pages, **kwargs):
+        raise VisionUnavailable("Page 1: the vision call failed (503).")
+
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=failing,
+    )
+
+    assert result.document.processed_pages == []
+    assert result.document.failed_pages == [1]
+    assert result.document.skipped_pages == []
+    assert {"R-20", "R-22"} <= set(result.reconciliation.rule_ids())
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_failing_vision_pass_does_not_lose_the_digital_pages(golden_dir, tmp_path):
@@ -337,7 +430,12 @@ def test_a_failing_vision_pass_does_not_lose_the_digital_pages(golden_dir, tmp_p
     assert result.classification.extraction_method is ExtractionMethod.MIXED
     assert result.classification.scanned_pages == [2]
     assert len(result.document.claims) == 6           # page 1 survived
+    assert result.document.processed_pages == [1]
+    assert result.document.failed_pages == [2]
+    assert result.document.skipped_pages == []
     assert any("503" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_mixed_document_merges_both_paths(golden_dir, tmp_path):
@@ -360,6 +458,9 @@ def test_a_mixed_document_merges_both_paths(golden_dir, tmp_path):
     assert methods == {SourceMethod.DIGITAL, SourceMethod.VISION}
     assert len(result.document.claims) == 6 + len(fx.SCANNED.claims)
     assert result.document.extraction_method is ExtractionMethod.MIXED
+    assert result.document.processed_pages == [1, 2]
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == []
     # Rows stay in page order so the review screen matches the document.
     pages = [claim.source_page for claim in result.document.claims]
     assert pages == sorted(pages)

@@ -151,14 +151,28 @@ def summarise_periods(
 
     if periods:
         summaries: list[PeriodSummary] = []
-        placed: set[int] = set()
-        for start, end in periods:
-            within: list[Claim] = []
-            for index, claim in enumerate(claims):
-                loss = claim.date_of_loss
-                if loss is not None and start <= loss <= end:
-                    within.append(claim)
-                    placed.add(index)
+        period_claims: list[list[Claim]] = [[] for _ in periods]
+        strays: list[Claim] = []
+        ambiguous: list[Claim] = []
+
+        for claim in claims:
+            loss = claim.date_of_loss
+            matches = [
+                index
+                for index, (start, end) in enumerate(periods)
+                if loss is not None and start <= loss <= end
+            ]
+            if len(matches) == 1:
+                period_claims[matches[0]].append(claim)
+            elif matches:
+                # A loss date inside overlapping document-level terms does not
+                # establish which policy covered the claim. Keep it once and
+                # expose the ambiguity rather than manufacturing membership.
+                ambiguous.append(claim)
+            else:
+                strays.append(claim)
+
+        for (start, end), within in zip(periods, period_claims):
             summaries.append(
                 _summarise(
                     f"{start.isoformat()} to {end.isoformat()}",
@@ -171,10 +185,19 @@ def summarise_periods(
 
         # A claim dated outside every declared term still belongs in the book;
         # dropping it would make the summary disagree with the claim table.
-        strays = [claim for index, claim in enumerate(claims) if index not in placed]
         if strays:
             summaries.append(
                 _summarise("Outside any stated term", None, None, strays, None)
+            )
+        if ambiguous:
+            summaries.append(
+                _summarise(
+                    "Unresolved policy term - review required",
+                    None,
+                    None,
+                    ambiguous,
+                    None,
+                )
             )
         return summaries
 

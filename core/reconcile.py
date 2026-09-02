@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Twenty-one rules, each returning zero or more :class:`~core.schema.Finding`
+Twenty-two rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -892,11 +892,29 @@ def r21_ambiguous_column_mapping(
     engine cannot say which column meant what, and guessing is how a reserve
     figure ends up reported as a recovery with nothing to show it happened.
     """
+    findings = [
+        Finding(
+            rule_id="R-21",
+            severity=Severity.ERROR,
+            message=record.mapping_issue,
+            expected="saved source-column structure to match uniquely",
+            actual="profile rejected; conservative mapping used",
+            category=FindingCategory.EXTRACTION,
+            # A rejected profile is a fact about the document's saved format,
+            # not about any one printed column: the record carrying it is a
+            # sentinel standing for the profile itself. Naming a column here
+            # would point a reviewer at a column that is not the problem.
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition="profile-mismatch",
+        )
+        for record in doc.column_mapping
+        if record.mapping_issue
+    ]
     contested = [
         record for record in doc.column_mapping
         if record.state is MappingState.AMBIGUOUS and record.contested_field
     ]
-    findings: list[Finding] = []
     for record in contested:
         label = record.source_header_raw or f"column {record.source_index}"
         findings.append(
@@ -919,6 +937,55 @@ def r21_ambiguous_column_mapping(
                 ),
                 expected=f"one column per {_label(record.contested_field)}",
                 actual=f"{len(contested) + 1} columns claimed it",
+            )
+        )
+    return findings
+
+
+@rule("R-22")
+def r22_incomplete_source_processing(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Incomplete source processing is never trusted as clean."""
+    processed = set(doc.processed_pages)
+    failed = set(doc.failed_pages)
+    skipped = set(doc.skipped_pages)
+    unaccounted = (
+        set(range(1, doc.page_count + 1)) - processed - failed - skipped
+    )
+
+    findings: list[Finding] = []
+    for page in sorted(failed | skipped | unaccounted):
+        if page in failed:
+            outcome = "processing failed"
+        elif page in skipped:
+            outcome = "processing was skipped"
+        else:
+            outcome = "no processing outcome was recorded"
+        findings.append(
+            Finding(
+                rule_id="R-22",
+                severity=Severity.ERROR,
+                # Whether the document could be read at all, so it blocks the
+                # same badge R-06 and R-20 block rather than sitting among the
+                # underwriting flags a reviewer may reasonably wave through.
+                category=FindingCategory.EXTRACTION,
+                # A page is not one of the objects a subject can name, and the
+                # completeness of the source is a property of the document. One
+                # finding per page still needs its own identity, which is what
+                # condition is for: these are independent checks, not one check
+                # restated, and dismissing page 3 must not answer for page 7.
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition=f"page-{page}",
+                page=page,
+                message=(
+                    f"Source page {page} is incomplete: {outcome}. The claims "
+                    "extracted from other pages may reconcile, but this page's "
+                    "contents are unknown and require review."
+                ),
+                expected="source page processed successfully",
+                actual=outcome,
             )
         )
     return findings

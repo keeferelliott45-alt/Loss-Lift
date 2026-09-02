@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from core.schema import Claim, ClaimStatus, LossRunDocument, PrintedSection
 from core.summary import summarise_by_period
 
@@ -115,6 +117,32 @@ def test_claims_outside_every_term_are_still_counted():
     assert sum(period.claims for period in summary) == 4
     assert summary[-1].label == "Outside any stated term"
     assert summary[-1].claims == 1
+
+
+@pytest.fixture()
+def overlapping_term_document() -> LossRunDocument:
+    """A claim date that fits two source terms cannot establish membership."""
+    return _document(
+        policy_periods=[
+            (date(2023, 1, 1), date(2023, 12, 31)),
+            (date(2023, 6, 1), date(2024, 5, 31)),
+        ],
+        claims=[
+            _claim("FIRST-ONLY", date(2023, 3, 1), "100.00"),
+            _claim("OVERLAP", date(2023, 8, 1), "200.00"),
+            _claim("SECOND-ONLY", date(2024, 2, 1), "300.00"),
+        ],
+    )
+
+
+def test_overlapping_terms_never_duplicate_a_claim(overlapping_term_document):
+    """Three normalized claims used to become four summary claims here."""
+    summary = summarise_by_period(overlapping_term_document)
+
+    assert len(overlapping_term_document.claims) == 3
+    assert sum(period.claims for period in summary) == 3
+    assert [period.claims for period in summary] == [1, 1, 1]
+    assert summary[-1].label == "Unresolved policy term - review required"
 
 
 def test_documents_without_declared_terms_group_by_loss_year():
