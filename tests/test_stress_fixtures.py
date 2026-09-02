@@ -197,7 +197,9 @@ def test_claim_numbers_are_the_one_thing_that_did_resolve(golden_dir):
 def test_every_planted_defect_is_caught_and_nothing_extra(golden_dir):
     result = result_for(golden_dir, "stress_dirty_avalanche")
     rule_ids = sorted({f.rule_id for f in result.reconciliation.findings})
-    assert rule_ids == ["R-01", "R-04", "R-05", "R-07", "R-11", "R-15", "R-18"]
+    assert rule_ids == [
+        "R-01", "R-04", "R-05", "R-07", "R-11", "R-15", "R-18", "R-23",
+    ]
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
@@ -208,10 +210,25 @@ def test_na_recovery_is_null_not_zero_amid_the_noise(golden_dir):
     assert claim.issue("recovery_total") is NullReason.NOT_APPLICABLE
 
 
-def test_the_blank_claim_number_row_is_dropped_and_warned(golden_dir):
+def test_the_blank_claim_number_row_keeps_its_money_in_reconciliation(golden_dir):
+    """The planted row has no claim number and $750 of real money on it.
+
+    It is right not to become a claim -- nothing says whose it is. It was not
+    right to leave as a warning: this fixture has been quietly dropping $750
+    since it was written, and the assertion that a warning was enough is what
+    let it. R-23 keeps the amount where a reviewer has to answer for it.
+    """
     result = result_for(golden_dir, "stress_dirty_avalanche")
     assert len(result.document.claims) == 6  # 7 planted, 1 has no claim number
-    assert any("no claim number" in warning for warning in result.warnings)
+
+    dropped = result.document.unplaced_rows
+    assert len(dropped) == 1
+    assert dropped[0].amounts == {"paid_total": "750.00", "incurred_total": "750.00"}
+    assert dropped[0].where().startswith("page 1, line ")
+
+    raised = [f for f in result.reconciliation.findings if f.rule_id == "R-23"]
+    assert len(raised) == 1
+    assert "750.00" in raised[0].message
 
 
 def test_the_unreadable_amount_genuinely_breaks_the_footer_tie(golden_dir):

@@ -261,7 +261,7 @@ def _document_from_profile(profile, cells, headers=REPEATED_HEADERS):
         headers=list(headers),
         rows=[RawRow(page=1, cells=list(cells))],
     )
-    claims, warnings = build_claims([table], mapping, "us", "mdy")
+    claims, warnings, _unplaced = build_claims([table], mapping, "us", "mdy")
     assert warnings == []
     document = LossRunDocument(
         source_filename="repeated-total.pdf",

@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Twenty-two rules, each returning zero or more :class:`~core.schema.Finding`
+Twenty-three rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -1003,6 +1003,83 @@ def r22_incomplete_source_processing(
                 ),
                 expected="source page processed successfully",
                 actual=outcome,
+            )
+        )
+    return findings
+
+
+@rule("R-23")
+def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """Money was read off a row that could not be attached to any claim.
+
+    Narrowly scoped on purpose. This does not ask where the amount belongs, and
+    must not: guessing an owner for a figure is how a reserve ends up reported
+    against the wrong claim. It says only that the app read an amount, could
+    not place it, and will not present the document as complete while that
+    stands.
+
+    The rules that would otherwise notice cannot. R-04 and R-05 check against a
+    printed total or a printed claim count, so a document that prints neither
+    has no anchor at all -- and a spreadsheet paginated by column, its money on
+    one page and its claim numbers on another, prints neither.
+
+    A text-only row stays a warning. Nothing measurable went missing with it,
+    and raising a finding for every stray line would bury the ones that did.
+
+    Nor does a column the carrier vouched for. Where a printed total exists and
+    the extracted claims meet it, that column's money is demonstrably already
+    inside them, whatever else was printed on the page -- a per-claim subtotal,
+    a transaction ledger repeating figures the summary carries, a section total
+    the footer scraper took but the row reader did not. The strongest evidence
+    in the product has already answered, and a second opinion here would say
+    money is missing on a document that ties. So this rule speaks only where
+    R-04 cannot: the anchorless case, where nothing was printed to check the
+    reading against and a dropped amount is invisible to everything else.
+    """
+    accounted = {
+        field_name
+        for field_name, printed in doc.printed_totals.items()
+        if printed is not None
+        and field_name in MONEY_FIELDS
+        and config.within_tolerance(doc.column_total(field_name) - printed)
+    }
+
+    findings: list[Finding] = []
+    for record in doc.unplaced_rows:
+        amounts = {
+            field: text
+            for field, text in record.amounts.items()
+            if field not in accounted
+        }
+        if not amounts:
+            continue
+        printed = ", ".join(
+            f"{_label(field)} {text}" for field, text in sorted(amounts.items())
+        )
+        findings.append(
+            Finding(
+                rule_id="R-23",
+                # Whether the document could be read, not whether its numbers
+                # add up: the figure never reached a column to be added.
+                category=FindingCategory.EXTRACTION,
+                # A printed row is not one of the objects a subject can name,
+                # and completeness of the reading is a property of the
+                # document. Condition carries the row, so two dropped rows are
+                # two findings and clearing one never answers for the other.
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition=f"page-{record.page}-row-{record.row}",
+                severity=Severity.ERROR,
+                page=record.page,
+                message=(
+                    f"Amounts were printed on {record.where()} that could not be "
+                    f"attached to any claim: {printed}. LossLift will not guess "
+                    f"which claim they belong to. Check the page — the row may "
+                    f"be a claim whose number was not read, or a continuation "
+                    f"whose figures belong to the row above."
+                ),
+                expected="every printed amount attached to a claim",
+                actual=printed,
             )
         )
     return findings

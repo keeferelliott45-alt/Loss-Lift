@@ -70,6 +70,7 @@ from core.schema import (
     RawRow,
     RawTable,
     ReconciliationResult,
+    UnplacedRow,
     Resolution,
     SourceMethod,
 )
@@ -356,6 +357,50 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     return clean_text(" ".join(row.cells)) or None
 
 
+#: What tells a printed amount from a bare number sharing its column. Money a
+#: carrier prints carries a separator, a symbol, a sign or a credit marker; a
+#: page number, a year, a count or a claim reference carries none of them.
+#: Requiring one costs a whole-unit amount printed as "9400", which falls back
+#: to the ordinary warning -- the safe direction, since the alternative reports
+#: every stray integer as money nobody placed.
+_MONEY_SHAPED = re.compile(r"[.,()]|[$€£¥]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE)
+
+#: Two numeric runs with space between them are two cells a column boundary
+#: ran together, not one printed amount: "4 .00" is a section marker beside a
+#: fragment, and reading it as 4.00 invents a figure nobody printed. A trailing
+#: credit marker is a word, not a second number, so "1,234.56 CR" still passes.
+_SMEARED = re.compile(r"\d[^\s]*\s+[^\s]*\d")
+
+
+def unplaced_money(
+    row: RawRow, mapping: ColumnMapping, locale: str | None
+) -> dict[str, str]:
+    """Amounts printed under mapped money columns on a row nothing claimed.
+
+    The counterpart of :func:`_continuation_text`, which asks the same question
+    for the opposite purpose: that one folds a row into the claim above when
+    nothing on it parses, this one reports what parsed when the row could not
+    be placed at all. Both read only cells the mapping says are money, so a
+    date, a policy number or a page marker is not eligible however it is
+    written -- the column it sits under is the evidence, and the shape of the
+    text has to agree.
+    """
+    values = _row_values(row, mapping)
+    amounts: dict[str, str] = {}
+    for name in MONEY_FIELDS:
+        text = (values.get(name) or "").strip()
+        if not text or not _MONEY_SHAPED.search(text) or _SMEARED.search(text):
+            continue
+        amount = parse_money(text, locale).value
+        # A zero is not money at risk. Rows of zeros are common -- a closed
+        # claim's reserve columns, a section rule, a cell fragment left by a
+        # column boundary -- and reporting that nothing went missing would
+        # bury the rows where something did.
+        if amount is not None and amount != 0:
+            amounts[name] = text
+    return amounts
+
+
 def accepted_identifier_shapes(
     tables: Sequence[RawTable], mapping: ColumnMapping
 ) -> set[str]:
@@ -454,10 +499,17 @@ def build_claims(
     dash_means_zero: bool = False,
     source_method: SourceMethod = SourceMethod.DIGITAL,
     confidence_cap: float = 1.0,
-) -> tuple[list[Claim], list[str]]:
-    """Normalise every row of every page, folding wrapped lines into their claim."""
+) -> tuple[list[Claim], list[str], list[UnplacedRow]]:
+    """Normalise every row of every page, folding wrapped lines into their claim.
+
+    Rows that carry money and cannot be attached to a claim come back
+    separately from the warnings. A warning is a note to the reader; an amount
+    the app parsed and could not place is a hole in the reading, and only the
+    rules can say so.
+    """
     claims: list[Claim] = []
     warnings: list[str] = []
+    unplaced: list[UnplacedRow] = []
     furniture = page_furniture(tables)
     shapes = accepted_identifier_shapes(tables, mapping)
 
@@ -488,10 +540,7 @@ def build_claims(
                         f"{previous.loss_description or ''} {extra}"
                     )
                 elif extra:
-                    warnings.append(
-                        f"Page {row.page}: skipped a row with no claim number "
-                        f"({extra[:60]})."
-                    )
+                    _record_discard(row, table_mapping, locale, warnings, unplaced, extra)
                 continue
 
             claim = build_claim(
@@ -515,12 +564,35 @@ def build_claims(
                     f"{previous.loss_description or ''} {extra}"
                 )
             elif not row.is_blank():
-                preview = " ".join(cell for cell in row.cells if cell)[:60]
-                warnings.append(
-                    f"Page {row.page}: skipped a row with no claim number "
-                    f"({preview})."
-                )
-    return claims, warnings
+                preview = " ".join(cell for cell in row.cells if cell)
+                _record_discard(row, table_mapping, locale, warnings, unplaced, preview)
+    return claims, warnings, unplaced
+
+
+def _record_discard(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+    warnings: list[str],
+    unplaced: list[UnplacedRow],
+    preview: str,
+) -> None:
+    """Note a row nothing could take, and whether money went with it.
+
+    A text-only row stays a warning: nothing measurable was lost, and raising
+    a finding for every stray line would bury the ones that matter. A row with
+    figures under money columns is recorded on the document instead, where a
+    rule can reach it.
+    """
+    amounts = unplaced_money(row, mapping, locale)
+    if amounts:
+        unplaced.append(
+            UnplacedRow(page=row.page, row=row.line_index, amounts=amounts)
+        )
+        return
+    warnings.append(
+        f"Page {row.page}: skipped a row with no claim number ({preview[:60]})."
+    )
 
 
 def stated_periods(
@@ -974,13 +1046,13 @@ def run_pipeline(
     # column is the better source: it is the document saying so directly, not
     # a guess about which line of the letterhead names the carrier.
     stated = read_document_columns(digital_tables)
-    claims, row_warnings = build_claims(
+    claims, row_warnings, unplaced_rows = build_claims(
         digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero
     )
     warnings.extend(row_warnings)
 
     if vision_tables:
-        vision_claims, vision_warnings = build_claims(
+        vision_claims, vision_warnings, vision_unplaced = build_claims(
             vision_tables, mapping, locale, date_order,
             dash_means_zero=dash_means_zero,
             source_method=SourceMethod.VISION,
@@ -988,6 +1060,7 @@ def run_pipeline(
         )
         claims.extend(vision_claims)
         warnings.extend(vision_warnings)
+        unplaced_rows.extend(vision_unplaced)
         claims.sort(key=lambda claim: (claim.source_page, claim.source_row or 0))
 
     # Document-level facts.
@@ -1128,6 +1201,7 @@ def run_pipeline(
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
+        unplaced_rows=unplaced_rows,
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,

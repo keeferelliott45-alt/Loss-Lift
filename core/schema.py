@@ -525,6 +525,10 @@ class LossRunDocument(BaseModel):
     processed_pages: list[int] = Field(default_factory=list)
     #: Source pages whose attempted extraction did not complete successfully.
     failed_pages: list[int] = Field(default_factory=list)
+    #: Rows carrying printed amounts that could not be attached to any claim.
+    #: Kept on the document rather than in the warning list because money the
+    #: app read and then could not place has to reach reconciliation.
+    unplaced_rows: list["UnplacedRow"] = Field(default_factory=list)
     #: Source pages a vision reader answered for without returning anything.
     #: Kept apart from the three outcomes either side of it because it is a
     #: different fact from each: the request did not fail, the page was not
@@ -1022,6 +1026,38 @@ class RawRow(BaseModel):
 
     def is_blank(self) -> bool:
         return not any(cell.strip() for cell in self.cells)
+
+
+class UnplacedRow(BaseModel):
+    """A printed row carrying amounts that no claim could take.
+
+    The extractor already tells a wrapped description from a line of figures:
+    prose is folded into the claim above it, and a row whose cells parse under
+    mapped money columns is data whose claim number could not be identified.
+    Having drawn that distinction it used to drop the second kind to a warning,
+    and a warning is not a finding -- it never reached the badge, the exceptions
+    or the workbook. An amount the app had itself parsed could therefore sit
+    nowhere at all while the document read as reconciled.
+
+    Only the location and the printed amounts are kept. Whatever else was on
+    the line is left on the page: a reviewer needs to know that money went
+    unplaced and where to look, not to have the row's prose copied into the
+    record.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    #: The printed line, in the same coordinates a claim's ``source_row`` uses,
+    #: so "page 3, line 18" means the same thing for both.
+    row: int | None = None
+    #: Canonical money field -> the text printed under it, verbatim.
+    amounts: dict[str, str] = Field(default_factory=dict)
+
+    def where(self) -> str:
+        if self.row is None:
+            return f"page {self.page}"
+        return f"page {self.page}, line {self.row + 1}"
 
 
 class RawTable(BaseModel):

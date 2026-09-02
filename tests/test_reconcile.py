@@ -68,7 +68,7 @@ def test_a_clean_document_is_clean():
 
 
 def test_every_rule_is_registered():
-    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 23)]
+    assert registered_rule_ids() == [f"R-{i:02d}" for i in range(1, 24)]
 
 
 def test_a_document_with_no_claims_is_never_clean():
