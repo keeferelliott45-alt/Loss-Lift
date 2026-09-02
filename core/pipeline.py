@@ -151,6 +151,7 @@ def build_mapping(
         headers,
         samples,
         profile=profile,
+        fingerprint_value=fingerprint_value,
         use_llm=use_llm,
         client=llm_client,
     )
@@ -173,6 +174,20 @@ def build_mapping(
         )
         for index, guess in sorted(guesses.items())
     ]
+    if source == "profile_mismatch":
+        decisions.append(
+            ColumnMappingRecord(
+                source_index=-1,
+                source_header_raw="Saved profile",
+                source_header_normalized="saved profile",
+                state=MappingState.AMBIGUOUS,
+                mapping_issue=(
+                    "The saved profile's source-column structure does not "
+                    "uniquely match this document. The profile was not applied; "
+                    "normal mapping was used and the result requires review."
+                ),
+            )
+        )
     return ColumnMapping(
         headers=list(headers),
         fields={index: guess.field for index, guess in guesses.items()},
@@ -786,19 +801,50 @@ def run_pipeline(
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
+    processed_pages = set(extraction.page_texts)
+    failed_pages: set[int] = set()
+    skipped_pages: set[int] = set()
 
     scanned_pages = classification.scanned_pages
     vision_tables: list[RawTable] = []
     if scanned_pages and use_vision:
-        from core.extract_vision import VisionUnavailable, extract_scanned_pages
+        from core.extract_vision import (
+            VisionExtraction,
+            VisionUnavailable,
+            extract_scanned_pages,
+        )
 
         extractor = vision_extractor or extract_scanned_pages
         try:
-            vision_tables = list(extractor(ingested.path, scanned_pages))
+            vision_output = extractor(ingested.path, scanned_pages)
+            if isinstance(vision_output, VisionExtraction):
+                vision_tables = list(vision_output.tables)
+                for page, message in vision_output.failures.items():
+                    failed_pages.add(page)
+                    warnings.append(message)
+            else:
+                # Preserve compatibility with injected extractors that return
+                # tables directly. A requested page they do not return is not
+                # evidence of successful processing.
+                vision_tables = list(vision_output)
+
+            successful_vision_pages = {table.page for table in vision_tables}
+            processed_pages.update(successful_vision_pages)
+            unreturned = (
+                set(scanned_pages) - successful_vision_pages - failed_pages
+            )
+            if unreturned:
+                failed_pages.update(unreturned)
+                joined = ", ".join(str(page) for page in sorted(unreturned))
+                warnings.append(
+                    f"Vision extraction returned no result for page(s) {joined}."
+                )
             tables.extend(vision_tables)
         except VisionUnavailable as error:
+            failed_pages.update(scanned_pages)
             warnings.append(str(error))
     elif scanned_pages:
+        skipped_pages.update(scanned_pages)
         warnings.append(
             f"{len(scanned_pages)} page(s) are scans and were not read. "
             f"Turn on vision extraction to include them."
@@ -1009,6 +1055,9 @@ def run_pipeline(
         page_count=classification.page_count,
         extraction_method=classification.extraction_method,
         scanned_pages=scanned_pages,
+        processed_pages=sorted(processed_pages),
+        failed_pages=sorted(failed_pages),
+        skipped_pages=sorted(skipped_pages),
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,

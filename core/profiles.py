@@ -33,7 +33,7 @@ PROFILE_DIR = Path(__file__).resolve().parent.parent / "data" / "profiles"
 #: Fraction of page 1 used for the fingerprint — the letterhead block.
 FINGERPRINT_TOP_FRACTION = 0.15
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 
 
 # --------------------------------------------------------------------------
@@ -487,6 +487,7 @@ PROFILE_WHITELIST: frozenset[str] = frozenset(
         "carrier",
         "profile_name",
         "column_map",
+        "columns",
         "header_row_index",
         "date_order",
         "number_locale",
@@ -509,6 +510,24 @@ class ProfileError(ValueError):
     """A profile is malformed or would carry claim data."""
 
 
+@dataclass(frozen=True)
+class ProfileColumn:
+    """One source column's stable identity within a format fingerprint."""
+
+    source_index: int
+    source_header: str
+    source_header_normalized: str
+    canonical_field: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_index": self.source_index,
+            "source_header": self.source_header,
+            "source_header_normalized": self.source_header_normalized,
+            "canonical_field": self.canonical_field,
+        }
+
+
 @dataclass
 class CarrierProfile:
     """A saved carrier format: structure only, never claim data."""
@@ -516,8 +535,10 @@ class CarrierProfile:
     fingerprint: str
     carrier: str | None = None
     profile_name: str | None = None
-    #: printed column label -> canonical field name
+    #: Version-1 label mapping, retained only for provably safe old profiles.
     column_map: dict[str, str] = field(default_factory=dict)
+    #: Version-2 ordered source-column identities, including unmapped columns.
+    columns: list[ProfileColumn] = field(default_factory=list)
     header_row_index: int | None = None
     date_order: str | None = None
     number_locale: str | None = None
@@ -535,46 +556,45 @@ class CarrierProfile:
     times_used: int = 0
     version: int = PROFILE_VERSION
 
-    def field_for(self, label: str) -> str | None:
-        """Look up a column label, tolerating whitespace and case drift."""
-        if label in self.column_map:
-            return self.column_map[label]
-        target = normalize_label(label)
-        for saved_label, saved_field in self.column_map.items():
-            if normalize_label(saved_label) == target:
-                return saved_field
-        return None
+    def __post_init__(self) -> None:
+        # Programmatic callers using the old constructor are creating a
+        # version-1 profile. Never present its label dictionary as version 2.
+        if self.column_map and not self.columns and self.version == PROFILE_VERSION:
+            self.version = 1
 
     def to_dict(self) -> dict[str, Any]:
-        return sanitise_profile(
-            {
-                "version": self.version,
-                "fingerprint": self.fingerprint,
-                "carrier": self.carrier,
-                "profile_name": self.profile_name,
-                "column_map": dict(self.column_map),
-                "header_row_index": self.header_row_index,
-                "date_order": self.date_order,
-                "number_locale": self.number_locale,
-                "negative_convention": self.negative_convention,
-                "recovery_convention": self.recovery_convention,
-                "dash_means_zero": self.dash_means_zero,
-                "total_row_pattern": self.total_row_pattern,
-                "money_tolerance": self.money_tolerance,
-                "currency": self.currency,
-                "line_of_business": self.line_of_business,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
-                "confirmed_by_human": self.confirmed_by_human,
-                "times_used": self.times_used,
-            }
-        )
+        payload = {
+            "version": self.version,
+            "fingerprint": self.fingerprint,
+            "carrier": self.carrier,
+            "profile_name": self.profile_name,
+            "header_row_index": self.header_row_index,
+            "date_order": self.date_order,
+            "number_locale": self.number_locale,
+            "negative_convention": self.negative_convention,
+            "recovery_convention": self.recovery_convention,
+            "dash_means_zero": self.dash_means_zero,
+            "total_row_pattern": self.total_row_pattern,
+            "money_tolerance": self.money_tolerance,
+            "currency": self.currency,
+            "line_of_business": self.line_of_business,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "confirmed_by_human": self.confirmed_by_human,
+            "times_used": self.times_used,
+        }
+        if self.version == 1:
+            payload["column_map"] = dict(self.column_map)
+        else:
+            payload["columns"] = [column.to_dict() for column in self.columns]
+        return sanitise_profile(payload)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "CarrierProfile":
         clean = sanitise_profile(payload)
-        clean.pop("version", None)
-        return cls(version=PROFILE_VERSION, **clean)
+        version = clean.pop("version", 1)
+        columns = [ProfileColumn(**column) for column in clean.pop("columns", [])]
+        return cls(version=version, columns=columns, **clean)
 
 
 def sanitise_profile(payload: dict[str, Any]) -> dict[str, Any]:
@@ -591,6 +611,12 @@ def sanitise_profile(payload: dict[str, Any]) -> dict[str, Any]:
             f"write unexpected key(s): {', '.join(sorted(unexpected))}"
         )
 
+    version = payload.get("version", 1)
+    if version not in {1, PROFILE_VERSION}:
+        raise ProfileError(
+            f"profile version {version!r} is unsupported; relearn this format"
+        )
+
     column_map = payload.get("column_map") or {}
     if not isinstance(column_map, dict):
         raise ProfileError("column_map must be a mapping of label -> field")
@@ -603,8 +629,46 @@ def sanitise_profile(payload: dict[str, Any]) -> dict[str, Any]:
                 f"canonical field"
             )
 
+    columns = payload.get("columns") or []
+    if not isinstance(columns, list):
+        raise ProfileError("columns must be an ordered list of source columns")
+    seen_indices: set[int] = set()
+    for column in columns:
+        if not isinstance(column, dict):
+            raise ProfileError("each profile column must be a mapping")
+        if set(column) != {
+            "source_index",
+            "source_header",
+            "source_header_normalized",
+            "canonical_field",
+        }:
+            raise ProfileError("profile columns contain unexpected structure")
+        index = column["source_index"]
+        header = column["source_header"]
+        normalized = column["source_header_normalized"]
+        field_name = column["canonical_field"]
+        if not isinstance(index, int) or index < 0 or index in seen_indices:
+            raise ProfileError("profile source column indices must be unique")
+        if not isinstance(header, str) or not isinstance(normalized, str):
+            raise ProfileError("profile source column headers must be strings")
+        if normalize_label(header) != normalized:
+            raise ProfileError("profile normalized header does not match its source")
+        if field_name is not None and field_name not in CANONICAL_FIELDS:
+            raise ProfileError(
+                f"profile column points at non-canonical field {field_name!r}"
+            )
+        seen_indices.add(index)
+
+    if version == 1 and columns:
+        raise ProfileError("version-1 profiles cannot contain version-2 columns")
+    if version == PROFILE_VERSION and column_map:
+        raise ProfileError("version-2 profiles cannot use a label-keyed column_map")
+
     clean = {key: payload.get(key) for key in payload}
-    clean["column_map"] = dict(column_map)
+    if "column_map" in payload:
+        clean["column_map"] = dict(column_map)
+    if "columns" in payload:
+        clean["columns"] = [dict(column) for column in columns]
     return clean
 
 
@@ -670,16 +734,21 @@ def profile_from_mapping(
     confirmed_by_human: bool = False,
 ) -> CarrierProfile:
     """Build a profile from the mapping screen's column choices."""
-    column_map = {
-        headers[index]: field_name
-        for index, field_name in mapping.items()
-        if field_name and 0 <= index < len(headers)
-    }
+    columns = [
+        ProfileColumn(
+            source_index=index,
+            source_header=header,
+            source_header_normalized=normalize_label(header),
+            canonical_field=mapping.get(index),
+        )
+        for index, header in enumerate(headers)
+    ]
     return CarrierProfile(
+        version=PROFILE_VERSION,
         fingerprint=fingerprint_value,
         carrier=carrier,
         profile_name=carrier or "Unnamed carrier format",
-        column_map=column_map,
+        columns=columns,
         date_order=date_order,
         number_locale=number_locale,
         recovery_convention=recovery_convention,
@@ -820,41 +889,92 @@ def llm_map_columns(
     return parse_llm_mapping(text, headers)
 
 
+def _profile_guesses(
+    headers: Sequence[str],
+    profile: CarrierProfile,
+    fingerprint_value: str,
+) -> dict[int, FieldGuess] | None:
+    """Apply a profile only when its complete source structure still matches."""
+    if fingerprint_value and profile.fingerprint != fingerprint_value:
+        return None
+
+    normalized_headers = [normalize_label(header) for header in headers]
+    if profile.version == PROFILE_VERSION:
+        columns = sorted(profile.columns, key=lambda column: column.source_index)
+        if [column.source_index for column in columns] != list(range(len(headers))):
+            return None
+        if [column.source_header_normalized for column in columns] != normalized_headers:
+            return None
+        fields = [column.canonical_field for column in columns]
+        claimed = [field_name for field_name in fields if field_name]
+        if len(claimed) != len(set(claimed)):
+            return None
+        return {
+            index: (
+                FieldGuess(field_name, 1.0, "profile")
+                if field_name
+                else FieldGuess(None, 0.0, "unmapped")
+            )
+            for index, field_name in enumerate(fields)
+        }
+
+    # Version 1 did not store indices or the complete header sequence. It is
+    # safe only for a matching fingerprint whose labels and targets are both
+    # unique; repeated-label profiles are invalidated and must be relearned.
+    if profile.version != 1 or not fingerprint_value:
+        return None
+    if len(normalized_headers) != len(set(normalized_headers)):
+        return None
+    saved: dict[str, str] = {}
+    for label, field_name in profile.column_map.items():
+        normalized = normalize_label(label)
+        if normalized in saved:
+            return None
+        saved[normalized] = field_name
+    if len(saved.values()) != len(set(saved.values())):
+        return None
+    if not set(saved).issubset(normalized_headers):
+        return None
+    return {
+        index: (
+            FieldGuess(saved[header], 1.0, "profile")
+            if header in saved
+            else FieldGuess(None, 0.0, "unmapped")
+        )
+        for index, header in enumerate(normalized_headers)
+    }
+
+
 def resolve_columns(
     headers: Sequence[str],
     sample_rows: Sequence[Sequence[str]] = (),
     *,
     profile: CarrierProfile | None = None,
+    fingerprint_value: str = "",
     use_llm: bool = False,
     client: Any | None = None,
 ) -> tuple[dict[int, FieldGuess], str]:
     """Map headers by profile, then vocabulary, then — only if asked — the LLM.
 
-    Returns the guesses and which source settled it.  A saved profile short
-    circuits everything, which is the point: the fortieth document from a
-    carrier costs nothing.
+    Returns the guesses and which source settled it. A structurally matching
+    saved profile short circuits everything; a mismatch falls back to normal
+    discovery and is surfaced for review by the mapping record.
     """
+    profile_mismatch = profile is not None
     if profile is not None:
-        guesses = {
-            index: (
-                FieldGuess(profile.field_for(header), 1.0, "profile")
-                if profile.field_for(header)
-                else FieldGuess(None, 0.0, "unmapped")
-            )
-            for index, header in enumerate(headers)
-        }
-        if any(guess.field for guess in guesses.values()):
+        guesses = _profile_guesses(headers, profile, fingerprint_value)
+        if guesses is not None and any(guess.field for guess in guesses.values()):
             return guesses, "profile"
 
     guesses = map_headers(headers)
     unmapped = [index for index, guess in guesses.items() if guess.field is None]
     if not unmapped or not use_llm:
-        return guesses, "heuristic"
+        return guesses, "profile_mismatch" if profile_mismatch else "heuristic"
 
     try:
         llm_guesses = llm_map_columns(headers, sample_rows, client=client)
     except LLMUnavailable:
-        return guesses, "heuristic"
+        return guesses, "profile_mismatch" if profile_mismatch else "heuristic"
 
     # The vocabulary is deterministic and reviewed; it wins any disagreement.
     claimed = {guess.field for guess in guesses.values() if guess.field}
@@ -863,4 +983,4 @@ def resolve_columns(
         if candidate and candidate.field and candidate.field not in claimed:
             guesses[index] = candidate
             claimed.add(candidate.field)
-    return guesses, "llm"
+    return guesses, "profile_mismatch" if profile_mismatch else "llm"

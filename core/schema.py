@@ -310,6 +310,8 @@ class ColumnMappingRecord(BaseModel):
     state: MappingState = MappingState.UNMAPPED
     #: The field this column wanted when another column won it.
     contested_field: str | None = None
+    #: Structural mapping problem not attributable to one current source cell.
+    mapping_issue: str | None = None
 
 
 class PrintedSection(BaseModel):
@@ -378,6 +380,12 @@ class LossRunDocument(BaseModel):
     #: are normalised to positive so R-01's subtraction means what it says.
     recovery_convention: str | None = None
     scanned_pages: list[int] = Field(default_factory=list)
+    #: Source pages successfully inspected, including pages with no claim table.
+    processed_pages: list[int] = Field(default_factory=list)
+    #: Source pages whose attempted extraction did not complete successfully.
+    failed_pages: list[int] = Field(default_factory=list)
+    #: Source pages deliberately not attempted, such as scans with vision off.
+    skipped_pages: list[int] = Field(default_factory=list)
     extracted_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

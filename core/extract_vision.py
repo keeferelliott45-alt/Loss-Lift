@@ -22,7 +22,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import pymupdf
 
@@ -64,6 +64,20 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 
 class VisionUnavailable(RuntimeError):
     """Vision extraction was asked for but cannot run."""
+
+
+@dataclass
+class VisionExtraction:
+    """Successful page tables plus failures from the same vision batch."""
+
+    tables: list[RawTable]
+    failures: dict[int, str]
+
+    def __iter__(self) -> Iterator[RawTable]:
+        return iter(self.tables)
+
+    def __len__(self) -> int:
+        return len(self.tables)
 
 
 @dataclass
@@ -224,20 +238,20 @@ def extract_scanned_pages(
     client: Any | None = None,
     model: str | None = None,
     dpi: int = RENDER_DPI,
-) -> list[RawTable]:
+) -> VisionExtraction:
     """Extract every scanned page of a document.
 
-    A page that fails is skipped rather than failing the whole document: the
-    digital pages are still worth having, and R-05 will report the rows that
-    are missing.
+    Successful pages remain usable when another page fails, but every partial
+    failure is returned with them so reconciliation can preserve the resulting
+    source uncertainty. A batch in which every page fails is still unavailable.
     """
     tables: list[RawTable] = []
-    failures: list[str] = []
+    failures: dict[int, str] = {}
     for rendered in render_pages(path, pages, dpi):
         try:
             tables.append(extract_page(rendered, client=client, model=model))
         except VisionUnavailable as error:
-            failures.append(str(error))
+            failures[rendered.page] = str(error)
     if not tables and failures:
-        raise VisionUnavailable(" ".join(failures))
-    return tables
+        raise VisionUnavailable(" ".join(failures.values()))
+    return VisionExtraction(tables=tables, failures=failures)
