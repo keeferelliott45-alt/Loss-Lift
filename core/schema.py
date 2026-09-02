@@ -525,6 +525,15 @@ class LossRunDocument(BaseModel):
     processed_pages: list[int] = Field(default_factory=list)
     #: Source pages whose attempted extraction did not complete successfully.
     failed_pages: list[int] = Field(default_factory=list)
+    #: Source pages a vision reader answered for without returning anything.
+    #: Kept apart from the three outcomes either side of it because it is a
+    #: different fact from each: the request did not fail, the page was not
+    #: skipped, and nothing was read. A model handed a poor scan usually
+    #: returns well-formed JSON with no rows rather than raising, which looks
+    #: exactly like a page that genuinely holds no claim table. Only a
+    #: deterministic reader can establish that; a model declining to find
+    #: anything is not evidence that there was nothing to find.
+    unresolved_pages: list[int] = Field(default_factory=list)
     #: Source pages deliberately not attempted, such as scans with vision off.
     skipped_pages: list[int] = Field(default_factory=list)
     extracted_at: datetime = Field(

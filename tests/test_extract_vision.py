@@ -17,6 +17,7 @@ import pytest
 
 from core.extract_vision import (
     RENDER_DPI,
+    VisionExtraction,
     RESPONSE_SCHEMA,
     VISION_CONFIDENCE_CAP,
     VisionUnavailable,
@@ -29,7 +30,7 @@ from core.extract_vision import (
     vision_enabled,
 )
 from core.pipeline import run_pipeline
-from core.schema import DocumentStatus, ExtractionMethod, SourceMethod
+from core.schema import DocumentStatus, ExtractionMethod, RawTable, SourceMethod
 from tests.golden import fixtures as fx
 from tests.golden.generate import cell_text, format_money
 
@@ -480,3 +481,173 @@ def test_live_gemini_reads_the_scanned_fixture(golden_dir):  # pragma: no cover
     assert table.rows
     numbers = {cell for row in table.rows for cell in row.cells}
     assert any("15,700.50" in cell for cell in numbers)
+
+
+# --------------------------------------------------------------------------
+# An empty vision result is not a reading
+# --------------------------------------------------------------------------
+#
+# A model handed a poor scan does not usually raise. It returns well-formed
+# JSON with an empty row list, which is the same shape as a page that genuinely
+# holds no claim table. The two are not the same fact: one is a reading, the
+# other is a model declining to find anything, and only the first is evidence.
+#
+# The distinction these tests hold open is between four different page
+# outcomes, none of which may wear another's clothes: a deterministic reader
+# that saw the whole page and found no table; a vision reader that returned
+# rows; a vision reader that returned nothing; and a vision request that failed
+# or never answered for the page at all.
+
+
+def _scan_behind_a_clean_page(golden_dir, tmp_path, name):
+    """A digital page that reconciles on its own, followed by a scan.
+
+    The digital page carries its own footer totals and printed claim count, so
+    it ties perfectly without the scan. That is what makes the document
+    dangerous: everything the engine can check passes, and the only unresolved
+    thing on it is a page nobody has read.
+    """
+    document = pymupdf.open(golden_dir / "us_basic.pdf")
+    scan = pymupdf.open(golden_dir / "scanned.pdf")
+    document.insert_pdf(scan)
+    path = tmp_path / name
+    document.save(path)
+    document.close()
+    scan.close()
+    return path
+
+
+def _returns(tables, failures=None):
+    def extractor(pdf_path, pages, **kwargs):
+        return VisionExtraction(tables=list(tables), failures=dict(failures or {}))
+
+    return extractor
+
+
+def test_an_empty_vision_result_does_not_make_a_document_clean(
+    golden_dir, tmp_path
+):
+    """The case that started this: page 1 ties, page 2 is asserted empty."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "clean-page-then-scan.pdf")
+    baseline = run_pipeline(path, use_vision=False)
+    assert baseline.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=2, headers=["Claim No"], rows=[])]),
+    )
+
+    assert result.document.claims, "page 1's claims are still read"
+    assert not [f for f in result.reconciliation.findings if f.rule_id in {"R-04", "R-05"}], (
+        "page 1 reconciles against its own printed totals"
+    )
+    assert 2 not in result.document.processed_pages
+    assert result.document.unresolved_pages == [2]
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_an_empty_vision_result_carrying_headers_still_proves_nothing(
+    golden_dir, tmp_path
+):
+    """Headers and metadata are not rows. A shape is not a reading."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "headers-only-scan.pdf")
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([
+            RawTable(
+                page=2,
+                headers=["Claim Number", "Date of Loss", "Paid", "Incurred"],
+                rows=[],
+            )
+        ]),
+    )
+    assert result.document.unresolved_pages == [2]
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_wholly_scanned_document_read_as_empty_is_not_clean(golden_dir):
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=1, headers=["Claim No"], rows=[])]),
+    )
+    assert result.document.processed_pages == []
+    assert result.document.unresolved_pages == [1]
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_vision_page_that_returns_rows_is_processed(golden_dir):
+    model = StandInModel(transcription(fx.SCANNED))
+    result = run_pipeline(
+        golden_dir / "scanned.pdf", use_vision=True, vision_extractor=_extractor(model)
+    )
+    assert result.document.processed_pages == [1]
+    assert result.document.unresolved_pages == []
+    assert result.document.failed_pages == []
+    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-22"]
+
+
+def test_a_mixed_batch_keeps_every_page_outcome_apart(golden_dir, tmp_path):
+    """Rows on one page, nothing on the next, a failure on the third."""
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    for _ in range(3):
+        three_pages.insert_pdf(source)
+    path = tmp_path / "three-outcomes.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    read = extract_scanned_pages(
+        path, [1], client=StandInModel(transcription(fx.SCANNED))
+    ).tables[0]
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns(
+            [read, RawTable(page=2, headers=["Claim No"], rows=[])],
+            {3: "Page 3: the vision call failed (503)."},
+        ),
+    )
+
+    assert result.document.processed_pages == [1]
+    assert result.document.unresolved_pages == [2]
+    assert result.document.failed_pages == [3]
+    assert result.document.skipped_pages == []
+    pages = {
+        f.page for f in result.reconciliation.findings if f.rule_id == "R-22"
+    }
+    assert pages == {2, 3}, "each unread page is named separately"
+
+
+def test_an_unresolved_page_reads_differently_from_a_failed_one(
+    golden_dir, tmp_path
+):
+    """Four outcomes, four messages. None may be mistaken for another."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "outcome-wording.pdf")
+    empty = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=2, headers=[], rows=[])]),
+    )
+    failed = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([], {2: "Page 2: the vision call failed (503)."}),
+    )
+    skipped = run_pipeline(path, use_vision=False)
+
+    def message(result):
+        return next(
+            f.message for f in result.reconciliation.findings if f.rule_id == "R-22"
+        )
+
+    assert "returned no rows" in message(empty)
+    assert "not evidence" in message(empty)
+    assert "processing failed" in message(failed)
+    assert "skipped" in message(skipped)
+    assert len({message(empty), message(failed), message(skipped)}) == 3

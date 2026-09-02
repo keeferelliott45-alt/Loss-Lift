@@ -946,20 +946,37 @@ def r21_ambiguous_column_mapping(
 def r22_incomplete_source_processing(
     doc: LossRunDocument, config: ReconcileConfig
 ) -> list[Finding]:
-    """Incomplete source processing is never trusted as clean."""
+    """Incomplete source processing is never trusted as clean.
+
+    Four ways a page can fail to be read, kept apart because they are four
+    different facts and a reviewer acts on each differently. A failed request
+    can be retried; a skipped scan needs vision turned on; a page with no
+    recorded outcome is a bug in the accounting. The fourth is the quiet one:
+    a vision reader answered and returned nothing. That is not a reading, and
+    treating it as one lets a document tie perfectly against the totals printed
+    on the pages that *were* read while an unread page carries whatever it
+    carries.
+    """
     processed = set(doc.processed_pages)
     failed = set(doc.failed_pages)
     skipped = set(doc.skipped_pages)
+    unresolved = set(doc.unresolved_pages)
     unaccounted = (
-        set(range(1, doc.page_count + 1)) - processed - failed - skipped
+        set(range(1, doc.page_count + 1))
+        - processed - failed - skipped - unresolved
     )
 
     findings: list[Finding] = []
-    for page in sorted(failed | skipped | unaccounted):
+    for page in sorted(failed | skipped | unresolved | unaccounted):
         if page in failed:
             outcome = "processing failed"
         elif page in skipped:
             outcome = "processing was skipped"
+        elif page in unresolved:
+            outcome = (
+                "the vision reader returned no rows for it, which is not "
+                "evidence that it holds none"
+            )
         else:
             outcome = "no processing outcome was recorded"
         findings.append(

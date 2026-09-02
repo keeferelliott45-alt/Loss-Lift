@@ -850,6 +850,7 @@ def run_pipeline(
     processed_pages = set(extraction.page_texts)
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
+    unresolved_pages: set[int] = set()
 
     scanned_pages = classification.scanned_pages
     vision_tables: list[RawTable] = []
@@ -874,10 +875,32 @@ def run_pipeline(
                 # evidence of successful processing.
                 vision_tables = list(vision_output)
 
-            successful_vision_pages = {table.page for table in vision_tables}
-            processed_pages.update(successful_vision_pages)
+            # A page counts as read only where the reader actually returned
+            # something off it. A well-formed answer carrying no rows is a
+            # model declining to find a table, which is not the same fact as a
+            # page having none -- and on a scan there is no second reader to
+            # settle which it was. Headers and page metadata do not decide it
+            # either: a shape is not a reading.
+            read_vision_pages = {
+                table.page for table in vision_tables
+                if table.rows or table.total_rows
+            }
+            empty_vision_pages = {
+                table.page for table in vision_tables
+            } - read_vision_pages
+            processed_pages.update(read_vision_pages)
+            unresolved_pages.update(empty_vision_pages - failed_pages)
+            if empty_vision_pages:
+                joined = ", ".join(str(page) for page in sorted(empty_vision_pages))
+                warnings.append(
+                    f"Vision extraction returned no rows for page(s) {joined}. "
+                    f"Whether they hold claims is unknown."
+                )
             unreturned = (
-                set(scanned_pages) - successful_vision_pages - failed_pages
+                set(scanned_pages)
+                - read_vision_pages
+                - empty_vision_pages
+                - failed_pages
             )
             if unreturned:
                 failed_pages.update(unreturned)
@@ -1104,6 +1127,7 @@ def run_pipeline(
         processed_pages=sorted(processed_pages),
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
+        unresolved_pages=sorted(unresolved_pages),
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,
