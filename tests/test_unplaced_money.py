@@ -24,8 +24,9 @@ from decimal import Decimal
 import pymupdf
 import pytest
 
-from core.pipeline import run_pipeline
-from core.schema import DocumentStatus, Severity
+from core.pipeline import ColumnMapping, build_claims, run_pipeline, unplaced_money
+from core.reconcile import reconcile
+from core.schema import DocumentStatus, RawRow, RawTable, Severity, UnplacedRow
 
 LINE = 14.0
 LEFT = 40.0
@@ -33,6 +34,17 @@ LEFT = 40.0
 #: not what the test is measuring.
 COLUMNS = (0.0, 95.0, 175.0, 245.0, 330.0, 415.0)
 HEADERS = ("Claim No", "Date of Loss", "Status", "Paid Total", "Reserve Total", "Total Incurred")
+MAPPING = ColumnMapping(
+    headers=list(HEADERS),
+    fields={
+        0: "claim_number",
+        1: "date_of_loss",
+        2: "claim_status",
+        3: "paid_total",
+        4: "reserve_total",
+        5: "incurred_total",
+    },
+)
 
 #: Three claims whose money ties: paid + reserve == incurred, nothing null,
 #: numbers unique, dates inside the stated term. Everything the engine checks
@@ -190,6 +202,47 @@ def test_several_dropped_rows_keep_distinct_provenance_and_identity(tmp_path):
     assert len({f.condition for f in raised}) == 2, "resolving one leaves the other"
 
 
+def test_an_r04_match_does_not_suppress_unplaced_money(anchorless):
+    """A document-wide tie says nothing about a separately discarded row."""
+    document = run_pipeline(anchorless, use_vision=False).document
+    document.printed_totals = {"paid_total": document.column_total("paid_total")}
+    document.unplaced_rows = [
+        UnplacedRow(page=1, row=12, amounts={"paid_total": "100.00"})
+    ]
+    result = reconcile(document)
+
+    assert not [f for f in result.findings if f.rule_id == "R-04"]
+    assert [f for f in result.findings if f.rule_id == "R-23"]
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_offsetting_unplaced_rows_cannot_hide_behind_an_r04_match(anchorless):
+    """Equal-and-opposite discarded rows preserve the total while losing data."""
+    document = run_pipeline(anchorless, use_vision=False).document
+    document.printed_totals = {
+        "paid_total": document.column_total("paid_total"),
+        "incurred_total": document.column_total("incurred_total"),
+    }
+    document.unplaced_rows = [
+        UnplacedRow(
+            page=1,
+            row=12,
+            amounts={"paid_total": "100.00", "incurred_total": "100.00"},
+        ),
+        UnplacedRow(
+            page=1,
+            row=13,
+            amounts={"paid_total": "(100.00)", "incurred_total": "(100.00)"},
+        ),
+    ]
+    result = reconcile(document)
+
+    raised = [f for f in result.findings if f.rule_id == "R-23"]
+    assert len(raised) == 2
+    assert len({f.condition for f in raised}) == 2
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+
+
 # --------------------------------------------------------------------------
 # What counts as money, and what does not
 # --------------------------------------------------------------------------
@@ -232,6 +285,43 @@ def test_eu_formatted_money_is_recognised_where_the_document_supports_it(tmp_pat
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
+@pytest.mark.parametrize("separator", [" ", "\u00a0"])
+def test_space_grouped_money_is_not_mistaken_for_smeared_cells(separator):
+    row = RawRow(
+        page=1,
+        line_index=4,
+        cells=["", "12.03.2024", "OPEN", f"1{separator}234,56", "", ""],
+    )
+
+    assert unplaced_money(row, MAPPING, "eu") == {
+        "paid_total": f"1{separator}234,56"
+    }
+
+
+def test_a_claim_like_row_preserves_whole_unit_money():
+    row = RawRow(
+        page=1,
+        line_index=4,
+        cells=["", "03/12/2024", "OPEN", "9400", "", ""],
+    )
+
+    assert unplaced_money(row, MAPPING, "us") == {"paid_total": "9400"}
+
+
+def test_a_claim_like_zero_row_is_not_automatically_irrelevant():
+    row = RawRow(
+        page=1,
+        line_index=4,
+        cells=["", "03/12/2024", "CLOSED", "0", "0", "0"],
+    )
+
+    assert unplaced_money(row, MAPPING, "us") == {
+        "paid_total": "0",
+        "reserve_total": "0",
+        "incurred_total": "0",
+    }
+
+
 @pytest.mark.parametrize(
     "row",
     [
@@ -260,6 +350,30 @@ def test_a_bare_integer_under_a_money_column_is_not_reported(tmp_path):
     assert result.reconciliation.status is DocumentStatus.CLEAN
 
 
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "12/31/2024",  # printed date
+        "12.31.2024",  # punctuated date
+        "45292",       # plausible Excel serial date
+        "7",           # count or index
+        "GL-4417-2024",  # identifier
+        "(2024)",      # parenthesised year, not accounting evidence by itself
+        "2024-",       # punctuated year, not a trailing-negative amount by itself
+        "1.2",         # version or split identifier fragment
+        "4 .00",       # two cells smeared together
+    ],
+)
+def test_an_isolated_numeric_fragment_in_a_money_column_is_not_money(fragment):
+    row = RawRow(
+        page=1,
+        line_index=4,
+        cells=["", "", "", fragment, "", ""],
+    )
+
+    assert unplaced_money(row, MAPPING, "us") == {}
+
+
 def test_a_recognised_totals_row_does_not_become_a_finding(tmp_path):
     """Footer totals are consumed as structure; they are not unplaced money."""
     path = _write(
@@ -280,3 +394,50 @@ def test_text_only_dropped_rows_remain_ordinary_warnings(tmp_path):
     result = run_pipeline(path, use_vision=False)
     assert result.document.unplaced_rows == []
     assert not [f for f in result.reconciliation.findings if f.rule_id == "R-23"]
+
+
+def test_repeated_headers_and_proven_prose_furniture_remain_exempt():
+    repeated = RawRow(
+        page=1,
+        line_index=1,
+        cells=["Claim No", "Date of Loss", "Status", "Paid Total", "Reserve Total", "Total Incurred"],
+    )
+    strapline = RawRow(
+        page=1,
+        line_index=2,
+        cells=["CONFIDENTIAL LOSS RUN", "", "", "", "", ""],
+    )
+    tables = [
+        RawTable(page=page, headers=list(HEADERS), rows=[
+            repeated.model_copy(update={"page": page}),
+            strapline.model_copy(update={"page": page}),
+        ])
+        for page in (1, 2)
+    ]
+
+    claims, warnings, unplaced = build_claims(tables, MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings == []
+    assert unplaced == []
+
+
+def test_identical_repeated_monetary_rows_are_not_page_furniture():
+    tables = [
+        RawTable(
+            page=page,
+            headers=list(HEADERS),
+            rows=[RawRow(
+                page=page,
+                line_index=4,
+                cells=["", "", "", "9,400.00", "600.00", "10,000.00"],
+            )],
+        )
+        for page in (1, 2)
+    ]
+
+    claims, warnings, unplaced = build_claims(tables, MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings == []
+    assert [(row.page, row.row) for row in unplaced] == [(1, 4), (2, 4)]

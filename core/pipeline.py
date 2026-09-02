@@ -19,6 +19,8 @@ from core.classify import DocumentClassification, classify_pdf
 from core.extract_digital import _COUNT_PATTERNS, _first_match, DocumentMetadata
 from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
+    CURRENCY_CODES,
+    CURRENCY_SYMBOLS,
     DateOrderInference,
     LocaleInference,
     RecoverySignInference,
@@ -314,7 +316,11 @@ def _normalised(row: RawRow) -> str:
     return " ".join(_PAGE_MARKER.sub(" ", text).split())
 
 
-def page_furniture(tables: Sequence[RawTable]) -> set[str]:
+def page_furniture(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping | None = None,
+    locale: str | None = None,
+) -> set[str]:
     """Row text that repeats across pages: a running header, footer or strapline.
 
     A claim appears once. A line printed on most pages of the document is the
@@ -329,7 +335,13 @@ def page_furniture(tables: Sequence[RawTable]) -> set[str]:
 
     seen: dict[str, set[int]] = {}
     for table in tables:
+        table_mapping = mapping_for(table, mapping) if mapping is not None else None
         for row in list(table.rows) + list(table.total_rows):
+            # Repetition alone does not make a row furniture. Spreadsheet
+            # continuations can repeat the same amounts on several pages; if
+            # those amounts have no claim, reconciliation must see each row.
+            if table_mapping is not None and unplaced_money(row, table_mapping, locale):
+                continue
             text = _normalised(row)
             if text:
                 seen.setdefault(text, set()).add(table.page)
@@ -357,19 +369,46 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     return clean_text(" ".join(row.cells)) or None
 
 
-#: What tells a printed amount from a bare number sharing its column. Money a
-#: carrier prints carries a separator, a symbol, a sign or a credit marker; a
-#: page number, a year, a count or a claim reference carries none of them.
-#: Requiring one costs a whole-unit amount printed as "9400", which falls back
-#: to the ordinary warning -- the safe direction, since the alternative reports
-#: every stray integer as money nobody placed.
-_MONEY_SHAPED = re.compile(r"[.,()]|[$€£¥]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE)
+_CURRENCY_CODE = re.compile(
+    r"\b(?:" + "|".join(sorted(CURRENCY_CODES)) + r")\b", re.IGNORECASE
+)
+_MONEY_DECIMALS = re.compile(
+    r"^(?:\d{1,3}(?:[ ,.\u2019']\d{3})+|\d+)[.,]\d{2}$"
+)
+_MONEY_GROUPS = re.compile(r"^\d{1,3}(?:[ ,.\u2019']\d{3})+$")
 
-#: Two numeric runs with space between them are two cells a column boundary
-#: ran together, not one printed amount: "4 .00" is a section marker beside a
-#: fragment, and reading it as 4.00 invents a figure nobody printed. A trailing
-#: credit marker is a word, not a second number, so "1,234.56 CR" still passes.
-_SMEARED = re.compile(r"\d[^\s]*\s+[^\s]*\d")
+
+def _has_money_notation(raw: str) -> bool:
+    """Whether the token itself supplies evidence that it denotes money."""
+    text = clean_text(raw)
+    explicit_currency = any(symbol in text for symbol in CURRENCY_SYMBOLS)
+    explicit_currency = explicit_currency or bool(_CURRENCY_CODE.search(text))
+
+    body = text
+    for symbol in sorted(CURRENCY_SYMBOLS, key=len, reverse=True):
+        body = body.replace(symbol, " ")
+    body = _CURRENCY_CODE.sub(" ", body)
+    body = re.sub(r"(?:^|\s)(?:CR|DR)\.?(?:\s|$)", " ", body, flags=re.IGNORECASE)
+    body = clean_text(body)
+    if body.startswith("(") and body.endswith(")"):
+        body = body[1:-1].strip()
+    body = body.removeprefix("+").removeprefix("-").strip()
+    if body.endswith("-"):
+        body = body[:-1].strip()
+
+    return explicit_currency or bool(
+        _MONEY_DECIMALS.fullmatch(body) or _MONEY_GROUPS.fullmatch(body)
+    )
+
+
+def _claim_like_without_identifier(values: dict[str, str]) -> bool:
+    """Independent row evidence that weak numeric cells belong to claim data."""
+    if parse_status(values.get("claim_status", "")) is not ClaimStatus.UNKNOWN:
+        return True
+    return any(
+        parse_date(values.get(field, ""), None).value is not None
+        for field in DATE_FIELDS
+    )
 
 
 def unplaced_money(
@@ -386,19 +425,24 @@ def unplaced_money(
     text has to agree.
     """
     values = _row_values(row, mapping)
-    amounts: dict[str, str] = {}
+    parsed: dict[str, str] = {}
+    strong_notation = False
     for name in MONEY_FIELDS:
         text = (values.get(name) or "").strip()
-        if not text or not _MONEY_SHAPED.search(text) or _SMEARED.search(text):
+        if not text:
             continue
         amount = parse_money(text, locale).value
-        # A zero is not money at risk. Rows of zeros are common -- a closed
-        # claim's reserve columns, a section rule, a cell fragment left by a
-        # column boundary -- and reporting that nothing went missing would
-        # bury the rows where something did.
-        if amount is not None and amount != 0:
-            amounts[name] = text
-    return amounts
+        if amount is not None:
+            parsed[name] = text
+            strong_notation = strong_notation or _has_money_notation(text)
+
+    # A lone bare integer is not enough: it may be a count, identifier fragment
+    # or Excel serial date displaced by a column boundary. Multiple mapped
+    # amounts, a status/date on the same row, or monetary notation supplies the
+    # independent context needed to retain whole-unit and zero-valued money.
+    if not strong_notation and len(parsed) < 2 and not _claim_like_without_identifier(values):
+        return {}
+    return parsed
 
 
 def accepted_identifier_shapes(
@@ -510,7 +554,7 @@ def build_claims(
     claims: list[Claim] = []
     warnings: list[str] = []
     unplaced: list[UnplacedRow] = []
-    furniture = page_furniture(tables)
+    furniture = page_furniture(tables, mapping, locale)
     shapes = accepted_identifier_shapes(tables, mapping)
 
     for table in tables:
