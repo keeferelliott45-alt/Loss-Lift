@@ -19,8 +19,6 @@ from core.classify import DocumentClassification, classify_pdf
 from core.extract_digital import _COUNT_PATTERNS, _first_match, DocumentMetadata
 from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
-    CURRENCY_CODES,
-    CURRENCY_SYMBOLS,
     DateOrderInference,
     LocaleInference,
     RecoverySignInference,
@@ -340,7 +338,9 @@ def page_furniture(
             # Repetition alone does not make a row furniture. Spreadsheet
             # continuations can repeat the same amounts on several pages; if
             # those amounts have no claim, reconciliation must see each row.
-            if table_mapping is not None and unplaced_money(row, table_mapping, locale):
+            if table_mapping is not None and _parsed_financial_cells(
+                row, table_mapping, locale
+            ):
                 continue
             text = _normalised(row)
             if text:
@@ -369,36 +369,37 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     return clean_text(" ".join(row.cells)) or None
 
 
-_CURRENCY_CODE = re.compile(
-    r"\b(?:" + "|".join(sorted(CURRENCY_CODES)) + r")\b", re.IGNORECASE
+_NON_MONEY_ROW = re.compile(
+    r"\b(?:software\s+)?version\b|"
+    r"\b(?:policy|calendar|fiscal)\s+year\b|"
+    r"\bexcel(?:\s+serial)?\s+date\b|"
+    r"\b(?:policy|claim)\s+(?:identifier|id|number|no)\b|"
+    r"\b(?:page|row|column)\s+(?:index|number|no|count)\b",
+    re.IGNORECASE,
 )
-_MONEY_DECIMALS = re.compile(
-    r"^(?:\d{1,3}(?:[ ,.\u2019']\d{3})+|\d+)[.,]\d{2}$"
+_FINANCIAL_NOTATION = re.compile(
+    r"[.,]|[$€£¥₤₹₽]|^[+(\-]|[)\-]$|\b(?:CR|DR)\b",
+    re.IGNORECASE,
 )
-_MONEY_GROUPS = re.compile(r"^\d{1,3}(?:[ ,.\u2019']\d{3})+$")
 
 
-def _has_money_notation(raw: str) -> bool:
-    """Whether the token itself supplies evidence that it denotes money."""
-    text = clean_text(raw)
-    explicit_currency = any(symbol in text for symbol in CURRENCY_SYMBOLS)
-    explicit_currency = explicit_currency or bool(_CURRENCY_CODE.search(text))
+@dataclass(frozen=True)
+class _UnplacedEvidence:
+    amounts: dict[str, str] = field(default_factory=dict)
+    ambiguous_values: dict[str, str] = field(default_factory=dict)
 
-    body = text
-    for symbol in sorted(CURRENCY_SYMBOLS, key=len, reverse=True):
-        body = body.replace(symbol, " ")
-    body = _CURRENCY_CODE.sub(" ", body)
-    body = re.sub(r"(?:^|\s)(?:CR|DR)\.?(?:\s|$)", " ", body, flags=re.IGNORECASE)
-    body = clean_text(body)
-    if body.startswith("(") and body.endswith(")"):
-        body = body[1:-1].strip()
-    body = body.removeprefix("+").removeprefix("-").strip()
-    if body.endswith("-"):
-        body = body[:-1].strip()
 
-    return explicit_currency or bool(
-        _MONEY_DECIMALS.fullmatch(body) or _MONEY_GROUPS.fullmatch(body)
-    )
+def _parsed_financial_cells(
+    row: RawRow, mapping: ColumnMapping, locale: str | None
+) -> dict[str, str]:
+    """Numeric text physically read under columns mapped as financial."""
+    values = _row_values(row, mapping)
+    return {
+        name: text
+        for name in MONEY_FIELDS
+        if (text := (values.get(name) or "").strip())
+        and parse_money(text, locale).value is not None
+    }
 
 
 def _claim_like_without_identifier(values: dict[str, str]) -> bool:
@@ -411,38 +412,64 @@ def _claim_like_without_identifier(values: dict[str, str]) -> bool:
     )
 
 
+def _unplaced_evidence(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+    *,
+    table_context: str = "unknown",
+) -> _UnplacedEvidence:
+    """Classify parsed numeric cells using the row and its table, not their shape."""
+    values = _row_values(row, mapping)
+    parsed = _parsed_financial_cells(row, mapping, locale)
+    if not parsed:
+        return _UnplacedEvidence()
+
+    claim_like = _claim_like_without_identifier(values)
+    context_text = " ".join(
+        row.cell(index)
+        for index in range(len(row.cells))
+        if mapping.fields.get(index) not in MONEY_FIELDS
+    )
+    if not claim_like and _NON_MONEY_ROW.search(clean_text(context_text)):
+        return _UnplacedEvidence()
+    if claim_like or table_context == "monetary-only":
+        return _UnplacedEvidence(amounts=parsed)
+    if table_context == "claims" and any(
+        _FINANCIAL_NOTATION.search(text) for text in parsed.values()
+    ):
+        return _UnplacedEvidence(amounts=parsed)
+    return _UnplacedEvidence(ambiguous_values=parsed)
+
+
 def unplaced_money(
     row: RawRow, mapping: ColumnMapping, locale: str | None
 ) -> dict[str, str]:
     """Amounts printed under mapped money columns on a row nothing claimed.
 
-    The counterpart of :func:`_continuation_text`, which asks the same question
-    for the opposite purpose: that one folds a row into the claim above when
-    nothing on it parses, this one reports what parsed when the row could not
-    be placed at all. Both read only cells the mapping says are money, so a
-    date, a policy number or a page marker is not eligible however it is
-    written -- the column it sits under is the evidence, and the shape of the
-    text has to agree.
+    This compatibility helper returns only values whose own row establishes
+    claim context. :func:`build_claims` additionally uses table context and
+    preserves unresolved numeric cells separately rather than guessing.
     """
-    values = _row_values(row, mapping)
-    parsed: dict[str, str] = {}
-    strong_notation = False
-    for name in MONEY_FIELDS:
-        text = (values.get(name) or "").strip()
-        if not text:
-            continue
-        amount = parse_money(text, locale).value
-        if amount is not None:
-            parsed[name] = text
-            strong_notation = strong_notation or _has_money_notation(text)
+    return _unplaced_evidence(row, mapping, locale).amounts
 
-    # A lone bare integer is not enough: it may be a count, identifier fragment
-    # or Excel serial date displaced by a column boundary. Multiple mapped
-    # amounts, a status/date on the same row, or monetary notation supplies the
-    # independent context needed to retain whole-unit and zero-valued money.
-    if not strong_notation and len(parsed) < 2 and not _claim_like_without_identifier(values):
-        return {}
-    return parsed
+
+def _table_context(
+    table: RawTable,
+    mapping: ColumnMapping,
+    shapes: set[str],
+) -> str:
+    """Whether this table supplies context that its numeric cells are financial."""
+    mapped = mapping.mapped_fields
+    if mapped and mapped <= set(MONEY_FIELDS):
+        return "monetary-only"
+    if any(
+        not is_structural_row(row, mapping)
+        and claim_identifier(row, mapping, shapes) is not None
+        for row in table.rows
+    ):
+        return "claims"
+    return "unknown"
 
 
 def accepted_identifier_shapes(
@@ -559,6 +586,7 @@ def build_claims(
 
     for table in tables:
         table_mapping = mapping_for(table, mapping)
+        table_context = _table_context(table, table_mapping, shapes)
 
         for row in table.rows:
             if is_structural_row(row, table_mapping):
@@ -584,7 +612,10 @@ def build_claims(
                         f"{previous.loss_description or ''} {extra}"
                     )
                 elif extra:
-                    _record_discard(row, table_mapping, locale, warnings, unplaced, extra)
+                    _record_discard(
+                        row, table_mapping, locale, warnings, unplaced, extra,
+                        table_context=table_context,
+                    )
                 continue
 
             claim = build_claim(
@@ -609,7 +640,10 @@ def build_claims(
                 )
             elif not row.is_blank():
                 preview = " ".join(cell for cell in row.cells if cell)
-                _record_discard(row, table_mapping, locale, warnings, unplaced, preview)
+                _record_discard(
+                    row, table_mapping, locale, warnings, unplaced, preview,
+                    table_context=table_context,
+                )
     return claims, warnings, unplaced
 
 
@@ -620,18 +654,27 @@ def _record_discard(
     warnings: list[str],
     unplaced: list[UnplacedRow],
     preview: str,
+    *,
+    table_context: str = "unknown",
 ) -> None:
-    """Note a row nothing could take, and whether money went with it.
+    """Note a row nothing could take and retain any numeric evidence on it.
 
     A text-only row stays a warning: nothing measurable was lost, and raising
     a finding for every stray line would bury the ones that matter. A row with
-    figures under money columns is recorded on the document instead, where a
-    rule can reach it.
+    figures under financial columns are recorded on the document instead,
+    where reconciliation can distinguish confirmed from ambiguous evidence.
     """
-    amounts = unplaced_money(row, mapping, locale)
-    if amounts:
+    evidence = _unplaced_evidence(
+        row, mapping, locale, table_context=table_context
+    )
+    if evidence.amounts or evidence.ambiguous_values:
         unplaced.append(
-            UnplacedRow(page=row.page, row=row.line_index, amounts=amounts)
+            UnplacedRow(
+                page=row.page,
+                row=row.line_index,
+                amounts=evidence.amounts,
+                ambiguous_values=evidence.ambiguous_values,
+            )
         )
         return
     warnings.append(

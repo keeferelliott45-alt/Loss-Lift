@@ -1053,6 +1053,9 @@ class UnplacedRow(BaseModel):
     row: int | None = None
     #: Canonical money field -> the text printed under it, verbatim.
     amounts: dict[str, str] = Field(default_factory=dict)
+    #: Numeric text found under mapped financial columns when the surrounding
+    #: row and table do not establish whether it is money or a displaced value.
+    ambiguous_values: dict[str, str] = Field(default_factory=dict)
 
     def where(self) -> str:
         if self.row is None:

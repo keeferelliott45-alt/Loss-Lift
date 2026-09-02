@@ -1033,11 +1033,28 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
     findings: list[Finding] = []
     for record in doc.unplaced_rows:
         amounts = record.amounts
-        if not amounts:
+        ambiguous = record.ambiguous_values
+        if not amounts and not ambiguous:
             continue
+        values = {**ambiguous, **amounts}
         printed = ", ".join(
-            f"{_label(field)} {text}" for field, text in sorted(amounts.items())
+            f"{_label(field)} {text}" for field, text in sorted(values.items())
         )
+        if amounts and not ambiguous:
+            message = (
+                f"Values were printed under monetary columns on {record.where()} "
+                f"but could not be attached to any claim: {printed}. LossLift "
+                "will not guess which claim they belong to."
+            )
+            expected = "every printed monetary value attached to a claim"
+        else:
+            message = (
+                f"Numeric values were read from mapped financial columns on "
+                f"{record.where()}, but the surrounding row and table do not "
+                f"establish what they represent: {printed}. LossLift will not "
+                "guess or present the document as complete."
+            )
+            expected = "every numeric table value classified or resolved"
         findings.append(
             Finding(
                 rule_id="R-23",
@@ -1053,14 +1070,8 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
                 condition=f"page-{record.page}-row-{record.row}",
                 severity=Severity.ERROR,
                 page=record.page,
-                message=(
-                    f"Amounts were printed on {record.where()} that could not be "
-                    f"attached to any claim: {printed}. LossLift will not guess "
-                    f"which claim they belong to. Check the page — the row may "
-                    f"be a claim whose number was not read, or a continuation "
-                    f"whose figures belong to the row above."
-                ),
-                expected="every printed amount attached to a claim",
+                message=message,
+                expected=expected,
                 actual=printed,
             )
         )

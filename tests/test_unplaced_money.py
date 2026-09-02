@@ -342,12 +342,14 @@ def test_ordinary_numbers_and_text_do_not_become_money(tmp_path, row):
     assert result.reconciliation.status is DocumentStatus.CLEAN
 
 
-def test_a_bare_integer_under_a_money_column_is_not_reported(tmp_path):
-    """A count or an index sharing a money column carries no separator."""
+def test_an_unlabelled_bare_integer_is_preserved_as_ambiguous(tmp_path):
+    """Without a label, seven dollars and an index of seven are indistinguishable."""
     path = _write(tmp_path / "bare.pdf", CLAIMS + (("", "", "", "7", "", ""),))
     result = run_pipeline(path, use_vision=False)
-    assert result.document.unplaced_rows == []
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert len(result.document.unplaced_rows) == 1
+    assert result.document.unplaced_rows[0].amounts == {}
+    assert result.document.unplaced_rows[0].ambiguous_values == {"paid_total": "7"}
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 @pytest.mark.parametrize(
@@ -441,3 +443,138 @@ def test_identical_repeated_monetary_rows_are_not_page_furniture():
     assert claims == []
     assert warnings == []
     assert [(row.page, row.row) for row in unplaced] == [(1, 4), (2, 4)]
+
+
+# --------------------------------------------------------------------------
+# Context decides; token shape does not
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("amount", ["9400", "9400 CR", "(9400)"])
+def test_a_money_only_continuation_table_preserves_whole_units(amount):
+    """The header and neighbouring amount establish a financial continuation."""
+    table = RawTable(
+        page=2,
+        headers=["Paid Total"],
+        rows=[
+            RawRow(page=2, line_index=4, cells=["1,200.00"]),
+            RawRow(page=2, line_index=5, cells=[amount]),
+        ],
+    )
+
+    claims, warnings, unplaced = build_claims([table], MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings == []
+    assert [record.amounts for record in unplaced] == [
+        {"paid_total": "1,200.00"},
+        {"paid_total": amount},
+    ]
+
+
+def test_identical_whole_unit_continuation_rows_are_not_furniture():
+    tables = [
+        RawTable(
+            page=page,
+            headers=["Paid Total"],
+            rows=[RawRow(page=page, line_index=4, cells=["9400"])],
+        )
+        for page in (2, 3)
+    ]
+
+    claims, warnings, unplaced = build_claims(tables, MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings == []
+    assert [(record.page, record.row, record.amounts) for record in unplaced] == [
+        (2, 4, {"paid_total": "9400"}),
+        (3, 4, {"paid_total": "9400"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("label", "fragment"),
+    [
+        ("Software Version", "1.20"),
+        ("Policy Year", "2024.00"),
+        ("Excel Serial Date", "45292.00"),
+        ("Policy Identifier", "12,345"),
+    ],
+)
+def test_contextually_identified_non_money_is_not_unplaced_money(label, fragment):
+    table = RawTable(
+        page=1,
+        headers=list(HEADERS),
+        rows=[RawRow(
+            page=1,
+            line_index=4,
+            cells=[label, "", "", fragment, "", ""],
+        )],
+    )
+
+    claims, warnings, unplaced = build_claims([table], MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings
+    assert unplaced == []
+
+
+def test_multiple_labelled_numeric_fragments_are_not_money():
+    table = RawTable(
+        page=1,
+        headers=list(HEADERS),
+        rows=[RawRow(
+            page=1,
+            line_index=4,
+            cells=["", "Page index", "", "45292", "7", ""],
+        )],
+    )
+
+    claims, warnings, unplaced = build_claims([table], MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings
+    assert unplaced == []
+
+
+def test_a_context_free_number_is_preserved_as_ambiguous_not_called_money(anchorless):
+    table = RawTable(
+        page=2,
+        headers=list(HEADERS),
+        rows=[RawRow(
+            page=2,
+            line_index=4,
+            cells=["", "", "", "9400", "", ""],
+        )],
+    )
+    claims, warnings, unplaced = build_claims([table], MAPPING, "us", "mdy")
+
+    assert claims == []
+    assert warnings == []
+    assert len(unplaced) == 1
+    assert unplaced[0].amounts == {}
+    assert unplaced[0].ambiguous_values == {"paid_total": "9400"}
+
+    document = run_pipeline(anchorless, use_vision=False).document
+    document.unplaced_rows = unplaced
+    result = reconcile(document)
+    finding = next(f for f in result.findings if f.rule_id == "R-23")
+    assert result.status is DocumentStatus.NEEDS_REVIEW
+    assert "numeric values" in finding.message.lower()
+    assert "amounts were printed" not in finding.message.lower()
+
+
+def test_mixed_confirmed_and_ambiguous_values_both_reach_the_finding(anchorless):
+    document = run_pipeline(anchorless, use_vision=False).document
+    document.unplaced_rows = [UnplacedRow(
+        page=2,
+        row=4,
+        amounts={"paid_total": "100.00"},
+        ambiguous_values={"reserve_total": "45292"},
+    )]
+
+    result = reconcile(document)
+    finding = next(f for f in result.findings if f.rule_id == "R-23")
+
+    assert "paid total 100.00" in finding.actual.lower()
+    assert "reserve total 45292" in finding.actual.lower()
