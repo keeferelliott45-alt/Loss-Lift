@@ -1053,6 +1053,11 @@ class UnplacedRow(BaseModel):
     row: int | None = None
     #: Canonical money field -> the text printed under it, verbatim.
     amounts: dict[str, str] = Field(default_factory=dict)
+    #: The same amounts, already parsed. Kept beside the text rather than
+    #: re-derived later: reconciliation compares this row's figures against a
+    #: claim's own Decimal fields, and re-parsing at that layer would mean
+    #: carrying locale into a module that should never need it.
+    parsed_amounts: dict[str, Money] = Field(default_factory=dict)
 
     def where(self) -> str:
         if self.row is None:

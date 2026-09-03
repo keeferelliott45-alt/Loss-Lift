@@ -1026,35 +1026,35 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
     A text-only row stays a warning. Nothing measurable went missing with it,
     and raising a finding for every stray line would bury the ones that did.
 
-    Nor does a column the carrier vouched for. Where a printed total exists and
-    the extracted claims meet it, that column's money is demonstrably already
-    inside them, whatever else was printed on the page -- a per-claim subtotal,
-    a transaction ledger repeating figures the summary carries, a section total
-    the footer scraper took but the row reader did not. The strongest evidence
-    in the product has already answered, and a second opinion here would say
-    money is missing on a document that ties. So this rule speaks only where
-    R-04 cannot: the anchorless case, where nothing was printed to check the
-    reading against and a dropped amount is invisible to everything else.
-    """
-    accounted = {
-        field_name
-        for field_name, printed in doc.printed_totals.items()
-        if printed is not None
-        and field_name in MONEY_FIELDS
-        and config.within_tolerance(doc.column_total(field_name) - printed)
-    }
+    Nothing here suppresses a row on arithmetic alone, even the arithmetic of
+    one row against one claim. A field the carrier's printed total ties on
+    says nothing about any *other* row on the page -- two unplaced rows can
+    cancel each other, a credit and a debit, leaving the column tying while
+    both sit unaccounted for. A row's figure matching one claim's own value on
+    the same page is no safer a signal: a policy-level subtotal that only one
+    claim on the page contributed to non-zero will equal that claim's own
+    number by simple addition, not because the row restates it. Both were
+    tried and both proved capable of hiding a real, previously-uncaptured
+    section total behind a coincidence -- on two different real documents, not
+    a hypothetical one. Distinguishing a genuine duplicate rendering from a
+    coincidental one would need evidence this architecture does not yet keep
+    -- which physical lines a claim's own record actually spans is recorded
+    only when the multi-line reconstruction folds a row in, and a row sitting
+    here has already failed that fold.
 
+    So every unplaced row's money is reported. Some of it will turn out, once
+    a reviewer looks, to already belong to a claim on the same page under a
+    different name than the one it was read under -- that is a real answer to
+    give, not noise, and it is a smaller cost than the alternative: reporting
+    a document complete while a section total nobody verified sits on the
+    page unmentioned.
+    """
     findings: list[Finding] = []
     for record in doc.unplaced_rows:
-        amounts = {
-            field: text
-            for field, text in record.amounts.items()
-            if field not in accounted
-        }
-        if not amounts:
+        if not record.amounts:
             continue
         printed = ", ".join(
-            f"{_label(field)} {text}" for field, text in sorted(amounts.items())
+            f"{_label(field)} {text}" for field, text in sorted(record.amounts.items())
         )
         findings.append(
             Finding(

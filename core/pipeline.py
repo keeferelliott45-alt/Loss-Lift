@@ -365,16 +365,44 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
 #: every stray integer as money nobody placed.
 _MONEY_SHAPED = re.compile(r"[.,()]|[$€£¥]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE)
 
-#: Two numeric runs with space between them are two cells a column boundary
-#: ran together, not one printed amount: "4 .00" is a section marker beside a
-#: fragment, and reading it as 4.00 invents a figure nobody printed. A trailing
-#: credit marker is a word, not a second number, so "1,234.56 CR" still passes.
-_SMEARED = re.compile(r"\d[^\s]*\s+[^\s]*\d")
+#: A trailing credit or debit marker is a word, not a second number, so it is
+#: stripped before anything asks whether the digits before it are one amount
+#: or two.
+_CREDIT_SUFFIX = re.compile(r"\s+(?:CR|DR)\s*$", re.IGNORECASE)
+
+#: One group of a space-grouped number: exactly three digits, or three digits
+#: carrying the one decimal fraction a final group may end in. Money is always
+#: grouped in threes counting from the right, whichever character does the
+#: grouping, so this is the same rule "1,234" and "1.234" already use --
+#: applied here to the group *after* a space rather than a comma or a period.
+_GROUP_CONTINUATION = re.compile(r"^\d{3}(?:[.,]\d+)?$")
+
+
+def _is_smeared(text: str) -> bool:
+    """Whether the space in this cell glues two unrelated numbers together.
+
+    A carrier's own space-grouped thousands -- "1 234,56", the French and
+    non-breaking-space convention section 4 lists -- puts exactly three digits
+    in every group after the first. "4 .00" and "36571 44694" do not: a
+    fragment with no digits before its punctuation, or a second run that is
+    not three digits, is not a continuation of the number before it. It is a
+    second, unrelated figure a column boundary ran together with the first --
+    "4" is a section marker, "30,000.00" is the amount beside it, and reading
+    the pair as one number invents a figure nobody printed.
+
+    Only the space is in question here. A comma or a period inside one token
+    already tells its own story and is left to :func:`parse_money`; this asks
+    only whether the *whitespace* is doing a printer's job or an accident's.
+    """
+    tokens = _CREDIT_SUFFIX.sub("", text).split()
+    if len(tokens) < 2:
+        return False
+    return not all(_GROUP_CONTINUATION.match(token) for token in tokens[1:])
 
 
 def unplaced_money(
     row: RawRow, mapping: ColumnMapping, locale: str | None
-) -> dict[str, str]:
+) -> dict[str, tuple[str, Decimal]]:
     """Amounts printed under mapped money columns on a row nothing claimed.
 
     The counterpart of :func:`_continuation_text`, which asks the same question
@@ -384,12 +412,16 @@ def unplaced_money(
     date, a policy number or a page marker is not eligible however it is
     written -- the column it sits under is the evidence, and the shape of the
     text has to agree.
+
+    Returns the printed text and the parsed value together: the text is what a
+    reviewer reads, the value is what a rule can safely compare a claim's own
+    figures against without parsing anything a second time.
     """
     values = _row_values(row, mapping)
-    amounts: dict[str, str] = {}
+    amounts: dict[str, tuple[str, Decimal]] = {}
     for name in MONEY_FIELDS:
         text = (values.get(name) or "").strip()
-        if not text or not _MONEY_SHAPED.search(text) or _SMEARED.search(text):
+        if not text or not _MONEY_SHAPED.search(text) or _is_smeared(text):
             continue
         amount = parse_money(text, locale).value
         # A zero is not money at risk. Rows of zeros are common -- a closed
@@ -397,7 +429,7 @@ def unplaced_money(
         # column boundary -- and reporting that nothing went missing would
         # bury the rows where something did.
         if amount is not None and amount != 0:
-            amounts[name] = text
+            amounts[name] = (text, amount)
     return amounts
 
 
@@ -584,10 +616,15 @@ def _record_discard(
     figures under money columns is recorded on the document instead, where a
     rule can reach it.
     """
-    amounts = unplaced_money(row, mapping, locale)
-    if amounts:
+    found = unplaced_money(row, mapping, locale)
+    if found:
         unplaced.append(
-            UnplacedRow(page=row.page, row=row.line_index, amounts=amounts)
+            UnplacedRow(
+                page=row.page,
+                row=row.line_index,
+                amounts={name: text for name, (text, _value) in found.items()},
+                parsed_amounts={name: value for name, (_text, value) in found.items()},
+            )
         )
         return
     warnings.append(
