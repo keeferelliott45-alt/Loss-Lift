@@ -1,0 +1,5 @@
+claim_number,date_of_loss,date_reported,claim_status,claimant_name,loss_description,paid_total,reserve_total,recovery_total,incurred_total
+KR-0001,2024-02-19,2024-02-20,OPEN,"Hale, Morgan",Forklift damage,10600.00,16000.00,,26600.00
+KR-0002,2024-05-08,2024-05-09,CLOSED,"Iverson, Blake",Damaged rental unit,3050.00,,,3050.00
+KR-0003,2024-07-26,2024-08-01,OPEN,"Jansen, Ruth",Customer trip,750.00,9100.00,,9850.00
+KR-0004,2024-10-13,2024-10-15,CLOSED,"Koval, Sam",Equipment theft,4620.00,,0.00,4620.00

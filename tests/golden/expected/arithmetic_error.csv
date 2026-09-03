@@ -1,0 +1,5 @@
+claim_number,date_of_loss,date_reported,claim_status,claimant_name,loss_description,paid_total,reserve_total,recovery_total,incurred_total
+FM-0001,2024-01-08,2024-01-12,OPEN,"Adams, Cole",Kitchen fire,6000.00,12000.00,,18000.00
+FM-0002,2024-04-22,2024-04-25,CLOSED,"Brooks, Nia",Customer injury,3650.00,,,3650.00
+FM-0003,2024-06-30,2024-07-02,OPEN,"Cortez, Ana",Equipment failure,8400.00,23000.00,,41400.00
+FM-0004,2024-09-14,2024-09-19,OPEN,"Dunn, Elliot",Slip in restroom,2100.00,6900.00,,9000.00

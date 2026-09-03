@@ -1,0 +1,34 @@
+{
+  "name": "accounting_negatives",
+  "description": "Parentheses negatives, recoveries exceeding paid on one row",
+  "carrier": "Great Basin Indemnity",
+  "named_insured": "Ridgeline Transport Co",
+  "policy_number": "AUTO-556201-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "AUTO",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 6,
+  "printed_claim_count": 6,
+  "printed_totals": {
+    "paid_total": "48800.50",
+    "reserve_total": "56500.00",
+    "recovery_total": "18800.00",
+    "incurred_total": "86500.50"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "cause_of_loss",
+    "litigation_flag",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

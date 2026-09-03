@@ -1,0 +1,29 @@
+{
+  "name": "arithmetic_error",
+  "description": "Row 3 incurred is overstated by 10,000 \u2014 R-01 must catch it",
+  "carrier": "Fairmount Underwriters",
+  "named_insured": "Copper Creek Brewing Co",
+  "policy_number": "GL-901244-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 4,
+  "printed_claim_count": 4,
+  "printed_totals": {},
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

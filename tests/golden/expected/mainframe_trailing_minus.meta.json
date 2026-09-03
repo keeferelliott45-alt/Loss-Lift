@@ -1,0 +1,40 @@
+{
+  "name": "mainframe_trailing_minus",
+  "description": "Trailing-minus negatives, -0- zeros, Courier, all caps",
+  "carrier": "ATLANTIC STATES INS CO",
+  "named_insured": "PIEDMONT FOODS INC",
+  "policy_number": "CPP 7719340",
+  "policy_period_start": "2023-07-01",
+  "policy_period_end": "2024-06-30",
+  "valuation_date": "2024-06-30",
+  "line_of_business": "PROP",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 6,
+  "printed_claim_count": 6,
+  "printed_totals": {
+    "paid_indemnity": "63750.50",
+    "paid_expense": "9200.00",
+    "paid_total": "72950.50",
+    "reserve_indemnity": "58000.00",
+    "reserve_expense": "10700.00",
+    "reserve_total": "68700.00",
+    "recovery_total": "3500.00",
+    "incurred_total": "138150.50"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "paid_indemnity",
+    "paid_expense",
+    "paid_total",
+    "reserve_indemnity",
+    "reserve_expense",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

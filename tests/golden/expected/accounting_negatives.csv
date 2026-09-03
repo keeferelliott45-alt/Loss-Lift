@@ -1,0 +1,7 @@
+claim_number,date_of_loss,date_reported,claim_status,cause_of_loss,litigation_flag,paid_total,reserve_total,recovery_total,incurred_total
+AU-0001,2024-02-14,2024-02-15,CLOSED,Collision,N,24200.00,,6500.00,17700.00
+AU-0002,2024-03-30,2024-04-04,OPEN,Bodily Injury,Y,6550.00,35500.00,,42050.00
+AU-0003,2024-06-11,2024-06-12,CLOSED,Comprehensive,N,3600.00,,9800.00,-6200.00
+AU-0004,2024-08-25,2024-09-02,OPEN,Collision,Y,17050.50,21000.00,2500.00,35550.50
+AU-0005,2024-10-17,2024-10-18,CLOSED,Glass,N,1000.00,,,1000.00
+AU-0006,2024-12-03,2024-12-05,CLOSED,Comprehensive,N,-3600.00,,,-3600.00

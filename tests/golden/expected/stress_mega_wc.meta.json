@@ -1,0 +1,42 @@
+{
+  "name": "stress_mega_wc",
+  "description": "44 claims across 5 pages: same-page duplicate (R-11), a 2-order-of-magnitude outlier (R-13), closed-with-reserve (R-08), a legitimate negative paid after recovery (R-14), and several report-before-loss orderings from the date arithmetic (R-10) -- all WARN/INFO, so the badge should still read Reconciled despite a busy Exceptions panel",
+  "carrier": "Continental Benefit Mutual",
+  "named_insured": "Ferrous Metal Works Inc",
+  "policy_number": "WC-990214-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2025-01-01",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "WC",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 44,
+  "printed_claim_count": 44,
+  "printed_totals": {
+    "paid_indemnity": "497024.25",
+    "paid_medical": "41758.75",
+    "paid_total": "538783.00",
+    "reserve_indemnity": "230623.00",
+    "reserve_medical": "81187.00",
+    "reserve_total": "311810.00",
+    "recovery_total": "7200.00",
+    "incurred_total": "843393.00"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "litigation_flag",
+    "paid_indemnity",
+    "paid_medical",
+    "paid_total",
+    "reserve_indemnity",
+    "reserve_medical",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}
