@@ -24,7 +24,7 @@ from decimal import Decimal
 import pymupdf
 import pytest
 
-from core.extract_digital import Line, Word, find_header_line, header_block
+from core.extract_digital import Line, Word, _is_label_line, find_header_line, header_block
 from core.pipeline import run_pipeline
 
 
@@ -294,3 +294,56 @@ def test_the_row_index_digit_does_not_become_a_claim_field(wrapped_money_result)
     any real claim -- it is header noise, not a column of its own."""
     for claim in wrapped_money_result.document.claims:
         assert claim.claim_number in {"WC0001", "WC0002"}
+
+
+# --- A known, deliberate limitation: a 3+-digit word inside a header -----
+#
+# "Coverage Year 2024" reads, to a person, unmistakably as a header line.
+# _looks_like_value flags "2024" as value-shaped (three digits together is
+# its bar for "this is what a claim's money or count looks like"), and that
+# is a blanket disqualification for the whole line -- it applies before the
+# header_score>=3 relaxation that lets a line with a bare short digit
+# through, so no amount of surrounding vocabulary saves a line that also
+# carries a 3+-digit token.
+#
+# This is a real gap, not a hypothetical: it was checked directly against
+# it before writing this test. It is left as-is rather than loosened,
+# because no document in the corpus this codebase is validated against
+# (19 real loss runs, spanning every carrier format currently supported)
+# contains a year-bearing or other 3+-digit header word, so there is no
+# evidence a fix earns its risk. The failure direction matters more than
+# the gap itself: excluding a genuine header line under-counts the header
+# block, and every path downstream of that (record-layout detection,
+# ordinary column mapping) already degrades safely from an under-tall
+# block -- to fewer recognised columns, or a clean fall-back to the
+# per-line path -- never to a column mis-mapped or a value misattributed.
+# That is the same fail-closed direction the rest of this module chooses
+# throughout, so this is documented as an accepted limitation, not fixed
+# blind. Loosening it is exactly the kind of unproven, broad heuristic
+# change spec section 2 asks Claude Code to justify with real documents
+# first.
+def test_year_bearing_header_word_is_a_known_unfixed_gap():
+    line = Line(
+        words=(
+            _word("Coverage", 30, 90, 100.0),
+            _word("Year", 95, 130, 100.0),
+            _word("2024", 135, 170, 100.0),
+        ),
+        index=5,
+    )
+    assert _is_label_line(line, CHAR_WIDTH) is False, (
+        "if this ever starts passing, _looks_like_value's digit-count bar "
+        "changed -- re-check it against the real corpus before relying on "
+        "the new behavior, don't just update this assertion"
+    )
+
+
+def test_a_genuine_data_row_is_still_correctly_excluded():
+    """The same conservative rule that catches "Coverage Year 2024" is not
+    accidentally letting real claim rows through as header text -- the
+    thing it exists to prevent."""
+    data_row = _line(
+        13, 200.0,
+        ("WC550C47269", 30, 85), ("CHAPMAN.GARY", 95, 150), ("10/08/2021", 160, 210),
+    )
+    assert _is_label_line(data_row, CHAR_WIDTH) is False

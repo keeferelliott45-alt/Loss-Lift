@@ -1085,6 +1085,7 @@ def _extract_record_table(
     page_number: int,
     lines: Sequence[Line],
     header_index: int,
+    block_end: int,
     layout: RecordLayout,
     char_width: float,
 ) -> RawTable | None:
@@ -1096,11 +1097,20 @@ def _extract_record_table(
     span of lines around one anchor and nothing else, so a section total under
     the last claim is never reached for, whatever it prints.
 
+    The body starts below the whole block, not below the one line that scored
+    as the header — same as the ordinary path, and for the same reason. A
+    multi-line header's own continuation lines commonly sit closer together
+    than the record lines below them do (Liberty's do: an 8pt header pitch
+    under a 10-15pt record pitch), so leaving them in the body corrupts the
+    gap statistics ``group_records`` uses to tell one record's lines apart
+    from the next record's — an entirely normal gap inside a real record then
+    reads as proof the page is not record-shaped after all.
+
     Returns None when the body does not bear the shape out, leaving the caller
     to read the page one line at a time — which yields claims with null dates
     and amounts, and a document that says so.
     """
-    body = [line for line in lines if line.index > header_index and line.words]
+    body = [line for line in lines if line.index > block_end and line.words]
     if not body or layout.identifier_span is None:
         return None
     span = layout.identifier_span
@@ -1266,18 +1276,18 @@ def _extract_positioned_table(
     layout = detect_layout(
         [split_cells(line, char_width, COLUMN_GUTTER_FACTOR) for line in block]
     )
-    if layout.is_multi_line:
-        reconstructed = _extract_record_table(
-            page_number, lines, header_index, layout, char_width
-        )
-        if reconstructed is not None:
-            return reconstructed
-
     # The table starts below the whole block, not below the one line that
     # scored as the header. A second line of labels left in the body is read
     # as a claim, and worse, its words close the gutters between the columns
     # it is naming -- so the table loses the boundaries its own header drew.
     block_end = max(line.index for line in block)
+    if layout.is_multi_line:
+        reconstructed = _extract_record_table(
+            page_number, lines, header_index, block_end, layout, char_width
+        )
+        if reconstructed is not None:
+            return reconstructed
+
     body = [line for line in lines if line.index > block_end]
     # A strapline set well below the last row is not part of the table: not a
     # claim, and not a source of column boundaries either, since its words run
