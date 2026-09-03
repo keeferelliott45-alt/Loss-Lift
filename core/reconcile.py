@@ -1,6 +1,6 @@
 """The reconciliation engine (spec section 6) — the moat.
 
-Twenty-three rules, each returning zero or more :class:`~core.schema.Finding`
+Twenty-four rules, each returning zero or more :class:`~core.schema.Finding`
 objects.  R-04 and R-05 are the ones that sell the product: they are the only
 rules that check the extraction against something the *carrier* printed rather
 than something this app computed.
@@ -1083,6 +1083,51 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
             )
         )
     return findings
+
+
+@rule("R-24")
+def r24_column_split_table(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A table's own printed geometry says two pages are one sheet, cut by
+    column for printing -- and its financial columns could not be attached to
+    a claim across that cut.
+
+    The evidence is real and specific: the column letters printed at the top
+    of each page are literally consecutive, and a value repeated at the left
+    edge of both sits at the exact height on each. That says the two pages
+    are one table. It does not say what any cell on the second half means --
+    a wrapped, multi-line header split across a narrow page can garble its
+    own column labels before any question of a second page even arises, and
+    this rule does not go further than the join it can actually defend. No
+    claim is filled in from this, on this page or any other: guessing an
+    owner for a figure once is how a reserve is reported against the wrong
+    claim, and doing it because two pages merely *look* related is worse, not
+    better, for looking justified.
+    """
+    return [
+        Finding(
+            rule_id="R-24",
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"pages-{left}-{right}",
+            severity=Severity.ERROR,
+            page=left,
+            message=(
+                f"Pages {left} and {right} print consecutive spreadsheet "
+                f"column ranges with the same row order repeated at the left "
+                f"edge of both -- this reads as one table sliced by column "
+                f"for printing. Its financial columns could not be safely "
+                f"attached to the claims read from the other page. Review "
+                f"both pages together; LossLift has not filled in any value "
+                f"from this."
+            ),
+            expected="one table's columns readable from a single page",
+            actual=f"table continues from page {left} to page {right}",
+        )
+        for left, right in doc.column_split_pages
+    ]
 
 
 # --------------------------------------------------------------------------

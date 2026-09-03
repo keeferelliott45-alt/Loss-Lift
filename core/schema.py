@@ -540,6 +540,13 @@ class LossRunDocument(BaseModel):
     unresolved_pages: list[int] = Field(default_factory=list)
     #: Source pages deliberately not attempted, such as scans with vision off.
     skipped_pages: list[int] = Field(default_factory=list)
+    #: Adjacent page pairs whose own printed geometry -- consecutive
+    #: spreadsheet column letters, a repeated row-index column at matching
+    #: heights on both -- says they are one table sliced by column for
+    #: printing. Structural fact only: it says two pages are one table, not
+    #: what any cell on either half means, so nothing here is used to fill
+    #: in a claim's fields.
+    column_split_pages: list[tuple[int, int]] = Field(default_factory=list)
     extracted_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

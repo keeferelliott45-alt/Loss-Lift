@@ -200,6 +200,181 @@ def cluster_lines(words: Sequence[Word]) -> list[Line]:
     ]
 
 
+# --------------------------------------------------------------------------
+# Column-split tables — one sheet printed as two page-halves
+# --------------------------------------------------------------------------
+#
+# A wide spreadsheet exported to PDF is often too wide for one page and gets
+# sliced by column instead of by row: page 1 carries columns A through some
+# letter, page 2 picks up where it left off. Excel's own "columns to repeat
+# at left" print option then reprints whatever sits in the frozen leading
+# column -- commonly a bare row-index -- on every slice, at the exact
+# vertical position it holds in the original sheet, because both slices are
+# rendered from the same underlying row layout.
+#
+# That gives two independent, checkable facts, neither of them an inference:
+# the printed column letters on adjacent pages are literally consecutive,
+# and a value repeated at the left edge of both pages sits at the same y on
+# both. Read together they say "these two pages are one table, cut here" --
+# not what any of the values on either half mean, which is a separate
+# question this file does not answer.
+
+#: A token that reads as one or two spreadsheet column letters and nothing
+#: else -- "AI", not "IN" or a stray abbreviation. Three-letter codes exist
+#: in principle (past column ZZ) but no real loss run is that wide, and
+#: allowing them would let ordinary short words start matching too.
+_COLUMN_LETTER = re.compile(r"^[A-Z]{1,2}$")
+
+#: The minimum run of consecutive letters accepted as a genuine band rather
+#: than a coincidence -- a handful of unrelated short uppercase tokens
+#: lining up by chance is far less likely across four or more in a row.
+MIN_LETTER_BAND = 4
+
+#: The minimum number of shared keys needed before row-position agreement
+#: means anything. Below this, two pages agreeing on one or two row heights
+#: is not yet a pattern.
+MIN_SHARED_ROWS = 3
+
+
+def _column_letter_value(token: str) -> int | None:
+    """1-based spreadsheet column index for "A".."Z", "AA".."ZZ", else None."""
+    if not _COLUMN_LETTER.match(token):
+        return None
+    value = 0
+    for char in token:
+        value = value * 26 + (ord(char) - ord("A") + 1)
+    return value
+
+
+def letter_band(line: Line) -> list[int] | None:
+    """This line's words as consecutive spreadsheet column indices, if that is
+    genuinely what they are.
+
+    Every word must read as a column letter, there must be enough of them
+    that coincidence stops being a credible explanation, and they must climb
+    by exactly one each step -- a real print-range slice never skips a
+    letter, because it never skips a column.
+    """
+    if len(line.words) < MIN_LETTER_BAND:
+        return None
+    values = [_column_letter_value(word.text) for word in line.words]
+    if any(value is None for value in values):
+        return None
+    if any(b != a + 1 for a, b in zip(values, values[1:])):
+        return None
+    return values
+
+
+def leading_integer_keys(
+    lines: Sequence[Line], char_width: float
+) -> dict[int, float] | None:
+    """Bare integers repeated down the left edge, mapped to their own y.
+
+    A multi-line record leaves most of its physical lines blank in the
+    leftmost cell, so whatever word a line happens to lead with there is not
+    reliably the row-index column -- a different field entirely can be the
+    first non-blank text on a line the index itself skips. So this does not
+    trust "first word of a line" on its own: it collects every line whose
+    first word is a bare small integer, finds the x-position most of them
+    actually sit at, and keeps only that cluster. A number sitting far to
+    the right of it belongs to some other column that happened to be the
+    leftmost thing printed on its own line, not to the index.
+    """
+    candidates: list[tuple[int, Word]] = []
+    for line in lines:
+        if not line.words:
+            continue
+        first = line.words[0]
+        if first.text.isdigit() and 1 <= len(first.text) <= 4:
+            candidates.append((int(first.text), first))
+    if len(candidates) < MIN_SHARED_ROWS:
+        return None
+
+    tolerance = max(1.0, char_width)
+    buckets: dict[float, list[tuple[int, Word]]] = {}
+    for key, word in candidates:
+        for anchor in buckets:
+            if abs(word.x0 - anchor) <= tolerance:
+                buckets[anchor].append((key, word))
+                break
+        else:
+            buckets[word.x0] = [(key, word)]
+    column = max(buckets.values(), key=len)
+    if len(column) < MIN_SHARED_ROWS:
+        return None
+
+    keys = [key for key, _ in column]
+    if len(set(keys)) != len(keys):
+        return None  # an ambiguous, repeated key names no single row
+    return {key: word.top for key, word in column}
+
+
+@dataclass(frozen=True)
+class PageSignature:
+    """What one page's own geometry says about whether it is a column-split
+    slice of a table -- independent of any other page."""
+
+    page: int
+    letters: tuple[int, ...] | None
+    keyed_rows: dict[int, float] | None
+
+
+def page_signature(page_number: int, words: Sequence[Word]) -> PageSignature:
+    lines = cluster_lines(words)
+    band: list[int] | None = None
+    for line in lines:
+        band = letter_band(line)
+        if band is not None:
+            break
+    char_width = _median_char_width(words)
+    keyed = leading_integer_keys(lines, char_width)
+    return PageSignature(page=page_number, letters=tuple(band) if band else None, keyed_rows=keyed)
+
+
+def detect_column_split_pages(
+    signatures: Sequence[PageSignature],
+) -> list[tuple[int, int]]:
+    """Adjacent page pairs that are, on this evidence, one table cut in two.
+
+    Every one of these has to hold at once: the letter bands exist and are
+    consecutive across the page break; the leading key column exists on
+    both sides and names the *same set* of rows, not merely the same count;
+    and every shared key sits at the same height on both pages. Any one of
+    them failing -- a gap in the letters, a row present on one side and not
+    the other, a key repeated, a row printed out of order, an unrelated page
+    between the two -- means these are not confidently one table, and
+    nothing here guesses past that. A coincidentally matching row count or
+    total is never even examined; this function never looks at either.
+    """
+    by_page = {sig.page: sig for sig in signatures}
+    pairs: list[tuple[int, int]] = []
+    for page in sorted(by_page):
+        left = by_page[page]
+        right = by_page.get(page + 1)
+        if right is None or left.letters is None or right.letters is None:
+            continue
+        if right.letters[0] != left.letters[-1] + 1:
+            continue  # not consecutive -- a gap, an overlap, or unrelated pages
+        if left.keyed_rows is None or right.keyed_rows is None:
+            continue
+        if set(left.keyed_rows) != set(right.keyed_rows):
+            continue  # missing, extra, or otherwise different records
+        # A tolerance scaled to the rows' own spacing, not an absolute point
+        # count: the same principle every other geometric threshold in this
+        # module follows, since a page fitted smaller shrinks its own rows
+        # with it.
+        heights = sorted(left.keyed_rows.values())
+        gaps = [b - a for a, b in zip(heights, heights[1:]) if b > a]
+        tolerance = max(1.0, (statistics.median(gaps) if gaps else 4.0) * 0.25)
+        if any(
+            abs(left.keyed_rows[key] - right.keyed_rows[key]) > tolerance
+            for key in left.keyed_rows
+        ):
+            continue  # reordered, or not really the same rows
+        pairs.append((page, page + 1))
+    return pairs
+
+
 def split_words(
     line: Line, char_width: float, gap_factor: float = CELL_GAP_FACTOR
 ) -> list[list[Word]]:
@@ -693,15 +868,44 @@ def _extract_ruled_table(
 # --------------------------------------------------------------------------
 
 
-def _is_label_line(line: Line | None) -> bool:
-    """A line that could be part of a header block: words, and no figures.
+def _looks_like_value(word: str) -> bool:
+    """A date or a currency amount -- the shapes a printed claim value takes.
 
-    Every claim row carries a date, an amount or an identifier, so a digit is
-    what separates a line of labels from the table beneath it.
+    A wrapped header's leaf line sometimes carries a short bare number: a
+    footnote marker, a sub-level ordinal ("Level 01"), or a row-index column
+    that prints on every physical line including the header's own. None of
+    those is what a claim row's digits look like -- a real value carries a
+    decimal fraction, a currency mark, a date's two separators, or three
+    digits together, none of which a stray index or an abbreviation does.
+    """
+    text = word.strip("()")
+    if DATE_SHAPED.search(text):
+        return True
+    if re.search(r"[$€£¥]", text):
+        return True
+    if sum(1 for char in text if char.isdigit()) >= 3:
+        return True
+    return "." in text and any(char.isdigit() for char in text)
+
+
+def _is_label_line(line: Line | None, char_width: float) -> bool:
+    """A line that could be part of a header block.
+
+    Every claim row carries a date, an amount or an identifier, so a value
+    shape is what separates a line of labels from the table beneath it. A
+    bare short digit does not by itself mark a row as data -- but only when
+    the rest of the line still reads as loss-run vocabulary, so a page
+    number or a blank rule sitting at the right pitch is not swept into the
+    block for lack of a decimal point.
     """
     if line is None or not line.words:
         return False
-    return not any(char.isdigit() for word in line.words for char in word.text)
+    if any(_looks_like_value(word.text) for word in line.words):
+        return False
+    if all(not word.text.isdigit() for word in line.words):
+        return True
+    cells = split_cells(line, char_width, COLUMN_GUTTER_FACTOR)
+    return header_score([text for text, _, _ in cells]) >= 3
 
 
 def header_block(
@@ -737,7 +941,7 @@ def header_block(
     block = [header]
     for index in range(header_index - 1, -1, -1):
         above = next((line for line in lines if line.index == index), None)
-        if not _is_label_line(above):
+        if not _is_label_line(above, char_width):
             break
         gap = min(word.top for word in block[0].words) - min(
             word.top for word in above.words
@@ -753,7 +957,7 @@ def header_block(
     # worse, its words close the very gutters between the columns it names.
     last = next(index for index, line in enumerate(lines) if line is header)
     for below in lines[last + 1 :]:
-        if not _is_label_line(below):
+        if not _is_label_line(below, char_width):
             break
         gap = min(word.top for word in below.words) - min(
             word.top for word in block[-1].words
@@ -1123,8 +1327,10 @@ def _extract_positioned_table(
     # what it is. Where the block describes a record line each -- Liberty gives
     # a claim seven lines and heads them with seven -- joining them per column
     # produces labels like "Incurred Indemnity Paid Indemnity Indemnity O/R"
-    # that name nothing. The body has already refused that shape by the time
-    # this runs, but the block still says what it is.
+    # that name nothing. ``layout.is_multi_line`` still says which shape the
+    # block itself is, whether or not a record attempt above found anchors to
+    # confirm it with: a page whose claims turn out not to be readable as
+    # records is not thereby a page whose header block stopped being one.
     candidates: list[tuple[list[tuple[float, float]], bool]] = [
         (gutters, False),
         (_bounds_from_header(header_cells), False),
@@ -1335,6 +1541,10 @@ class DigitalExtraction:
     metadata: DocumentMetadata
     page_texts: dict[int, str]
     page_count: int
+    #: Adjacent page pairs whose own printed geometry says they are one
+    #: table sliced by column -- see detect_column_split_pages. Structural
+    #: evidence only; no claim or money field is read to produce this.
+    column_split_pages: list[tuple[int, int]] = dataclass_field(default_factory=list)
 
     @property
     def all_rows(self) -> list[RawRow]:
@@ -1359,16 +1569,25 @@ def extract_pdf(
     """
     tables: list[RawTable] = []
     page_texts: dict[int, str] = {}
+    signatures: list[PageSignature] = []
 
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
         for index, page in enumerate(pdf.pages, start=1):
+            # Read for every page, not only the ones ``pages`` selects for
+            # table extraction: a scanned page between two digital ones has
+            # to read as "no letter band here" for the pairing below to
+            # correctly refuse to join across it, and it only reads that way
+            # if it was looked at.
+            signatures.append(page_signature(index, page_words(page)))
             if pages is not None and index not in pages:
                 continue
             page_texts[index] = page.extract_text() or ""
             table = extract_page_table(page, index)
             if table is not None:
                 tables.append(table)
+
+    column_split_pages = detect_column_split_pages(signatures)
 
     first_text = page_texts.get(min(page_texts), "") if page_texts else ""
     metadata = extract_metadata(first_text)
@@ -1422,4 +1641,5 @@ def extract_pdf(
         metadata=metadata,
         page_texts=page_texts,
         page_count=page_count,
+        column_split_pages=column_split_pages,
     )

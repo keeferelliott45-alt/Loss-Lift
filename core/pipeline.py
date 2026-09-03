@@ -1239,6 +1239,7 @@ def run_pipeline(
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
         unplaced_rows=unplaced_rows,
+        column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,
         printed_claim_count=metadata.printed_claim_count,
         policy_periods=declared_periods,
