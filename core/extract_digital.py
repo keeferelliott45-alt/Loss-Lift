@@ -65,6 +65,22 @@ CLAIM_COUNT_LABEL = re.compile(
     re.IGNORECASE,
 )
 
+#: The same label with its number actually beside it — "Claim Count = 4",
+#: "Claim Count : 28". A carrier that groups a run by policy prints one
+#: subtotal per group, and not all of them use the word "total" for it: AIG's
+#: reads "Pol-Asco-Mod: <policy> Claim Count = 4" and then the amounts. Saying
+#: how many claims a row's figures cover is the same claim to be a total as
+#: saying "Totals:", so it is read as one.
+#:
+#: The count has to be there. A column *headed* "Claim Count" names a column
+#: and totals nothing, and a header promoted to a totals row takes the table
+#: with it, so the bare label is deliberately not enough.
+COUNTED_TOTAL_LABEL = re.compile(
+    r"(?:\b(?:claims?|losses|loss)\s*(?:count|cnt)\b|\bcount\s+of\s+(?:claims?|losses))"
+    r"\s*[:=]?\s*\d",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class Word:
@@ -692,7 +708,9 @@ def assign_to_columns(
 def _is_total_line(line: Line) -> bool:
     if TOTAL_ROW_PATTERN.search(line.leading_text(3)):
         return True
-    return bool(TRAILING_TOTAL_LABEL.search(line.leading_text(8)))
+    if TRAILING_TOTAL_LABEL.search(line.leading_text(8)):
+        return True
+    return bool(COUNTED_TOTAL_LABEL.search(line.leading_text(8)))
 
 
 def _merge_total_row(label: RawRow, values: Sequence[str]) -> RawRow:
@@ -1409,7 +1427,13 @@ def _extract_positioned_table(
     pending_label: RawRow | None = None
     for line in body:
         cells = assign_to_columns(line, bounds, char_width)
-        is_total = _is_total_line(line)
+        # A header repeated mid-page is asked about first, as the record path
+        # already asks. A totals label can be recognised in a header's words --
+        # a "Claim Count" column is headed with the same phrase a counted
+        # subtotal carries -- and a header read as a totals row takes the
+        # table's rows with it, so being a header settles it either way.
+        header_here = looks_like_header(cells)
+        is_total = not header_here and _is_total_line(line)
         money_here = _money_token_count(line)
 
         if pending_label is not None:
@@ -1434,7 +1458,7 @@ def _extract_positioned_table(
                 pending_label = row  # its amounts are on the line below
             else:
                 total_rows.append(row)
-        elif looks_like_header(cells):
+        elif header_here:
             continue  # a header repeated mid-page
         else:
             rows.append(row)
@@ -1509,7 +1533,12 @@ GRAND_COUNT_PATTERN = re.compile(
 
 _COUNT_PATTERNS = (
     r"(?:total|number\s*of|count\s*of)\s*(?:claims?|records?|rows?)\s*[:\-]?\s*(\d[\d,]*)",
-    r"claims?\s*count\s*[:\-]?\s*(\d[\d,]*)",
+    # "Claim Count = 4" as well as "Claim Count: 4". The equals form is what
+    # makes a counted subtotal a total (see COUNTED_TOTAL_LABEL), and a total
+    # whose count cannot be read here is a total nothing can tell apart from
+    # the document's own -- which is how a per-policy subtotal ends up standing
+    # in as the grand total for a different set of claims.
+    r"claims?\s*count\s*[:=\-]?\s*(\d[\d,]*)",
     # Footer rows commonly read just "Claims: 2". The plural and the colon are
     # both required so a "Claim #: 12345" identifier is never read as a count.
     r"\bclaims\s*[:]\s*(\d[\d,]*)",
@@ -1661,11 +1690,21 @@ def extract_pdf(
         metadata.printed_claim_count = grand_count
     elif metadata.printed_claim_count is None:
         # The claim count is usually printed under the totals on the last page.
-        for _, text in sorted(page_texts.items(), reverse=True):
-            found = extract_metadata(text).printed_claim_count
-            if found is not None:
-                metadata.printed_claim_count = found
-                break
+        # A run grouped by policy prints one under each group instead, and the
+        # last page's is that group's count, not the document's -- R-05 would
+        # then read a four-claim subtotal as the whole report and call eight
+        # correctly extracted claims a discrepancy. So every count the document
+        # states is collected, and one is adopted only where they agree: a
+        # running footer repeating the same figure is the document speaking
+        # once, several different figures are several sections speaking for
+        # themselves, and neither this rule nor any other may pick between them.
+        stated = {
+            found
+            for text in page_texts.values()
+            if (found := extract_metadata(text).printed_claim_count) is not None
+        }
+        if len(stated) == 1:
+            metadata.printed_claim_count = stated.pop()
 
     return DigitalExtraction(
         tables=tables,

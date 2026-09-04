@@ -24,7 +24,7 @@ from decimal import Decimal
 import pymupdf
 import pytest
 
-from core.pipeline import run_pipeline
+from core.pipeline import _is_smeared, run_pipeline
 from core.schema import DocumentStatus, Severity
 
 LINE = 14.0
@@ -562,3 +562,33 @@ def test_excel_date_serials_under_a_money_column_are_never_reported_as_money(
     assert result.document.unplaced_rows == []
     assert not [f for f in result.reconciliation.findings if f.rule_id == "R-23"]
     assert result.reconciliation.status is DocumentStatus.CLEAN
+
+
+@pytest.mark.parametrize(
+    "printed, smeared",
+    [
+        ("5.700,50 €", False),   # EU amount with the symbol printed after it
+        ("€ 5.700,50", False),   # and before it
+        ("1 200,00 €", False),   # space-grouped, with the symbol beside it
+        ("$ 1,234.56", False),
+        ("5.700,50 EUR", False),  # the ISO code rather than the symbol
+        ("1,234.56 CR", False),   # the credit marker, which was already handled
+        ("4 30,000.00 €", True),  # still a smear; the symbol changes nothing
+        ("4 .00 €", True),
+    ],
+)
+def test_a_currency_symbol_is_not_one_of_the_number_s_groups(printed, smeared):
+    """A symbol beside an amount is not a second figure glued to it.
+
+    ``_is_smeared`` asks whether the whitespace in a cell is grouping one
+    number or fusing two, by requiring every whitespace-separated run after the
+    first to be a three-digit group. A currency symbol is a run that can never
+    satisfy that, so every EU-formatted amount printed the ordinary way --
+    "5.700,50 €" -- was condemned as a smear.
+
+    Two things were lost by it, in opposite directions. On a row nothing could
+    place, real money went unreported: the cell was skipped before it was ever
+    parsed. On a totals row it threw away the carrier's own printed figure,
+    which is the only number R-04 has to check anything against.
+    """
+    assert _is_smeared(printed) is smeared, printed

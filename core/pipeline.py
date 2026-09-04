@@ -16,7 +16,13 @@ from typing import Any, Sequence
 
 from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
-from core.extract_digital import _COUNT_PATTERNS, _first_match, DocumentMetadata
+from core.extract_digital import (
+    _COUNT_PATTERNS,
+    _first_match,
+    CLAIM_COUNT_LABEL,
+    COUNTED_TOTAL_LABEL,
+    DocumentMetadata,
+)
 from core.ingest import IngestedFile, ingest_path
 from core.normalize import (
     DateOrderInference,
@@ -30,6 +36,7 @@ from core.normalize import (
     parse_date,
     parse_int,
     parse_money,
+    _strip_currency,
     parse_status,
     normalize_label,
     parse_text,
@@ -393,8 +400,15 @@ def _is_smeared(text: str) -> bool:
     Only the space is in question here. A comma or a period inside one token
     already tells its own story and is left to :func:`parse_money`; this asks
     only whether the *whitespace* is doing a printer's job or an accident's.
+
+    A currency symbol is not one of the number's groups. "5.700,50 €" is one
+    amount printed the way half of Europe prints it, and counting the euro sign
+    as a second group condemned the whole cell -- which on a totals row means
+    the carrier's own printed figure is thrown away, and on an unplaced row
+    means real money goes unreported. It is removed before the question is
+    asked, along with the credit marker, for the same reason.
     """
-    tokens = _CREDIT_SUFFIX.sub("", text).split()
+    tokens = _strip_currency(_CREDIT_SUFFIX.sub("", text))[0].split()
     if len(tokens) < 2:
         return False
     return not all(_GROUP_CONTINUATION.match(token) for token in tokens[1:])
@@ -734,6 +748,36 @@ def _covers(row_text: str, claim_count: int | None) -> int:
     return 1 if stated == claim_count else -1
 
 
+def _is_the_claim_count(row: RawRow, index: int) -> bool:
+    """Whether this cell of a totals row holds its claim count, not an amount.
+
+    A subtotal that says how many claims it covers prints the label and the
+    number beside each other -- "Claim Count = 4" -- and where the label ends
+    on a column boundary the number lands one column to the right, under a
+    money heading. It is not that column's total; it is how many claims the
+    totals cover, and recording it as money reports a figure the carrier never
+    printed, on the one row a reviewer is most likely to trust.
+
+    Two things have to hold, because either alone is wrong. The cell to the
+    left must carry the label *without* its number, since a label that already
+    has its count beside it has been read and whatever follows is money. And
+    this cell must be a bare run of digits: no separator, no fraction, nothing
+    a printed amount would carry.
+    """
+    text = row.cell(index).strip()
+    if not text.isdigit():
+        return False
+    for before in range(index - 1, -1, -1):
+        previous = row.cell(before).strip()
+        if not previous:
+            continue
+        return bool(
+            CLAIM_COUNT_LABEL.search(previous)
+            and not COUNTED_TOTAL_LABEL.search(previous)
+        )
+    return False
+
+
 def collect_printed_totals(
     tables: Sequence[RawTable],
     mapping: ColumnMapping,
@@ -751,7 +795,7 @@ def collect_printed_totals(
                 if field_name not in MONEY_FIELDS:
                     continue
                 cell = row.cell(index).strip()
-                if not cell:
+                if not cell or _is_smeared(cell) or _is_the_claim_count(row, index):
                     continue
                 parsed = parse_money(cell, locale)
                 if parsed.value is not None:
@@ -771,8 +815,14 @@ def collect_printed_totals(
     return best
 
 
-#: The claim count printed inside a subtotal row, e.g. "# Claims: 6".
-_SECTION_COUNT = re.compile(r"#?\s*claims?\s*:?\s*(\d[\d,]*)", re.IGNORECASE)
+#: The claim count printed inside a subtotal row, e.g. "# Claims: 6" or
+#: "Claim Count = 4". The word "count" and an equals sign are both forms
+#: carriers use for the same statement, and a subtotal that says how many
+#: claims it covers is the only thing that lets that subtotal be checked
+#: against the right rows.
+_SECTION_COUNT = re.compile(
+    r"#?\s*claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)", re.IGNORECASE
+)
 #: The date a subtotal row leads with, naming the term it totals.
 _SECTION_DATE = re.compile(r"\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}")
 
@@ -801,7 +851,7 @@ def collect_printed_sections(
                 if field_name not in MONEY_FIELDS:
                     continue
                 cell = row.cell(index).strip()
-                if cell:
+                if cell and not _is_smeared(cell) and not _is_the_claim_count(row, index):
                     parsed = parse_money(cell, locale)
                     if parsed.value is not None:
                         totals[field_name] = parsed.value
