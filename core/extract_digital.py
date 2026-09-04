@@ -16,7 +16,7 @@ import re
 import statistics
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import pdfplumber
 
@@ -1270,12 +1270,25 @@ def _extract_record_table(
         line = body[index]
         if looks_like_header([text for text, _, _ in cells[line.index]]):
             continue  # a header repeated mid-page
+        # Why a line was left out of every record is worth carrying. It was
+        # left out because it ends a record rather than continuing one -- a
+        # contract block, a policy label, a section total -- and the claim
+        # builder, seeing only cells whose column boundaries have since moved,
+        # would otherwise have to work that out again from less evidence than
+        # was available here. Where it failed to, the line became the previous
+        # claim's accident description.
+        if _is_total_line(line):
+            kind = "total"
+        elif _ends_a_record(line, cells[line.index]):
+            kind = "meta"
+        else:
+            kind = "data"
         row = RawRow(
             cells=placed(line, _fitting_slice(line, slices, char_width)),
             page=page_number,
             line_index=line.index,
             bbox=line.bbox,
-            kind="total" if _is_total_line(line) else "data",
+            kind=kind,
         )
         if row.is_blank():
             continue
@@ -1525,9 +1538,13 @@ _PERIOD_PATTERN = re.compile(
 )
 
 #: A grand-total label and the claim count beneath it, e.g. "Report Totals:"
-#: on one line and "# Claims: 50" on the next.
+#: on one line and "# Claims: 50" on the next. The count may name itself --
+#: Liberty writes "Report Totals Claim Count : 28" on one line -- so the word
+#: and an equals sign are both allowed between the label and its number, the
+#: same two forms _COUNT_PATTERNS accepts.
 GRAND_COUNT_PATTERN = re.compile(
-    r"(?:grand|report|overall|final)\s+totals?\s*:?[\s#]*claims?\s*:?\s*(\d[\d,]*)",
+    r"(?:grand|report|overall|final)\s+totals?\s*:?[\s#]*"
+    r"claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)",
     re.IGNORECASE,
 )
 
@@ -1552,6 +1569,71 @@ def _first_match(text: str, patterns: Iterable[str]) -> str | None:
         if match:
             return clean_text(match.group(1))
     return None
+
+
+def stated_claim_counts(text: str) -> list[int]:
+    """Every claim count printed in this text, in the order it is printed.
+
+    A page can state more than one: Illinois prints a section's ``# Claims: 8``
+    and the report's ``# Claims: 50`` on the same page, and reading only the
+    first takes the section and never sees the report beneath it.
+
+    Overlapping patterns are collapsed by position, so a count matched by two
+    of them is one count and not two.
+    """
+    spans: dict[tuple[int, int], int] = {}
+    for pattern in _COUNT_PATTERNS:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = parse_int(clean_text(match.group(1)))
+            if value is not None:
+                spans[match.span(1)] = value
+    return [value for _span, value in sorted(spans.items())]
+
+
+def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
+    """How many claims the document says it holds -- or None if it never says.
+
+    R-05 is one of the two rules that check against something the carrier
+    printed rather than against the app's own arithmetic, so a count taken
+    from the wrong scope makes the strongest rule in the engine report a
+    discrepancy nobody made. A run grouped by policy prints a count under
+    every group, and any of them will look like an answer.
+
+    Illinois settles how to tell them apart, because it rules out the obvious
+    way: it prints seven section counts and the report total in *identical*
+    wording, ``# Claims: N`` throughout. What marks 50 out is that it is
+    6+9+6+8+6+7+8 -- the document total is the one that totals the others.
+    That is arithmetic the carrier printed, not a guess about labels.
+
+    So, in order: a grand/report/overall/final total states its own scope; a
+    document stating exactly one count has stated its own; and otherwise the
+    single count that adds the rest up is the report's. Failing all three the
+    scope is unestablished and nothing is adopted -- agreement is not enough,
+    since two policies of four claims each agree at four while the document
+    holds eight, and a confident wrong answer here is worse than no answer.
+    """
+    for _page, text in sorted(page_texts.items(), reverse=True):
+        match = GRAND_COUNT_PATTERN.search(text)
+        if match:
+            return parse_int(match.group(1))
+
+    counts = [
+        count
+        for _page, text in sorted(page_texts.items())
+        for count in stated_claim_counts(text)
+    ]
+    if not counts:
+        return None
+    if len(counts) == 1:
+        return counts[0]
+
+    total = sum(counts)
+    covering = [
+        index for index, count in enumerate(counts) if count * 2 == total
+    ]
+    # Exactly one, or nothing is established: on ``[4, 4]`` both entries equal
+    # the sum of the rest, which is precisely the case that must not resolve.
+    return counts[covering[0]] if len(covering) == 1 else None
 
 
 def _labelled_value(text: str, *labels: str) -> str | None:
@@ -1688,23 +1770,12 @@ def extract_pdf(
 
     if grand_count is not None:
         metadata.printed_claim_count = grand_count
-    elif metadata.printed_claim_count is None:
-        # The claim count is usually printed under the totals on the last page.
-        # A run grouped by policy prints one under each group instead, and the
-        # last page's is that group's count, not the document's -- R-05 would
-        # then read a four-claim subtotal as the whole report and call eight
-        # correctly extracted claims a discrepancy. So every count the document
-        # states is collected, and one is adopted only where they agree: a
-        # running footer repeating the same figure is the document speaking
-        # once, several different figures are several sections speaking for
-        # themselves, and neither this rule nor any other may pick between them.
-        stated = {
-            found
-            for text in page_texts.values()
-            if (found := extract_metadata(text).printed_claim_count) is not None
-        }
-        if len(stated) == 1:
-            metadata.printed_claim_count = stated.pop()
+    else:
+        # Unconditionally, not only where page 1 stated nothing. A count read
+        # off the first page is a section's as readily as any other, and
+        # leaving it in place let a policy subtotal stand as the document's
+        # without the other pages ever being consulted.
+        metadata.printed_claim_count = document_claim_count(page_texts)
 
     return DigitalExtraction(
         tables=tables,

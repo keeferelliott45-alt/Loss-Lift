@@ -37,6 +37,8 @@ from core.normalize import (
     parse_int,
     parse_money,
     _strip_currency,
+    CURRENCY_CODES,
+    CURRENCY_SYMBOLS,
     parse_status,
     normalize_label,
     parse_text,
@@ -384,6 +386,38 @@ _CREDIT_SUFFIX = re.compile(r"\s+(?:CR|DR)\s*$", re.IGNORECASE)
 #: applied here to the group *after* a space rather than a comma or a period.
 _GROUP_CONTINUATION = re.compile(r"^\d{3}(?:[.,]\d+)?$")
 
+#: Every way a currency is marked on a cell: the symbols, longest first so
+#: "US$" is not read as a bare "$", and the ISO codes standing as whole words.
+_CURRENCY_MARK = re.compile(
+    "|".join(
+        [
+            *(re.escape(symbol) for symbol in sorted(CURRENCY_SYMBOLS, key=len, reverse=True)),
+            r"(?<![A-Za-z])(?:%s)(?![A-Za-z])" % "|".join(sorted(CURRENCY_CODES)),
+        ]
+    ),
+    re.IGNORECASE,
+)
+
+
+def _marks_two_amounts(text: str) -> bool:
+    """Whether a currency marker sits *between* this cell's digits.
+
+    Carriers put the marker at one end of an amount or the other: "$1,234.56",
+    "5.700,50 €", "$ 1 234,56", and even "$1,234.56 USD" keep every marker
+    outside the digits. No convention writes one between the groups of a
+    single number, so a marker with digits on both sides of it is a second
+    amount's marker, and the cell holds two amounts.
+
+    Position rather than a count of markers, because the count is wrong in
+    both directions: "$1,234.56 USD" carries two and is one amount, and a cell
+    could hold two amounts of which only the second is marked.
+    """
+    for mark in _CURRENCY_MARK.finditer(text):
+        before, after = text[: mark.start()], text[mark.end() :]
+        if any(ch.isdigit() for ch in before) and any(ch.isdigit() for ch in after):
+            return True
+    return False
+
 
 def _is_smeared(text: str) -> bool:
     """Whether the space in this cell glues two unrelated numbers together.
@@ -407,7 +441,14 @@ def _is_smeared(text: str) -> bool:
     the carrier's own printed figure is thrown away, and on an unplaced row
     means real money goes unreported. It is removed before the question is
     asked, along with the credit marker, for the same reason.
+
+    Removing the markers first is also how a cell holding *two* marked amounts
+    came to read as one: "$1 $234" left "1 234", which is a perfectly good
+    space-grouped twelve hundred and thirty-four, and nothing on the page says
+    that. So the markers are asked where they sit before they are taken away.
     """
+    if _marks_two_amounts(text):
+        return True
     tokens = _strip_currency(_CREDIT_SUFFIX.sub("", text))[0].split()
     if len(tokens) < 2:
         return False
@@ -563,7 +604,13 @@ def build_claims(
         table_mapping = mapping_for(table, mapping)
 
         for row in table.rows:
-            if is_structural_row(row, table_mapping):
+            if row.kind == "meta" or is_structural_row(row, table_mapping):
+                # ``meta`` is the extractor's own finding that this line
+                # belongs to the document and not to any claim. It is trusted
+                # here rather than re-derived: the extractor saw the line whole
+                # and in the company of the lines around it, while by now the
+                # column boundaries have been redrawn and the label may no
+                # longer sit in the cell ``is_structural_row`` reads.
                 continue
             text = _normalised(row)
             if not text or text in furniture:

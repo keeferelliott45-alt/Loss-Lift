@@ -1016,7 +1016,14 @@ class RawRow(BaseModel):
     page: int = 1
     line_index: int = 0
     bbox: tuple[float, float, float, float] | None = None
-    kind: str = "data"  # data | total | header
+    #: What the extractor made of this printed line. ``meta`` is a line it
+    #: recognised as belonging to the document rather than to any claim -- a
+    #: contract or policy block, a section label. It is kept as a row so the
+    #: page's contents are not silently dropped, but it is not claim data and
+    #: must never be folded into a claim's text: the line above a continuation
+    #: page's first claim is the *previous page's* last claim, and a contract
+    #: number appended there becomes part of an accident description.
+    kind: str = "data"  # data | total | header | meta
 
     #: Every printed line this row was read from, when a carrier spreads one
     #: claim over several. Empty means the row is one line, at ``line_index``.
