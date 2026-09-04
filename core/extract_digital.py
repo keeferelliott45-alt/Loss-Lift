@@ -520,11 +520,19 @@ def subdivided(
             for line in data_lines
             if any(word.x0 < end and word.x1 > start for word in line.words)
         ]
-        spacing = _word_spacing(rows, start, end, gutter)
         cuts: list[float] = []
         for left, right in zip(over, over[1:]):
             if right[1] - left[2] < gutter:
                 continue  # one label wrapped, not two labels
+            # Word spacing is measured across the pair being separated, not
+            # across the whole merged run. Where one gutter column covers
+            # three printed columns, spanning it averages in the gaps
+            # *between* those columns -- the very gaps this measurement
+            # exists to exclude -- and reports them as ordinary word
+            # spacing, so a real boundary narrower than them is refused.
+            spacing = _word_spacing(
+                rows, max(left[1], start), min(right[2], end), gutter
+            )
             point = _blank_point(
                 rows, max(left[2], start), min(right[1], end), spacing
             )
@@ -1170,7 +1178,20 @@ def _extract_record_table(
             if not bounds:
                 continue
             labels = _pair_labels(header_cells, bounds)
-            named = sum(1 for label in labels if label)
+            # Only labels over a column the rows actually fill are counted. A
+            # header names every field the format can carry, including ones
+            # this page leaves empty, and naming an empty column is no
+            # evidence that the boundaries around the filled ones are right.
+            # Counted plainly, a reading that splits a populated column in
+            # the wrong place outscores one that reads every populated column
+            # correctly, purely by naming a column nothing is printed under.
+            filled = [
+                any(cells[index].strip() for cells in member_cells)
+                for index in range(len(bounds))
+            ] if (member_cells := [
+                assign_to_columns(member, bounds, char_width) for member in members
+            ]) else []
+            named = sum(1 for label, used in zip(labels, filled) if label and used)
             if best is None or named > best[0]:
                 best = (named, list(bounds), labels)
         if best is None:

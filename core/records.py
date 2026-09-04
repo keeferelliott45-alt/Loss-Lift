@@ -42,6 +42,16 @@ Cell = tuple[str, float, float]
 #: from its predecessor. Beyond it, the next line belongs to the next record.
 MAX_INTRA_GAP_RATIO = 1.5
 
+#: Slack allowed when judging a line too far from its predecessor. Both
+#: sides of that comparison are floating-point differences of PDF word
+#: coordinates, so a gap sitting essentially on the limit can fall either
+#: way on rounding alone: one real page differs by 2.8e-14, orders below
+#: any spacing a document could be expressing deliberately. This is a
+#: practical tolerance rather than a derived error bound -- set well above
+#: the rounding noise seen here, and well below the smallest real gap
+#: margin in the reference corpus (7.5e-3), which it must not mask.
+GAP_COMPARISON_TOLERANCE = 1e-6
+
 #: A cell shorter than this is a code or a stray digit, never a claim number.
 MIN_IDENTIFIER_LENGTH = 3
 
@@ -380,8 +390,27 @@ def group_records(
     assert layout.identifier_line is not None
     height, offset = layout.height, layout.identifier_line
 
+    # A line already known to end a record -- a printed total, a claim
+    # count, a "Label:" line -- is not part of any claim's own rhythm.
+    # Liberty prints such lines with a tighter pitch than real claim
+    # content, so a gap touching one understates how far apart this
+    # page's genuine record lines actually sit, and every span on the
+    # page is then measured against a floor that was never really theirs.
+    # Only the gap pair itself is dropped -- the surrounding tops are
+    # untouched, so this never invents a gap across the excluded line the
+    # way removing it from ``tops`` before differencing would.
     gaps = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
-    limit = max(min(gaps, default=0.0), 1.0) * MAX_INTRA_GAP_RATIO
+    claim_gaps = [
+        gap
+        for i, gap in enumerate(gaps)
+        if not is_boundary[i] and not is_boundary[i + 1]
+    ]
+    # If every gap on the page touches a boundary line, there is no
+    # boundary-free evidence to prefer -- fall back to the unfiltered
+    # gaps exactly as before this filter existed, rather than leaving the
+    # floor computed from nothing (which `min(..., default=0.0)` would
+    # turn into an unreachably tight limit) or skipping the safeguard.
+    limit = max(min(claim_gaps or gaps, default=0.0), 1.0) * MAX_INTRA_GAP_RATIO
 
     records: list[list[int]] = []
     claimed: set[int] = set()
@@ -396,7 +425,7 @@ def group_records(
             or sum(has_identifier[index] for index in span) != 1
             or any(is_boundary[index] for index in span)
             or any(
-                tops[span[step + 1]] - tops[span[step]] > limit
+                tops[span[step + 1]] - tops[span[step]] > limit + GAP_COMPARISON_TOLERANCE
                 for step in range(height - 1)
             )
         ):
