@@ -524,6 +524,11 @@ class LossRunDocument(BaseModel):
     #: exemption for a third: the column simply stops being checked, and a
     #: reviewer has to be told which one and why.
     unreadable_totals: dict[str, str] = Field(default_factory=dict)
+    #: Which printed line that row was, when the reading has one. A vision
+    #: result can report a figure without a line to point at; that stays None
+    #: and is reported as unknown rather than filled with a number nobody
+    #: measured. None is the absence of a measurement, not the value zero.
+    unreadable_totals_row: int | None = None
     #: The page that row was printed on, so the finding can point at it.
     unreadable_totals_page: int | None = None
 

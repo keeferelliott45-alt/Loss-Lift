@@ -8,7 +8,7 @@ UI does any of this work.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, field as dataclass_field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -406,6 +406,14 @@ _NAMES_A_NON_MONEY_VALUE = re.compile(
     re.IGNORECASE,
 )
 
+#: Two separate runs of digits in one cell -- what a column boundary running
+#: two numbers together actually looks like. ``_is_smeared`` answers a
+#: narrower question, whether whitespace is grouping one number or fusing two,
+#: and it only ever meant anything about text already known to be numeric: ask
+#: it about "Property Claim" and it says True, because "Claim" is not a
+#: three-digit group. Prose is a text-only row and stays an ordinary warning.
+_TWO_NUMERIC_RUNS = re.compile(r"\d[^\s]*\s+[^\s]*\d")
+
 #: A trailing credit or debit marker is a word, not a second number, so it is
 #: stripped before anything asks whether the digits before it are one amount
 #: or two.
@@ -499,9 +507,13 @@ class UnplacedEvidence:
 
     amounts: dict[str, tuple[str, Decimal]]
     ambiguous: dict[str, tuple[str, Decimal]]
+    #: Cells refused as values because a column boundary ran two numbers
+    #: together. Text only: there is deliberately no number here, since any
+    #: number would be one the page never printed.
+    unreadable: dict[str, str] = dataclass_field(default_factory=dict)
 
     def __bool__(self) -> bool:
-        return bool(self.amounts or self.ambiguous)
+        return bool(self.amounts or self.ambiguous or self.unreadable)
 
 
 def _row_establishes_claim_data(values: dict[str, str]) -> bool:
@@ -532,7 +544,17 @@ def table_money_context(
     on it can be called money at all.
     """
     mapped = mapping.mapped_fields
-    if mapped and mapped <= set(MONEY_FIELDS):
+    populated_unmapped = any(
+        row.cell(index).strip()
+        for row in table.rows
+        for index in range(len(row.cells))
+        if mapping.fields.get(index) is None
+    )
+    # Every mapped field being money says what the mapper managed to place, not
+    # what the table holds. A populated column nobody mapped is precisely the
+    # state in which the mapping is least trustworthy, and concluding "every
+    # number here is money" from the columns that happened to map is circular.
+    if mapped and mapped <= set(MONEY_FIELDS) and not populated_unmapped:
         return "monetary-only"
     if any(
         not is_structural_row(row, mapping)
@@ -576,18 +598,33 @@ def unplaced_evidence(
     """
     values = _row_values(row, mapping)
     parsed: dict[str, tuple[str, Decimal]] = {}
+    # Text a column boundary ran together -- "4 30,000.00" -- is refused as a
+    # *value*, because parsing it invents 430,000. It is not refused as
+    # evidence: the page printed something under a money column and no claim
+    # took it, which is exactly what an unplaced row is for. It goes straight
+    # to the unresolved side, never to `amounts`, and never with a number.
+    merged: dict[str, str] = {}
     for name in MONEY_FIELDS:
         text = (values.get(name) or "").strip()
-        if not text or _is_smeared(text):
+        if not text:
+            continue
+        if _is_smeared(text):
+            # Refused as a value either way. Recorded as evidence only when it
+            # really is two numbers run together; otherwise it is prose that
+            # happens to share a column, and belongs in the warning it always
+            # went to.
+            if _TWO_NUMERIC_RUNS.search(text):
+                merged[name] = text
             continue
         amount = parse_money(text, locale).value
         if amount is not None:
             parsed[name] = (text, amount)
-    if not parsed:
+    if not parsed and not merged:
         return UnplacedEvidence({}, {})
 
+    unresolved: dict[str, tuple[str, Decimal]] = {}
     if _row_establishes_claim_data(values):
-        return UnplacedEvidence(parsed, {})
+        return UnplacedEvidence(parsed, unresolved, merged)
 
     labelling = clean_text(
         " ".join(
@@ -597,15 +634,23 @@ def unplaced_evidence(
         )
     )
     if _NAMES_A_NON_MONEY_VALUE.search(labelling):
-        return UnplacedEvidence({}, {})
+        # A label names one value, and which one depends on whether it already
+        # carries a number. "Policy year" with a lone 2024.00 under a money
+        # column is naming that figure, and the row holds nothing else it could
+        # mean. "Software version 1.20" has already named its own number, so it
+        # says nothing whatever about a $500.00 further along the row -- and
+        # letting the word "version" erase that cell loses real money to a
+        # string match.
+        if not any(character.isdigit() for character in labelling):
+            return UnplacedEvidence({}, {}, merged) if merged else UnplacedEvidence({}, {})
 
     if context == "monetary-only":
-        return UnplacedEvidence(parsed, {})
-    if context == "claims" and all(
+        return UnplacedEvidence(parsed, unresolved, merged)
+    if context == "claims" and parsed and all(
         _FINANCIAL_NOTATION.search(text) for text, _value in parsed.values()
     ):
-        return UnplacedEvidence(parsed, {})
-    return UnplacedEvidence({}, parsed)
+        return UnplacedEvidence(parsed, unresolved, merged)
+    return UnplacedEvidence({}, parsed, merged)
 
 
 def unplaced_money(
@@ -846,7 +891,15 @@ def _record_discard(
                     name: value for name, (_text, value) in evidence.amounts.items()
                 },
                 ambiguous_values={
-                    name: text for name, (text, _value) in evidence.ambiguous.items()
+                    **{
+                        name: text
+                        for name, (text, _value) in evidence.ambiguous.items()
+                    },
+                    # Refused text belongs here too: it is unresolved evidence
+                    # of exactly the kind this field exists for, and the only
+                    # thing that must never happen to it is being given a
+                    # number.
+                    **evidence.unreadable,
                 },
             )
         )
@@ -1136,6 +1189,31 @@ def collect_printed_sections(
     return sections
 
 
+def vision_claim_count(counts: Sequence[dict[str, int]]) -> int | None:
+    """The document's claim count from scanned pages, or None if unestablished.
+
+    A scanned page prints its claim count like any other page, and the digital
+    path spent a whole correction learning that a count under a policy section
+    is that section's. This path used to take the first count it was handed,
+    whatever its scope -- so three scanned sections reporting 3, 2 and 1 gave
+    the document 3, and where that happened to equal the number of claims
+    extracted, R-05 fell silent and the badge went green on a document two
+    thirds of which was never counted.
+
+    The vision reader returns a number, not the wording around it, so the
+    strongest test the digital path uses -- a "Report Totals" label -- is not
+    available here. What remains is the one thing several pages can still
+    establish between them: a single count, or the same count repeated, is the
+    document speaking once. Different counts are several sections speaking for
+    themselves, and none of them may stand for the report.
+
+    Every count is preserved by the caller with the page it came from, so a
+    rule can say the document's count is unresolved rather than absent.
+    """
+    stated = {entry["count"] for entry in counts}
+    return stated.pop() if len(stated) == 1 else None
+
+
 def scope_sections(
     sections: Sequence[PrintedSection], claims: Sequence[Claim]
 ) -> None:
@@ -1399,11 +1477,16 @@ def run_pipeline(
     # A scanned page prints its valuation date and claim count like any other,
     # but there is no text layer to read them from, so the vision pass reports
     # them and they are used only where the digital pass found nothing.
+    vision_counts = [
+        {"page": table.page, "count": table.printed_claim_count}
+        for table in vision_tables
+        if table.printed_claim_count is not None
+    ]
     for table in vision_tables:
         if metadata.valuation_date_text is None and table.valuation_date_text:
             metadata.valuation_date_text = table.valuation_date_text
-        if metadata.printed_claim_count is None and table.printed_claim_count:
-            metadata.printed_claim_count = table.printed_claim_count
+    if metadata.printed_claim_count is None:
+        metadata.printed_claim_count = vision_claim_count(vision_counts)
 
     first_page_text = extraction.page_texts.get(
         min(extraction.page_texts), ""
@@ -1630,6 +1713,9 @@ def run_pipeline(
         unreadable_totals=unreadable_totals,
         unreadable_totals_page=(
             document_total_row[0] if document_total_row else None
+        ),
+        unreadable_totals_row=(
+            document_total_row[1] if document_total_row else None
         ),
         printed_count_evidence=counted_claim_evidence(extraction.page_texts),
         policy_periods=declared_periods,

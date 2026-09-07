@@ -1263,6 +1263,12 @@ def r26_unreadable_printed_totals(
     columns tying does not earn the refused one an exemption: R-04 proves the
     columns it could read, and says nothing whatever about the one it could
     not.
+
+    Where the row was printed is part of the finding, because a reviewer has to
+    go and look. Where the reading genuinely has no line -- a vision result
+    reporting a figure without one -- the finding says the row is unknown. It
+    does not write a zero: that would be a measurement nobody made, and this
+    rule exists because a value nobody measured was presented as one.
     """
     findings: list[Finding] = []
     withheld: list[tuple[str, int, int | None, str, str]] = [
@@ -1272,8 +1278,23 @@ def r26_unreadable_printed_totals(
         for field_name, printed in sorted(section.unreadable_totals.items())
     ]
     withheld += [
-        ("the document's total row", doc.unreadable_totals_page or 0, None,
-         field_name, printed)
+        (
+            (
+                f"the document's total row on page "
+                f"{doc.unreadable_totals_page}, line {doc.unreadable_totals_row}"
+                if doc.unreadable_totals_row is not None
+                else (
+                    f"the document's total row on page "
+                    f"{doc.unreadable_totals_page} (row unknown)"
+                    if doc.unreadable_totals_page is not None
+                    else "the document's total row (page and row unknown)"
+                )
+            ),
+            doc.unreadable_totals_page or 0,
+            doc.unreadable_totals_row,
+            field_name,
+            printed,
+        )
         for field_name, printed in sorted(doc.unreadable_totals.items())
     ]
     for where, page, line_index, field_name, printed in withheld:
@@ -1283,7 +1304,11 @@ def r26_unreadable_printed_totals(
                 category=FindingCategory.EXTRACTION,
                 scope=FindingScope.DOCUMENT,
                 subject="document",
-                condition=f"page-{page}-row-{line_index}-{field_name}",
+                condition=(
+                    f"page-{page}-row-"
+                    f"{line_index if line_index is not None else 'unknown'}"
+                    f"-{field_name}"
+                ),
                 # Blocking: the column stops being checked, and a green badge
                 # over an unchecked column is indistinguishable from one over a
                 # column that checked out.

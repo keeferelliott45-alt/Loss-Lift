@@ -548,12 +548,27 @@ def test_genuine_column_smears_are_still_rejected(tmp_path, smeared):
     fused to an adjacent cell's figure by a column boundary the extractor
     misjudged. None of them is a number a carrier printed, and accepting one
     would invent a figure nobody wrote down.
+
+    What has changed is the disposal. This test used to require the row to
+    vanish and the document to go CLEAN, which conflated two different
+    decisions: refusing to *parse* the text, which is right, and refusing to
+    *record* it, which erased a printed cell and let the badge go green with
+    one fewer number on the page than the page has. The text is now kept as
+    unresolved evidence -- never with a value attached -- and it blocks.
     """
     path = _write(tmp_path / "smear.pdf", CLAIMS + (("", "", "", smeared, "", ""),))
     result = run_pipeline(path, use_vision=False)
-    assert result.document.unplaced_rows == []
-    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-23"]
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    rows = result.document.unplaced_rows
+    assert rows, f"{smeared!r} was erased"
+    row = rows[0]
+    assert row.amounts == {}, f"{smeared!r} was accepted as an amount: {row.amounts}"
+    assert row.parsed_amounts == {}, f"{smeared!r} was given a value"
+    assert smeared in row.ambiguous_values.values(), row.ambiguous_values
+    finding = next(
+        f for f in result.reconciliation.findings if f.rule_id == "R-23"
+    )
+    assert smeared in finding.message, finding.message
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_excel_date_serials_under_a_money_column_are_never_reported_as_money(
