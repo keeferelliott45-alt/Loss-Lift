@@ -1571,23 +1571,53 @@ def _first_match(text: str, patterns: Iterable[str]) -> str | None:
     return None
 
 
-def stated_claim_counts(text: str) -> list[int]:
-    """Every claim count printed in this text, in the order it is printed.
+#: The count patterns whose wording states a *report* scope rather than a
+#: section's -- "Total Claims: 3", "Number of Claims: 3". A section subtotal
+#: writes "Claim Count = 4" or bare "# Claims: 6" instead, so the wording, not
+#: the number, is what separates them. This is the same evidence
+#: GRAND_COUNT_PATTERN uses, one step weaker: it names a total without naming
+#: which total, so it settles the document only when nothing competes with it.
+_TOTAL_LED_COUNT = _COUNT_PATTERNS[0]
+
+
+def stated_claim_counts(text: str) -> list[tuple[int, bool]]:
+    """Every claim count printed in this text, and whether it names a total.
 
     A page can state more than one: Illinois prints a section's ``# Claims: 8``
     and the report's ``# Claims: 50`` on the same page, and reading only the
     first takes the section and never sees the report beneath it.
 
-    Overlapping patterns are collapsed by position, so a count matched by two
-    of them is one count and not two.
+    Each count comes back with whether the wording that introduced it names a
+    total. Overlapping patterns are collapsed by position, so a count matched
+    by two of them is one count and not two -- and a count matched by the
+    total-led pattern keeps that, whichever other pattern also saw it.
     """
-    spans: dict[tuple[int, int], int] = {}
+    spans: dict[tuple[int, int], tuple[int, bool]] = {}
     for pattern in _COUNT_PATTERNS:
+        total_led = pattern == _TOTAL_LED_COUNT
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             value = parse_int(clean_text(match.group(1)))
-            if value is not None:
-                spans[match.span(1)] = value
-    return [value for _span, value in sorted(spans.items())]
+            if value is None:
+                continue
+            span = match.span(1)
+            was_total_led = spans.get(span, (value, False))[1]
+            spans[span] = (value, total_led or was_total_led)
+    return [entry for _span, entry in sorted(spans.items())]
+
+
+def counted_claim_evidence(page_texts: Mapping[int, str]) -> list[dict[str, int]]:
+    """Every claim count the document states, with the page it was printed on.
+
+    Kept whether or not one of them becomes the document's count. Where several
+    are printed and none is the report's, R-05 cannot run at all, and these are
+    the only evidence of why -- discarded, the document reads as one that never
+    mentioned how many claims it holds.
+    """
+    return [
+        {"page": page, "count": count}
+        for page, text in sorted(page_texts.items())
+        for count, _total_led in stated_claim_counts(text)
+    ]
 
 
 def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
@@ -1599,41 +1629,38 @@ def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
     discrepancy nobody made. A run grouped by policy prints a count under
     every group, and any of them will look like an answer.
 
-    Illinois settles how to tell them apart, because it rules out the obvious
-    way: it prints seven section counts and the report total in *identical*
-    wording, ``# Claims: N`` throughout. What marks 50 out is that it is
-    6+9+6+8+6+7+8 -- the document total is the one that totals the others.
-    That is arithmetic the carrier printed, not a guess about labels.
+    Only a count whose *wording* states its scope is taken, in order: a grand,
+    report, overall or final total naming one; a document that states exactly
+    one count anywhere, which has no other section to be confused with; or a
+    single count introduced as a total ("Total Claims: 3") where every other
+    count on the document is written in the section form ("Claim Count = 4").
+    Illinois is read by the first of those, its report total printed as
+    "Report Totals:" over "# Claims: 50".
 
-    So, in order: a grand/report/overall/final total states its own scope; a
-    document stating exactly one count has stated its own; and otherwise the
-    single count that adds the rest up is the report's. Failing all three the
-    scope is unestablished and nothing is adopted -- agreement is not enough,
-    since two policies of four claims each agree at four while the document
-    holds eight, and a confident wrong answer here is worse than no answer.
+    Nothing is inferred from the counts' arithmetic. A document whose sections
+    hold one, two and three claims prints a 3 that is also 1+2, and adopting it
+    reports six correctly extracted claims as a discrepancy; the coincidence
+    is indistinguishable from a real report total by number alone. Where no
+    count states its scope the answer is None, and
+    :func:`counted_claim_evidence` keeps what was printed so a rule can say the
+    document's count is unresolved rather than absent.
     """
     for _page, text in sorted(page_texts.items(), reverse=True):
         match = GRAND_COUNT_PATTERN.search(text)
         if match:
             return parse_int(match.group(1))
 
-    counts = [
-        count
+    stated = [
+        entry
         for _page, text in sorted(page_texts.items())
-        for count in stated_claim_counts(text)
+        for entry in stated_claim_counts(text)
     ]
-    if not counts:
+    if not stated:
         return None
-    if len(counts) == 1:
-        return counts[0]
-
-    total = sum(counts)
-    covering = [
-        index for index, count in enumerate(counts) if count * 2 == total
-    ]
-    # Exactly one, or nothing is established: on ``[4, 4]`` both entries equal
-    # the sum of the rest, which is precisely the case that must not resolve.
-    return counts[covering[0]] if len(covering) == 1 else None
+    if len(stated) == 1:
+        return stated[0][0]
+    total_led = [count for count, is_total in stated if is_total]
+    return total_led[0] if len(total_led) == 1 else None
 
 
 def _labelled_value(text: str, *labels: str) -> str | None:

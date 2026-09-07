@@ -516,6 +516,23 @@ class LossRunDocument(BaseModel):
 
     printed_totals: dict[str, Money | None] = Field(default_factory=dict)
     printed_claim_count: int | None = None
+
+    #: Money columns of the *document's own* total row whose printed cell could
+    #: not be read, and what the page shows in them. The same fact
+    #: `PrintedSection.unreadable_totals` records, for the row R-04 checks
+    #: against. Supplying two readable totals does not earn the row an
+    #: exemption for a third: the column simply stops being checked, and a
+    #: reviewer has to be told which one and why.
+    unreadable_totals: dict[str, str] = Field(default_factory=dict)
+    #: The page that row was printed on, so the finding can point at it.
+    unreadable_totals_page: int | None = None
+
+    #: Every claim count the document states, with the page it was read from.
+    #: Kept whether or not one of them became `printed_claim_count`: where
+    #: several are printed and none is the report's, R-05 cannot run, and the
+    #: counts are the only evidence of why. Discarding them leaves a document
+    #: that looks as though it never mentioned how many claims it holds.
+    printed_count_evidence: list[dict[str, int]] = Field(default_factory=list)
     #: Every policy term the document declares, in the order printed. A loss run
     #: covering several renewals declares one per section.
     policy_periods: list[tuple[date, date]] = Field(default_factory=list)
@@ -1093,6 +1110,14 @@ class UnplacedRow(BaseModel):
     row: int | None = None
     #: Canonical money field -> the text printed under it, verbatim.
     amounts: dict[str, str] = Field(default_factory=dict)
+
+    #: Numeric text read under a mapped money column where the row and its
+    #: table establish neither that it is money nor that it is not. Kept apart
+    #: from `amounts` because the two are different facts and only one of them
+    #: may be called an amount: a bare "9400" on an otherwise empty row may be
+    #: a whole-unit payment or a page number a column boundary caught, and the
+    #: reading does not know. Reported in those words rather than resolved.
+    ambiguous_values: dict[str, str] = Field(default_factory=dict)
     #: The same amounts, already parsed. Kept beside the text rather than
     #: re-derived later: reconciliation compares this row's figures against a
     #: claim's own Decimal fields, and re-parsing at that layer would mean

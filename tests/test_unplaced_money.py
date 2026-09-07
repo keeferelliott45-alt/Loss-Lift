@@ -252,12 +252,24 @@ def test_ordinary_numbers_and_text_do_not_become_money(tmp_path, row):
     assert result.reconciliation.status is DocumentStatus.CLEAN
 
 
-def test_a_bare_integer_under_a_money_column_is_not_reported(tmp_path):
-    """A count or an index sharing a money column carries no separator."""
+def test_a_bare_integer_under_a_money_column_is_not_called_money(tmp_path):
+    """A count or an index sharing a money column is not an amount.
+
+    It is also not nothing. This test used to require the row to vanish and
+    the document to go CLEAN, on the reasoning that a bare integer carries no
+    separator and so cannot be money. That gate was wrong in the other
+    direction too: it silently discarded a whole-unit "9400" and every "0.00",
+    letting a document reach a green badge with a figure read off the page and
+    thrown away. The value is now kept as *unresolved* -- not money, not
+    discarded -- and unresolved evidence requires review.
+    """
     path = _write(tmp_path / "bare.pdf", CLAIMS + (("", "", "", "7", "", ""),))
     result = run_pipeline(path, use_vision=False)
-    assert result.document.unplaced_rows == []
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert result.document.unplaced_rows, "the printed 7 was discarded"
+    row = result.document.unplaced_rows[0]
+    assert row.amounts == {}, "a bare integer was called money"
+    assert row.ambiguous_values.get("paid_total") == "7"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_recognised_totals_row_does_not_become_a_finding(tmp_path):
@@ -554,14 +566,22 @@ def test_excel_date_serials_under_a_money_column_are_never_reported_as_money(
     ``44806`` is 2022-09-12, not $44,806 -- and printing it as unplaced money
     would be inventing a figure nobody meant as one. This is exactly the
     safeguard that keeps the real Austin document out of scope for this
-    rule: without a currency mark, a sign, or a separator, a bare integer
-    never qualifies, however plausible its magnitude.
+    rule. What has changed is the disposal: the serial is no longer erased.
+    Erasing it let a page's only unattached figure disappear and the badge go
+    green, so it is now carried as unresolved -- reported in those words,
+    never as an amount, and never attached to a claim.
     """
     path = _write(tmp_path / "date-serial.pdf", CLAIMS + (("", "", "", "44806", "", ""),))
     result = run_pipeline(path, use_vision=False)
-    assert result.document.unplaced_rows == []
-    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-23"]
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    row = result.document.unplaced_rows[0]
+    assert row.amounts == {}, "a date serial was reported as an amount"
+    assert row.ambiguous_values.get("paid_total") == "44806"
+    finding = next(
+        f for f in result.reconciliation.findings if f.rule_id == "R-23"
+    )
+    assert "could not be attached to any claim" not in finding.message, finding.message
+    assert "not call them money" in finding.message, finding.message
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 @pytest.mark.parametrize(

@@ -1051,10 +1051,13 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
     """
     findings: list[Finding] = []
     for record in doc.unplaced_rows:
-        if not record.amounts:
+        if not record.amounts and not record.ambiguous_values:
             continue
         printed = ", ".join(
-            f"{_label(field)} {text}" for field, text in sorted(record.amounts.items())
+            f"{_label(field)} {text}"
+            for field, text in sorted(
+                {**record.ambiguous_values, **record.amounts}.items()
+            )
         )
         findings.append(
             Finding(
@@ -1072,13 +1075,28 @@ def r23_unplaced_money(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
                 severity=Severity.ERROR,
                 page=record.page,
                 message=(
-                    f"Amounts were printed on {record.where()} that could not be "
-                    f"attached to any claim: {printed}. LossLift will not guess "
-                    f"which claim they belong to. Check the page — the row may "
-                    f"be a claim whose number was not read, or a continuation "
-                    f"whose figures belong to the row above."
+                    (
+                        f"Amounts were printed on {record.where()} that could "
+                        f"not be attached to any claim: {printed}. LossLift "
+                        f"will not guess which claim they belong to. Check the "
+                        f"page — the row may be a claim whose number was not "
+                        f"read, or a continuation whose figures belong to the "
+                        f"row above."
+                    )
+                    if record.amounts and not record.ambiguous_values
+                    else (
+                        f"Numbers were read under monetary columns on "
+                        f"{record.where()}, but neither the row nor the table "
+                        f"establishes what they are: {printed}. LossLift will "
+                        f"not call them money, and will not attach them to a "
+                        f"claim. Read the page to say what they represent."
+                    )
                 ),
-                expected="every printed amount attached to a claim",
+                expected=(
+                    "every printed amount attached to a claim"
+                    if record.amounts and not record.ambiguous_values
+                    else "every number under a monetary column resolved"
+                ),
                 actual=printed,
             )
         )
@@ -1160,7 +1178,12 @@ def r25_section_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
                     scope=FindingScope.DOCUMENT,
                     subject="document",
                     condition=f"unscoped-page-{section.page}-row-{section.line_index}",
-                    severity=Severity.WARN,
+                    # Blocking. A captured subtotal nobody could check reads on
+                    # screen exactly like a checked one, so leaving the badge
+                    # green states that a figure reconciled when nothing looked
+                    # at it. That is the one claim this product cannot get
+                    # wrong.
+                    severity=Severity.ERROR,
                     page=section.page,
                     message=(
                         f"The subtotal printed on page {section.page} "
@@ -1231,36 +1254,99 @@ def r26_unreadable_printed_totals(
     dropping it without a word leaves a reviewer believing the column was
     verified when nothing looked at it.
 
-    So the printed text and its page survive the refusal. This reports what
-    was given up, not an error in the document -- which is why it is a warning
-    and why it carries what the page actually shows.
+    So the printed text and its page survive the refusal. It reports what was
+    given up rather than an error in the document, and it carries what the page
+    actually shows -- but it blocks, because a column that is not being checked
+    and a column that checked out look identical on a green badge.
+
+    The document's own total row is covered as well as the sections'. Its other
+    columns tying does not earn the refused one an exemption: R-04 proves the
+    columns it could read, and says nothing whatever about the one it could
+    not.
     """
     findings: list[Finding] = []
-    for section in doc.printed_sections:
-        for field_name, printed in sorted(section.unreadable_totals.items()):
-            findings.append(
-                Finding(
-                    rule_id="R-26",
-                    category=FindingCategory.EXTRACTION,
-                    scope=FindingScope.DOCUMENT,
-                    subject="document",
-                    condition=f"page-{section.page}-row-{section.line_index}-{field_name}",
-                    severity=Severity.WARN,
-                    field=field_name,
-                    page=section.page,
-                    message=(
-                        f"The {_label(field_name)} printed in the subtotal on "
-                        f"page {section.page} could not be read, so that column "
-                        f"is not checked against this section. The document "
-                        f"shows {printed!r} -- two values run together by a "
-                        f"column boundary read as one would invent a figure, so "
-                        f"none was taken. Read it from the page."
-                    ),
-                    expected="a printed subtotal that can be read",
-                    actual=printed,
-                )
+    withheld: list[tuple[str, int, int | None, str, str]] = [
+        ("the subtotal on page %d" % section.page, section.page,
+         section.line_index, field_name, printed)
+        for section in doc.printed_sections
+        for field_name, printed in sorted(section.unreadable_totals.items())
+    ]
+    withheld += [
+        ("the document's total row", doc.unreadable_totals_page or 0, None,
+         field_name, printed)
+        for field_name, printed in sorted(doc.unreadable_totals.items())
+    ]
+    for where, page, line_index, field_name, printed in withheld:
+        findings.append(
+            Finding(
+                rule_id="R-26",
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition=f"page-{page}-row-{line_index}-{field_name}",
+                # Blocking: the column stops being checked, and a green badge
+                # over an unchecked column is indistinguishable from one over a
+                # column that checked out.
+                severity=Severity.ERROR,
+                field=field_name,
+                page=page or None,
+                message=(
+                    f"The {_label(field_name)} printed in {where} could not be "
+                    f"read, so that column is not checked. The document shows "
+                    f"{printed!r} -- two values run together by a column "
+                    f"boundary read as one would invent a figure, so none was "
+                    f"taken. Read it from the page."
+                ),
+                expected="a printed total that can be read",
+                actual=printed,
             )
+        )
     return findings
+
+
+@rule("R-27")
+def r27_unresolved_claim_count(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """The document states claim counts, and none of them is the report's.
+
+    R-05 checks the extracted row count against a number the carrier printed,
+    and is one of only two rules that check against the document at all. Where
+    a run grouped by policy prints a count under every group and none states
+    the report's scope, R-05 cannot run -- and if the counts are then dropped,
+    nothing distinguishes that document from one that never said how many
+    claims it holds. The strongest available check silently did not happen.
+
+    So the counts are kept and reported. Blocking, because the alternative is
+    a green badge on a document whose printed claim count was read, was not
+    checkable, and was thrown away.
+    """
+    if doc.printed_claim_count is not None or not doc.printed_count_evidence:
+        return []
+    stated = ", ".join(
+        f"{entry['count']} on page {entry['page']}"
+        for entry in doc.printed_count_evidence
+    )
+    return [
+        Finding(
+            rule_id="R-27",
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition="unresolved-claim-count",
+            severity=Severity.ERROR,
+            field="claim_count",
+            message=(
+                f"The document prints more than one claim count and none of "
+                f"them states the report's scope: {stated}. The extracted "
+                f"{len(doc.claims)} claim(s) could not be checked against any "
+                f"of them. Confirm from the document how many claims it "
+                f"covers."
+            ),
+            expected="a printed claim count covering the whole report",
+            actual=stated,
+        )
+    ]
 
 
 # --------------------------------------------------------------------------

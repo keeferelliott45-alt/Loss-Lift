@@ -6,26 +6,25 @@ against the app's own arithmetic, so a count adopted from the wrong scope does
 not merely mislead -- it makes the strongest rule in the engine report a
 discrepancy nobody made.
 
-A run grouped by policy prints a count under each group. Illinois shows why
-vocabulary cannot settle which one is the report's: it prints seven section
-counts and one document total in *identical* wording,
+A run grouped by policy prints a count under each group, and any of them will
+look like an answer. Only wording that states a scope is trusted:
 
-    # Claims: 6 ... # Claims: 9 ... # Claims: 8      (per page)
-    # Claims: 50                                     (the report)
+1. A grand, report, overall or final total naming a count says its own scope.
+   Illinois is read here -- it prints seven section counts and its report total
+   in identical "# Claims: N" wording, and what separates the 50 is the
+   "Report Totals:" label above it, not the figure.
+2. Otherwise a document stating exactly one count anywhere has stated its own,
+   having no other section to be confused with.
+3. Otherwise a single count introduced as a total ("Total Claims: 3") where
+   every other count is written in the section form ("Claim Count = 4").
+4. Otherwise the scope is unestablished and no count is adopted.
 
-and 50 is exactly 6+9+6+8+6+7+8. The document total is the one that adds up.
-That is arithmetic the carrier printed, not an inference about labels, and it
-is the discriminator used here where the wording gives nothing.
-
-Four rules, in order:
-
-1. A grand/report/overall/final total naming a count says its own scope.
-2. Otherwise a document stating exactly one count has stated the document's.
-3. Otherwise, if exactly one stated count equals the sum of all the others, it
-   totals them.
-4. Otherwise the scope is unestablished, and no count is adopted. Agreement is
-   not enough: two policies of four claims each agree at four, and the
-   document has eight.
+Arithmetic is never consulted. An earlier version of this file asserted that
+the one count equalling the sum of the others was the report's; 50 really is
+6+9+6+8+6+7+8 on Illinois, but sections of one, two and three claims print a 3
+that is also 1+2, and by number alone the coincidence cannot be told from a
+real total. Agreement is no better: two policies of four claims each agree at
+four while the document holds eight.
 
 The page texts here are synthetic; the arrangements are the ones the reference
 corpus and the review's probes exhibit.
@@ -106,18 +105,43 @@ def test_a_report_total_outranks_the_sections_under_it():
     ) == 28
 
 
-def test_the_count_that_totals_the_others_is_the_documents():
-    """Illinois: identical wording throughout, and 50 is the sum of the rest."""
+#: Illinois's seven section counts and its report total, in the identical
+#: "# Claims: N" wording the document really uses.
+_ILLINOIS_SECTIONS = [
+    "# Claims: 6 $28,055.10",
+    "# Claims: 9 $13,292.32",
+    "# Claims: 6 $46,791.96",
+    "# Claims: 8 $10,214.90",
+    "# Claims: 6 $104,068.07",
+    "# Claims: 7 $144,537.62",
+]
+
+
+def test_identical_wording_alone_leaves_the_count_unresolved():
+    """50 is 6+9+6+8+6+7+8, and that is not evidence.
+
+    This test previously asserted the opposite: that the one count equalling
+    the sum of the others could be taken as the report's. It cannot. Sections
+    holding one, two and three claims print a 3 that is also 1+2, and by number
+    alone the coincidence is indistinguishable from a real report total --
+    adopting it reports six correctly extracted claims as a discrepancy on
+    R-05. Arithmetic is no longer consulted; the wording below is.
+    """
     assert _count_from(
-        [
-            "# Claims: 6 $28,055.10",
-            "# Claims: 9 $13,292.32",
-            "# Claims: 6 $46,791.96",
-            "# Claims: 8 $10,214.90",
-            "# Claims: 6 $104,068.07",
-            "# Claims: 7 $144,537.62",
-            "# Claims: 8 $11,233.08\n# Claims: 50 $358,193.05",
-        ]
+        _ILLINOIS_SECTIONS + ["# Claims: 8 $11,233.08\n# Claims: 50 $358,193.05"]
+    ) is None
+
+
+def test_illinois_report_label_establishes_its_count():
+    """What the real document prints, and why Illinois still ties 50/50.
+
+    Page 7 carries the section's own count and then "Report Totals:" over
+    "# Claims: 50". The label states the scope; nothing is inferred from the
+    figures.
+    """
+    assert _count_from(
+        _ILLINOIS_SECTIONS
+        + ["# Claims: 8 $11,233.08\nReport Totals:\n# Claims: 50 $358,193.05"]
     ) == 50
 
 
@@ -143,14 +167,16 @@ def test_every_count_on_a_page_is_read_not_just_the_first():
     that the second count is *seen* at all -- reading only the first per page
     took the section's 8 and never knew the 50 beneath it existed.
     """
-    assert ed.stated_claim_counts(
+    assert [count for count, _total_led in ed.stated_claim_counts(
         "# Claims: 8 $11,233.08\n# Claims: 50 $358,193.05"
-    ) == [8, 50]
+    )] == [8, 50]
 
 
 def test_a_count_matched_by_two_patterns_is_still_one_count():
     """"Total Claims: 3" answers more than one pattern; it is one statement."""
-    assert ed.stated_claim_counts("Total Claims: 3") == [3]
+    assert ed.stated_claim_counts("Total Claims: 3") == [(3, True)]
+    # And the section form is recorded as what it is.
+    assert ed.stated_claim_counts("Claim Count = 4") == [(4, False)]
 
 
 # --- the guard must not be sidestepped ------------------------------------

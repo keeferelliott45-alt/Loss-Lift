@@ -32,7 +32,7 @@ from decimal import Decimal
 
 import pytest
 
-from core.pipeline import ColumnMapping, _is_smeared, unplaced_money
+from core.pipeline import ColumnMapping, _is_smeared, unplaced_evidence
 from core.schema import RawRow
 
 MAPPING = ColumnMapping(
@@ -42,9 +42,17 @@ MAPPING = ColumnMapping(
 
 
 def _amount(text: str, locale: str = "us"):
-    """What ``unplaced_money`` makes of this cell under a money column."""
+    """What the reader makes of this cell under an established money column.
+
+    The context is stated rather than left to be inferred: this file's subject
+    is how a cell's currency markers are read, not how a table establishes
+    that its numbers are money, and a fixture that left the second open would
+    be asking two questions at once.
+    """
     row = RawRow(cells=["", text], page=1, line_index=10)
-    return unplaced_money(row, MAPPING, locale).get("paid_total")
+    return unplaced_evidence(
+        row, MAPPING, locale, context="monetary-only"
+    ).amounts.get("paid_total")
 
 
 @pytest.mark.parametrize(
