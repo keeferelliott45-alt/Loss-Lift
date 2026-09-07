@@ -1,0 +1,29 @@
+{
+  "name": "qa_dirty_errors",
+  "description": "Three real defects at once: broken arithmetic, closed-with-reserve, loss before inception",
+  "carrier": "TEST CARRIER",
+  "named_insured": "Acme Logistics LLC",
+  "policy_number": "TC-901244",
+  "policy_period_start": "2023-01-01",
+  "policy_period_end": "2024-01-01",
+  "valuation_date": "2024-06-30",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 1,
+  "printed_claim_count": 1,
+  "printed_totals": {
+    "paid_total": "50000.00",
+    "reserve_total": "10000.00",
+    "incurred_total": "55000.00"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "claim_status",
+    "paid_total",
+    "reserve_total",
+    "incurred_total"
+  ]
+}

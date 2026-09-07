@@ -1,0 +1,15 @@
+claim_number,date_of_loss,date_reported,claim_status,claimant_name,loss_description,paid_total,reserve_total,recovery_total,incurred_total
+NG-24-0001,2024-02-04,2024-02-05,CLOSED,Claimant 01,Loss event number 01,1608.75,,,1608.75
+NG-24-0002,2024-03-07,2024-03-08,REOPENED,Claimant 02,Loss event number 02,2016.75,7888.00,,9904.75
+NG-24-0003,2024-04-10,2024-04-11,OPEN,Claimant 03,Loss event number 03,2424.75,8932.00,,11356.75
+NG-24-0004,2024-05-13,2024-05-14,CLOSED,Claimant 04,Loss event number 04,2832.75,,600.00,2232.75
+NG-24-0005,2024-06-16,2024-06-17,REOPENED,Claimant 05,Loss event number 05,3240.75,11020.00,,14260.75
+NG-24-0006,2024-07-19,2024-07-20,OPEN,Claimant 06,Loss event number 06,3648.75,12064.00,,15712.75
+NG-24-0007,2024-08-22,2024-08-23,CLOSED,Claimant 07,Loss event number 07,4056.75,,,4056.75
+NG-24-0008,2024-09-25,2024-09-26,REOPENED,Claimant 08,Loss event number 08,4464.75,14152.00,1200.00,17416.75
+NG-24-0009,2024-10-01,2024-10-03,OPEN,Claimant 09,Loss event number 09,4872.75,15196.00,,20068.75
+NG-24-0010,2024-11-04,2024-11-06,CLOSED,Claimant 10,Loss event number 10,5280.75,,,5280.75
+NG-24-0011,2024-12-07,2024-12-09,REOPENED,Claimant 11,Loss event number 11,5688.75,17284.00,,22972.75
+NG-24-0012,2024-01-10,2024-01-12,OPEN,Claimant 12,Loss event number 12,6096.75,18328.00,1800.00,22624.75
+NG-24-0013,2024-02-13,2024-02-15,CLOSED,Claimant 13,Loss event number 13,6504.75,,,6504.75
+NG-24-0014,2024-03-16,2024-03-18,REOPENED,Claimant 14,Loss event number 14,6912.75,20416.00,,27328.75

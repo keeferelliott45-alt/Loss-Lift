@@ -1,0 +1,653 @@
+"""Stage 2b — vision extraction for scanned pages.
+
+The model is replaced by a stand-in that transcribes the fixture exactly as it
+was printed. What is under test is this app's handling of a transcription:
+that the same deterministic parser reads it, that it is marked as vision-read,
+and that its confidence is capped no matter what the model claims.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import date
+
+import pymupdf
+import pytest
+
+from core.extract_vision import (
+    RENDER_DPI,
+    VisionExtraction,
+    RESPONSE_SCHEMA,
+    VISION_CONFIDENCE_CAP,
+    VisionUnavailable,
+    extract_page,
+    extract_scanned_pages,
+    load_prompt,
+    parse_vision_response,
+    render_page,
+    render_pages,
+    vision_enabled,
+)
+from core.pipeline import run_pipeline
+from core.schema import DocumentStatus, ExtractionMethod, RawTable, SourceMethod
+from tests.golden import fixtures as fx
+from tests.golden.generate import cell_text, format_money
+
+
+def transcription(fixture: fx.Fixture, page_number: int = 1) -> dict:
+    """Exactly what is printed on the page, as the prompt asks for it."""
+    rows = [
+        {
+            "cells": [cell_text(fixture, claim, column) for column in fixture.columns],
+            "kind": "data",
+        }
+        for claim in fixture.claims
+    ]
+    totals = fixture.printed_totals()
+    if fixture.print_totals:
+        rows.append({
+            "cells": [
+                fixture.total_label if index == 0
+                else (format_money(totals[column.field], fixture.number_format)
+                      if column.field in totals else "")
+                for index, column in enumerate(fixture.columns)
+            ],
+            "kind": "total",
+        })
+    return {
+        "headers": [column.label for column in fixture.columns],
+        "rows": rows,
+        "printed_claim_count": len(fixture.claims) if fixture.print_claim_count else None,
+        "valuation_date": fixture.valuation_date.strftime("%m/%d/%Y"),
+    }
+
+
+class StandInModel:
+    """A Gemini stand-in that returns a fixed transcription."""
+
+    def __init__(self, payload, confidence_claim: float = 0.99) -> None:
+        self.payload = payload
+        self.calls = 0
+        self.contents: list = []
+        self.confidence_claim = confidence_claim
+        self.models = self
+
+    def generate_content(self, model: str, contents, config=None):
+        self.calls += 1
+        self.contents.append(contents)
+        body = self.payload
+        if callable(body):
+            body = body(self.calls)
+        text = body if isinstance(body, str) else json.dumps(body)
+        return type("Response", (), {"text": text})()
+
+
+@pytest.fixture()
+def scanned_model():
+    return StandInModel(transcription(fx.SCANNED))
+
+
+# --- Rendering -------------------------------------------------------------
+
+
+def test_pages_render_at_300_dpi(golden_dir):
+    assert RENDER_DPI == 300
+    rendered = render_page(golden_dir / "scanned.pdf", 1)
+    assert rendered.page == 1
+    assert rendered.image[:8] == b"\x89PNG\r\n\x1a\n"
+    # US letter landscape at 300 DPI.
+    assert rendered.width == 3300 and rendered.height == 2550
+
+
+def test_render_pages_returns_one_image_per_page(golden_dir):
+    rendered = render_pages(golden_dir / "scanned.pdf", [1])
+    assert [page.page for page in rendered] == [1]
+
+
+def test_rendering_a_page_that_does_not_exist_fails_loudly(golden_dir):
+    with pytest.raises(VisionUnavailable, match="does not exist"):
+        render_page(golden_dir / "scanned.pdf", 99)
+
+
+# --- Prompt and schema -----------------------------------------------------
+
+
+def test_prompt_forbids_calculating():
+    prompt = load_prompt()
+    assert "Never compute" in prompt
+    assert "character for character" in prompt
+    assert "-0-" in prompt   # placeholders must survive transcription
+
+
+def test_schema_requires_headers_and_rows():
+    assert RESPONSE_SCHEMA["required"] == ["headers", "rows"]
+
+
+# --- Response parsing ------------------------------------------------------
+
+
+def test_parses_a_transcription_into_a_raw_table():
+    table = parse_vision_response(json.dumps(transcription(fx.SCANNED)), 1)
+    assert table.strategy == "vision"
+    assert table.page == 1
+    assert len(table.rows) == len(fx.SCANNED.claims)
+    assert table.total_rows
+    assert table.headers[0] == "Claim Number"
+
+
+def test_tolerates_code_fences():
+    table = parse_vision_response(
+        '```json\n{"headers": ["A"], "rows": [{"cells": ["x"]}]}\n```', 2
+    )
+    assert table.rows[0].cells == ["x"]
+
+
+def test_rows_are_padded_and_trimmed_to_the_header_width():
+    table = parse_vision_response(
+        {"headers": ["A", "B", "C"], "rows": [
+            {"cells": ["1"]},                    # short
+            {"cells": ["1", "2", "3", "4"]},     # long
+        ]},
+        1,
+    )
+    assert table.rows[0].cells == ["1", "", ""]
+    assert table.rows[1].cells == ["1", "2", "3"]
+
+
+def test_blank_rows_are_dropped():
+    table = parse_vision_response(
+        {"headers": ["A", "B"], "rows": [{"cells": ["", ""]}, {"cells": ["x", ""]}]}, 1
+    )
+    assert len(table.rows) == 1
+
+
+def test_a_response_with_no_headers_fails_loudly():
+    with pytest.raises(VisionUnavailable, match="no column headers"):
+        parse_vision_response({"headers": [], "rows": []}, 1)
+
+
+def test_non_json_fails_loudly():
+    with pytest.raises(VisionUnavailable, match="did not return JSON"):
+        parse_vision_response("The table shows six claims.", 1)
+
+
+def test_page_printed_facts_are_carried():
+    table = parse_vision_response(json.dumps(transcription(fx.SCANNED)), 1)
+    assert table.printed_claim_count == len(fx.SCANNED.claims)
+    assert table.valuation_date_text == "12/31/2024"
+
+
+# --- Calling the model -----------------------------------------------------
+
+
+def test_the_image_and_the_prompt_are_both_sent(golden_dir, scanned_model):
+    rendered = render_page(golden_dir / "scanned.pdf", 1)
+    extract_page(rendered, client=scanned_model)
+    assert scanned_model.calls == 1
+    sent = scanned_model.contents[0]
+    assert any(isinstance(part, str) and "Never compute" in part for part in sent)
+
+    images = [part for part in sent if not isinstance(part, str)]
+    assert len(images) == 1, "exactly one page image per call"
+    payload = images[0]
+    data = payload if isinstance(payload, bytes) else payload.inline_data.data
+    assert data == rendered.image
+    if not isinstance(payload, bytes):
+        assert payload.inline_data.mime_type == "image/png"
+
+
+def test_a_failing_call_is_reported_not_raised_raw(golden_dir):
+    class Broken(StandInModel):
+        def generate_content(self, model, contents, config=None):
+            raise RuntimeError("429 quota exceeded")
+
+    rendered = render_page(golden_dir / "scanned.pdf", 1)
+    with pytest.raises(VisionUnavailable, match="429"):
+        extract_page(rendered, client=Broken(None))
+
+
+def test_without_a_key_the_message_says_what_to_do(golden_dir, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    rendered = render_page(golden_dir / "scanned.pdf", 1)
+    with pytest.raises(VisionUnavailable, match="GEMINI_API_KEY"):
+        extract_page(rendered)
+
+
+def test_partial_vision_failure_is_returned_with_the_good_pages(golden_dir, tmp_path):
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    path = tmp_path / "three-scans.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    payloads = [
+        transcription(fx.SCANNED),
+        "not json at all",
+        transcription(fx.SCANNED),
+    ]
+    model = StandInModel(lambda call: payloads[call - 1])
+    extraction = extract_scanned_pages(path, [1, 2, 3], client=model)
+
+    assert [table.page for table in extraction] == [1, 3]
+    assert list(extraction.failures) == [2]
+    assert "Page 2" in extraction.failures[2]
+
+
+def test_partial_vision_failure_reaches_pipeline_reconciliation(
+    golden_dir, tmp_path
+):
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    three_pages.insert_pdf(source)
+    path = tmp_path / "three-scans.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    payloads = [
+        transcription(fx.SCANNED),
+        "not json at all",
+        transcription(fx.SCANNED),
+    ]
+    model = StandInModel(lambda call: payloads[call - 1])
+    result = run_pipeline(path, use_vision=True, vision_extractor=_extractor(model))
+
+    assert result.document.processed_pages == [1, 3]
+    assert result.document.failed_pages == [2]
+    assert result.document.skipped_pages == []
+    assert any("Page 2" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_all_pages_failing_is_reported(golden_dir):
+    model = StandInModel("not json")
+    with pytest.raises(VisionUnavailable):
+        extract_scanned_pages(golden_dir / "scanned.pdf", [1], client=model)
+
+
+# --- Through the pipeline --------------------------------------------------
+
+
+def _extractor(model):
+    def run(path, pages, **kwargs):
+        return extract_scanned_pages(path, pages, client=model)
+    return run
+
+
+def test_a_scanned_document_extracts_through_vision(golden_dir, scanned_model):
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_extractor(scanned_model),
+    )
+    document = result.document
+    assert document.extraction_method is ExtractionMethod.VISION
+    assert document.scanned_pages == [1]
+    assert document.processed_pages == [1]
+    assert document.failed_pages == []
+    assert document.skipped_pages == []
+    assert len(document.claims) == len(fx.SCANNED.claims)
+    assert document.claims[0].claim_number == "GL-2024-0001"
+
+
+def test_vision_values_parse_exactly_like_digital_ones(golden_dir, scanned_model):
+    """A transcription goes through the same parser, so the same characters
+    give the same Decimal whichever path read them."""
+    scanned = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_extractor(scanned_model),
+    )
+    digital = run_pipeline(golden_dir / "us_basic.pdf", use_vision=False)
+
+    by_number = {c.claim_number: c for c in digital.document.claims}
+    for claim in scanned.document.claims:
+        twin = by_number[claim.claim_number]
+        assert claim.incurred_total == twin.incurred_total
+        assert claim.paid_total == twin.paid_total
+        assert claim.recovery_total == twin.recovery_total
+        assert claim.date_of_loss == twin.date_of_loss
+
+
+def test_every_vision_field_is_marked_and_capped(golden_dir, scanned_model):
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_extractor(scanned_model),
+    )
+    for claim in result.document.claims:
+        assert claim.source_method is SourceMethod.VISION
+        for field_name, score in claim.field_confidence.items():
+            assert score <= VISION_CONFIDENCE_CAP, f"{field_name} was {score}"
+
+
+def test_confidence_is_capped_even_when_the_model_is_certain(golden_dir):
+    model = StandInModel(transcription(fx.SCANNED), confidence_claim=1.0)
+    result = run_pipeline(
+        golden_dir / "scanned.pdf", use_vision=True, vision_extractor=_extractor(model)
+    )
+    assert max(
+        score
+        for claim in result.document.claims
+        for score in claim.field_confidence.values()
+    ) == VISION_CONFIDENCE_CAP
+
+
+def test_the_valuation_date_comes_from_the_page(golden_dir, scanned_model):
+    """A scanned page has no text layer, so R-06 would fire on every scan if
+    the vision pass did not report what the page prints."""
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_extractor(scanned_model),
+    )
+    assert result.document.valuation_date == date(2024, 12, 31)
+    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-06"]
+
+
+def test_footer_totals_from_a_scan_still_drive_r04(golden_dir, scanned_model):
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_extractor(scanned_model),
+    )
+    assert result.document.printed_totals
+    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-04"]
+
+
+def test_vision_off_says_what_was_skipped(golden_dir):
+    result = run_pipeline(golden_dir / "scanned.pdf", use_vision=False)
+    assert result.document.claims == []
+    assert result.document.processed_pages == []
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == [1]
+    assert any("scans" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+
+
+def test_a_successfully_processed_irrelevant_page_is_not_a_failure(
+    golden_dir, tmp_path
+):
+    document = pymupdf.open(golden_dir / "us_basic.pdf")
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "This intentionally irrelevant cover page contains no claim table. "
+        "It was still processed successfully.",
+    )
+    path = tmp_path / "claims-and-cover.pdf"
+    document.save(path)
+    document.close()
+
+    result = run_pipeline(path, use_vision=False)
+
+    assert result.document.processed_pages == [1, 2]
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == []
+    assert 2 not in {table.page for table in result.tables}
+    assert result.reconciliation.status is DocumentStatus.CLEAN
+
+
+def test_a_fully_failed_extraction_preserves_every_failed_page(golden_dir):
+    def failing(pdf_path, pages, **kwargs):
+        raise VisionUnavailable("Page 1: the vision call failed (503).")
+
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=failing,
+    )
+
+    assert result.document.processed_pages == []
+    assert result.document.failed_pages == [1]
+    assert result.document.skipped_pages == []
+    assert {"R-20", "R-22"} <= set(result.reconciliation.rule_ids())
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_failing_vision_pass_does_not_lose_the_digital_pages(golden_dir, tmp_path):
+    """A mixed document: page 1 digital, page 2 a scan. If vision fails the
+    digital rows must still arrive, and R-05 reports what is missing."""
+    mixed = pymupdf.open(golden_dir / "us_basic.pdf")
+    scan = pymupdf.open(golden_dir / "scanned.pdf")
+    mixed.insert_pdf(scan)
+    path = tmp_path / "mixed.pdf"
+    mixed.save(str(path))
+    mixed.close()
+    scan.close()
+
+    def failing(pdf_path, pages, **kwargs):
+        raise VisionUnavailable("the vision call failed (503)")
+
+    result = run_pipeline(path, use_vision=True, vision_extractor=failing)
+    assert result.classification.extraction_method is ExtractionMethod.MIXED
+    assert result.classification.scanned_pages == [2]
+    assert len(result.document.claims) == 6           # page 1 survived
+    assert result.document.processed_pages == [1]
+    assert result.document.failed_pages == [2]
+    assert result.document.skipped_pages == []
+    assert any("503" in warning for warning in result.warnings)
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_mixed_document_merges_both_paths(golden_dir, tmp_path):
+    mixed = pymupdf.open(golden_dir / "us_basic.pdf")
+    scan = pymupdf.open(golden_dir / "scanned.pdf")
+    mixed.insert_pdf(scan)
+    path = tmp_path / "mixed.pdf"
+    mixed.save(str(path))
+    mixed.close()
+    scan.close()
+
+    payload = transcription(fx.SCANNED)
+    for row in payload["rows"]:
+        if row["kind"] == "data":
+            row["cells"][0] = row["cells"][0].replace("GL-2024", "SC-2024")
+    model = StandInModel(payload)
+
+    result = run_pipeline(path, use_vision=True, vision_extractor=_extractor(model))
+    methods = {claim.source_method for claim in result.document.claims}
+    assert methods == {SourceMethod.DIGITAL, SourceMethod.VISION}
+    assert len(result.document.claims) == 6 + len(fx.SCANNED.claims)
+    assert result.document.extraction_method is ExtractionMethod.MIXED
+    assert result.document.processed_pages == [1, 2]
+    assert result.document.failed_pages == []
+    assert result.document.skipped_pages == []
+    # Rows stay in page order so the review screen matches the document.
+    pages = [claim.source_page for claim in result.document.claims]
+    assert pages == sorted(pages)
+
+
+# --- Optional live check ---------------------------------------------------
+
+
+@pytest.mark.llm
+@pytest.mark.skipif(
+    os.getenv("LOSSLIFT_RUN_LLM_TESTS", "0") != "1" or not vision_enabled(),
+    reason="set LOSSLIFT_RUN_LLM_TESTS=1 and GEMINI_API_KEY to call Gemini",
+)
+def test_live_gemini_reads_the_scanned_fixture(golden_dir):  # pragma: no cover
+    rendered = render_page(golden_dir / "scanned.pdf", 1)
+    table = extract_page(rendered)
+    assert table.rows
+    numbers = {cell for row in table.rows for cell in row.cells}
+    assert any("15,700.50" in cell for cell in numbers)
+
+
+# --------------------------------------------------------------------------
+# An empty vision result is not a reading
+# --------------------------------------------------------------------------
+#
+# A model handed a poor scan does not usually raise. It returns well-formed
+# JSON with an empty row list, which is the same shape as a page that genuinely
+# holds no claim table. The two are not the same fact: one is a reading, the
+# other is a model declining to find anything, and only the first is evidence.
+#
+# The distinction these tests hold open is between four different page
+# outcomes, none of which may wear another's clothes: a deterministic reader
+# that saw the whole page and found no table; a vision reader that returned
+# rows; a vision reader that returned nothing; and a vision request that failed
+# or never answered for the page at all.
+
+
+def _scan_behind_a_clean_page(golden_dir, tmp_path, name):
+    """A digital page that reconciles on its own, followed by a scan.
+
+    The digital page carries its own footer totals and printed claim count, so
+    it ties perfectly without the scan. That is what makes the document
+    dangerous: everything the engine can check passes, and the only unresolved
+    thing on it is a page nobody has read.
+    """
+    document = pymupdf.open(golden_dir / "us_basic.pdf")
+    scan = pymupdf.open(golden_dir / "scanned.pdf")
+    document.insert_pdf(scan)
+    path = tmp_path / name
+    document.save(path)
+    document.close()
+    scan.close()
+    return path
+
+
+def _returns(tables, failures=None):
+    def extractor(pdf_path, pages, **kwargs):
+        return VisionExtraction(tables=list(tables), failures=dict(failures or {}))
+
+    return extractor
+
+
+def test_an_empty_vision_result_does_not_make_a_document_clean(
+    golden_dir, tmp_path
+):
+    """The case that started this: page 1 ties, page 2 is asserted empty."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "clean-page-then-scan.pdf")
+    baseline = run_pipeline(path, use_vision=False)
+    assert baseline.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=2, headers=["Claim No"], rows=[])]),
+    )
+
+    assert result.document.claims, "page 1's claims are still read"
+    assert not [f for f in result.reconciliation.findings if f.rule_id in {"R-04", "R-05"}], (
+        "page 1 reconciles against its own printed totals"
+    )
+    assert 2 not in result.document.processed_pages
+    assert result.document.unresolved_pages == [2]
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_an_empty_vision_result_carrying_headers_still_proves_nothing(
+    golden_dir, tmp_path
+):
+    """Headers and metadata are not rows. A shape is not a reading."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "headers-only-scan.pdf")
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([
+            RawTable(
+                page=2,
+                headers=["Claim Number", "Date of Loss", "Paid", "Incurred"],
+                rows=[],
+            )
+        ]),
+    )
+    assert result.document.unresolved_pages == [2]
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_wholly_scanned_document_read_as_empty_is_not_clean(golden_dir):
+    result = run_pipeline(
+        golden_dir / "scanned.pdf",
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=1, headers=["Claim No"], rows=[])]),
+    )
+    assert result.document.processed_pages == []
+    assert result.document.unresolved_pages == [1]
+    assert "R-22" in result.reconciliation.rule_ids()
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_vision_page_that_returns_rows_is_processed(golden_dir):
+    model = StandInModel(transcription(fx.SCANNED))
+    result = run_pipeline(
+        golden_dir / "scanned.pdf", use_vision=True, vision_extractor=_extractor(model)
+    )
+    assert result.document.processed_pages == [1]
+    assert result.document.unresolved_pages == []
+    assert result.document.failed_pages == []
+    assert not [f for f in result.reconciliation.findings if f.rule_id == "R-22"]
+
+
+def test_a_mixed_batch_keeps_every_page_outcome_apart(golden_dir, tmp_path):
+    """Rows on one page, nothing on the next, a failure on the third."""
+    source = pymupdf.open(golden_dir / "scanned.pdf")
+    three_pages = pymupdf.open()
+    for _ in range(3):
+        three_pages.insert_pdf(source)
+    path = tmp_path / "three-outcomes.pdf"
+    three_pages.save(path)
+    three_pages.close()
+    source.close()
+
+    read = extract_scanned_pages(
+        path, [1], client=StandInModel(transcription(fx.SCANNED))
+    ).tables[0]
+    result = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns(
+            [read, RawTable(page=2, headers=["Claim No"], rows=[])],
+            {3: "Page 3: the vision call failed (503)."},
+        ),
+    )
+
+    assert result.document.processed_pages == [1]
+    assert result.document.unresolved_pages == [2]
+    assert result.document.failed_pages == [3]
+    assert result.document.skipped_pages == []
+    pages = {
+        f.page for f in result.reconciliation.findings if f.rule_id == "R-22"
+    }
+    assert pages == {2, 3}, "each unread page is named separately"
+
+
+def test_an_unresolved_page_reads_differently_from_a_failed_one(
+    golden_dir, tmp_path
+):
+    """Four outcomes, four messages. None may be mistaken for another."""
+    path = _scan_behind_a_clean_page(golden_dir, tmp_path, "outcome-wording.pdf")
+    empty = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([RawTable(page=2, headers=[], rows=[])]),
+    )
+    failed = run_pipeline(
+        path,
+        use_vision=True,
+        vision_extractor=_returns([], {2: "Page 2: the vision call failed (503)."}),
+    )
+    skipped = run_pipeline(path, use_vision=False)
+
+    def message(result):
+        return next(
+            f.message for f in result.reconciliation.findings if f.rule_id == "R-22"
+        )
+
+    assert "returned no rows" in message(empty)
+    assert "not evidence" in message(empty)
+    assert "processing failed" in message(failed)
+    assert "skipped" in message(skipped)
+    assert len({message(empty), message(failed), message(skipped)}) == 3

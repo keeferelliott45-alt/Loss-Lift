@@ -1,0 +1,29 @@
+{
+  "name": "qa_european_credit",
+  "description": "EUR amounts, dd.mm.yyyy dates and credit recoveries in one document",
+  "carrier": "ALLIANZ GLOBAL",
+  "named_insured": "Acme Logistics LLC",
+  "policy_number": "AZ-88213",
+  "policy_period_start": "2023-01-01",
+  "policy_period_end": "2024-01-01",
+  "valuation_date": "2024-06-30",
+  "line_of_business": "GL",
+  "currency": "EUR",
+  "locale_hint": "eu",
+  "claim_count": 1,
+  "printed_claim_count": 1,
+  "printed_totals": {
+    "paid_total": "5700.50",
+    "recovery_total": "200.00",
+    "incurred_total": "5500.50"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "claim_status",
+    "paid_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

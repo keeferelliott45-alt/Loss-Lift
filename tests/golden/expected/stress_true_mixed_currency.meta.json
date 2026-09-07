@@ -1,0 +1,26 @@
+{
+  "name": "stress_true_mixed_currency",
+  "description": "Genuinely two currencies on real rows (not a default-vs-symbol false positive) \u2014 R-16 should actually fire \u2014 plus a recovery that legitimately exceeds paid on one USD row and one EUR row",
+  "carrier": "Meridian International Underwriters",
+  "named_insured": "Halcyon Freight Group",
+  "policy_number": "INTL-550218-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 5,
+  "printed_claim_count": 5,
+  "printed_totals": {},
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "claim_status",
+    "currency_label",
+    "paid_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}
