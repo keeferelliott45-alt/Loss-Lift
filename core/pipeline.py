@@ -18,6 +18,7 @@ from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
 from core.extract_digital import (
     _COUNT_PATTERNS,
+    document_claim_count,
     counted_claim_evidence,
     _first_match,
     CLAIM_COUNT_LABEL,
@@ -391,6 +392,12 @@ _FINANCIAL_NOTATION = re.compile(
     r"[.,()]|[$€£¥₤₹₽]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE
 )
 
+#: Written the way only money is written: a currency mark, accounting
+#: parentheses, or a credit marker. A year, a version, a serial or an
+#: identifier never carries one, so a cell that does is money regardless of
+#: what words happen to share its row.
+_UNMISTAKABLY_MONEY = re.compile(r"[$€£¥₤₹₽]|^\(.*\)$|\b(?:CR|DR)\b", re.IGNORECASE)
+
 #: A row that says outright what its number is. This is the row's own words --
 #: source evidence, the same kind ``is_structural_row`` already reads -- and it
 #: is consulted only where nothing else has established the row as claim data.
@@ -406,13 +413,38 @@ _NAMES_A_NON_MONEY_VALUE = re.compile(
     re.IGNORECASE,
 )
 
-#: Two separate runs of digits in one cell -- what a column boundary running
-#: two numbers together actually looks like. ``_is_smeared`` answers a
-#: narrower question, whether whitespace is grouping one number or fusing two,
-#: and it only ever meant anything about text already known to be numeric: ask
-#: it about "Property Claim" and it says True, because "Claim" is not a
-#: three-digit group. Prose is a text-only row and stays an ordinary warning.
-_TWO_NUMERIC_RUNS = re.compile(r"\d[^\s]*\s+[^\s]*\d")
+#: One number as printed: a digit run, with any grouping or decimal marks that
+#: belong inside it. "30,000.00" is one of these; "4-30,000.00" is two.
+_NUMERIC_ATOM = re.compile(r"\d[\d,.']*")
+
+#: A run of letters long enough to be a word rather than a unit or a marker.
+_A_WORD = re.compile(r"[A-Za-z]{2,}")
+
+
+def _numeric_bearing(text: str) -> bool:
+    """Whether this cell is a number the reader failed to read, or prose.
+
+    Deliberately not a list of the separators a column boundary might leave
+    behind -- a space, a slash, a hyphen, a currency word, a conjunction. Any
+    such list holds until the next document brings a separator nobody listed.
+    Two general properties, either of which is enough:
+
+    More than one number in the cell. That is what a collision *is*, whatever
+    sits between them: "4 / 30,000.00", "4 and 30,000.00" and "4-30,000.00"
+    are each two printed figures the reader must not merge into one.
+
+    Or no word in it at all. A lone run of digits the parser could not resolve
+    -- "1.2.3" -- is still a number nobody could read, and dropping it loses a
+    printed figure.
+
+    Prose that merely mentions a number satisfies neither: a disclaimer ending
+    "within the last 30 days." carries one number and several words, and is a
+    sentence sharing a column, not an amount. It stays the ordinary warning.
+    """
+    atoms = _NUMERIC_ATOM.findall(text)
+    if not atoms:
+        return False
+    return len(atoms) > 1 or not _A_WORD.search(text)
 
 #: A trailing credit or debit marker is a word, not a second number, so it is
 #: stripped before anything asks whether the digits before it are one amount
@@ -608,17 +640,15 @@ def unplaced_evidence(
         text = (values.get(name) or "").strip()
         if not text:
             continue
-        if _is_smeared(text):
-            # Refused as a value either way. Recorded as evidence only when it
-            # really is two numbers run together; otherwise it is prose that
-            # happens to share a column, and belongs in the warning it always
-            # went to.
-            if _TWO_NUMERIC_RUNS.search(text):
-                merged[name] = text
-            continue
-        amount = parse_money(text, locale).value
+        amount = None if _is_smeared(text) else parse_money(text, locale).value
         if amount is not None:
             parsed[name] = (text, amount)
+        elif _numeric_bearing(text):
+            # No confident single value came out of it, and it carries digits
+            # under a column mapped as money. Refused as a value -- any number
+            # taken from it would be one the page never printed -- and kept as
+            # evidence, because the page printed it and no claim took it.
+            merged[name] = text
     if not parsed and not merged:
         return UnplacedEvidence({}, {})
 
@@ -634,15 +664,30 @@ def unplaced_evidence(
         )
     )
     if _NAMES_A_NON_MONEY_VALUE.search(labelling):
-        # A label names one value, and which one depends on whether it already
-        # carries a number. "Policy year" with a lone 2024.00 under a money
-        # column is naming that figure, and the row holds nothing else it could
-        # mean. "Software version 1.20" has already named its own number, so it
-        # says nothing whatever about a $500.00 further along the row -- and
-        # letting the word "version" erase that cell loses real money to a
-        # string match.
-        if not any(character.isdigit() for character in labelling):
-            return UnplacedEvidence({}, {}, merged) if merged else UnplacedEvidence({}, {})
+        # A label explains its own value. It is not evidence about any other
+        # cell on the row, and two opposite mistakes follow from treating it as
+        # though it were.
+        #
+        # It must not erase. "Software version unknown" beside a $500.00 says
+        # nothing about the $500, and a cell written unmistakably as money is
+        # money whatever words share its row.
+        #
+        # It must not promote. Whether "Policy year 2024" names the 2024.00
+        # beside it or some other figure is exactly what is uncertain, and the
+        # earlier test -- whether the label happened to contain a digit -- was
+        # never evidence about the money. Uncertain is recorded as uncertain:
+        # kept, reported, and never called an amount.
+        money = {
+            name: entry
+            for name, entry in parsed.items()
+            if _UNMISTAKABLY_MONEY.search(entry[0])
+        }
+        unresolved = {
+            name: entry for name, entry in parsed.items() if name not in money
+        }
+        if not money and not unresolved and not merged:
+            return UnplacedEvidence({}, {})
+        return UnplacedEvidence(money, unresolved, merged)
 
     if context == "monetary-only":
         return UnplacedEvidence(parsed, unresolved, merged)
@@ -801,11 +846,25 @@ def build_claims(
             identifier = claim_identifier(row, table_mapping, shapes)
             if identifier is None:
                 extra = clean_text(" ".join(row.cells))
+                # Numeric evidence is weighed before anything may absorb the
+                # row. A cell under a money column that carries digits and
+                # yields no value is unresolved evidence, and a continuation
+                # fold would bury it inside the previous claim's narrative --
+                # where no rule can see it and the description acquires a
+                # figure that is not part of the accident.
+                evidence = unplaced_evidence(
+                    row, table_mapping, locale, context=context
+                )
                 # A continuation line carries prose. A row carrying money or a
                 # date is a claim whose number could not be identified, and
                 # folding that into the description above would bury real
                 # figures inside someone else's narrative.
-                if extra and claims and _continuation_text(row, table_mapping):
+                if evidence:
+                    _record_discard(
+                        row, table_mapping, locale, warnings, unplaced, extra,
+                        context=context,
+                    )
+                elif extra and claims and _continuation_text(row, table_mapping):
                     previous = claims[-1]
                     previous.loss_description = clean_text(
                         f"{previous.loss_description or ''} {extra}"
@@ -1104,6 +1163,16 @@ def _document_total(
                 best, best_rank = totals, rank
                 best_row = (row.page, row.line_index)
                 best_unreadable = unreadable
+            elif not totals and unreadable and best_row is None:
+                # A totals row every one of whose money cells was refused
+                # parses nothing, so it can never win the ranking above -- and
+                # it was dropped whole, taking the fact that this document has
+                # a printed total with it. It is still the total row: R-04 is
+                # now checking nothing against it, which is precisely what has
+                # to be said. Only where no readable total was found, so a row
+                # that does tie is never displaced by one that cannot.
+                best_row = (row.page, row.line_index)
+                best_unreadable = unreadable
     return best, best_row, best_unreadable
 
 
@@ -1189,29 +1258,31 @@ def collect_printed_sections(
     return sections
 
 
-def vision_claim_count(counts: Sequence[dict[str, int]]) -> int | None:
-    """The document's claim count from scanned pages, or None if unestablished.
+def vision_claim_evidence(
+    tables: Sequence[RawTable],
+) -> list[dict[str, int]]:
+    """Claim counts reported off scanned pages, with the page each came from.
 
-    A scanned page prints its claim count like any other page, and the digital
-    path spent a whole correction learning that a count under a policy section
-    is that section's. This path used to take the first count it was handed,
-    whatever its scope -- so three scanned sections reporting 3, 2 and 1 gave
-    the document 3, and where that happened to equal the number of claims
-    extracted, R-05 fell silent and the badge went green on a document two
-    thirds of which was never counted.
+    Evidence, and only evidence. The digital path can tell a section's count
+    from the report's because it reads the words around the number -- "Report
+    Totals:" over "# Claims: 50". The vision schema returns the number alone,
+    so nothing in what comes back distinguishes a policy subtotal from the
+    document's own count, and none of these may become
+    ``printed_claim_count``.
 
-    The vision reader returns a number, not the wording around it, so the
-    strongest test the digital path uses -- a "Report Totals" label -- is not
-    available here. What remains is the one thing several pages can still
-    establish between them: a single count, or the same count repeated, is the
-    document speaking once. Different counts are several sections speaking for
-    themselves, and none of them may stand for the report.
+    Repetition does not rescue it. Three sections of three claims each agree at
+    three while the document holds nine, so agreement across pages is the same
+    coincidence the digital path already refuses to read as scope.
 
-    Every count is preserved by the caller with the page it came from, so a
-    rule can say the document's count is unresolved rather than absent.
+    Extending the vision schema to carry that wording is the real fix and is
+    deliberately not attempted here. Until it exists the honest answer is that
+    the document's count is unresolved, which is what R-27 reports from this.
     """
-    stated = {entry["count"] for entry in counts}
-    return stated.pop() if len(stated) == 1 else None
+    return [
+        {"page": table.page, "count": table.printed_claim_count}
+        for table in tables
+        if table.printed_claim_count is not None
+    ]
 
 
 def scope_sections(
@@ -1477,16 +1548,18 @@ def run_pipeline(
     # A scanned page prints its valuation date and claim count like any other,
     # but there is no text layer to read them from, so the vision pass reports
     # them and they are used only where the digital pass found nothing.
-    vision_counts = [
-        {"page": table.page, "count": table.printed_claim_count}
-        for table in vision_tables
-        if table.printed_claim_count is not None
-    ]
+    vision_counts = vision_claim_evidence(vision_tables)
     for table in vision_tables:
         if metadata.valuation_date_text is None and table.valuation_date_text:
             metadata.valuation_date_text = table.valuation_date_text
-    if metadata.printed_claim_count is None:
-        metadata.printed_claim_count = vision_claim_count(vision_counts)
+    if vision_counts:
+        # The digital decision was made before the scanned pages were read, on
+        # incomplete evidence. Re-taken with all of it: a lone digital count is
+        # only the document's while nothing else states a different one.
+        metadata.printed_claim_count = document_claim_count(
+            extraction.page_texts,
+            [entry["count"] for entry in vision_counts],
+        )
 
     first_page_text = extraction.page_texts.get(
         min(extraction.page_texts), ""
@@ -1717,7 +1790,12 @@ def run_pipeline(
         unreadable_totals_row=(
             document_total_row[1] if document_total_row else None
         ),
-        printed_count_evidence=counted_claim_evidence(extraction.page_texts),
+        # Both readers' counts, digital and scanned alike. A count the digital
+        # pages happened to supply is one candidate among several, not licence
+        # to ignore what the scanned pages said.
+        printed_count_evidence=(
+            counted_claim_evidence(extraction.page_texts) + vision_counts
+        ),
         policy_periods=declared_periods,
         rows_seen_per_page=rows_seen_per_page,
         column_mapping=mapping.decisions,

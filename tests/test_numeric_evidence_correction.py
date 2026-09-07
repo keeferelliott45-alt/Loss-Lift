@@ -163,14 +163,19 @@ def test_the_money_beside_a_version_label_still_blocks():
 
 
 def test_a_label_still_covers_the_value_it_names():
-    """The guard the rule exists for is unchanged: alone on its row, the
-    version is not money."""
+    """The guard the rule exists for: alone on its row, the version is not
+    money.
+
+    It is also not gone. The assertion that it vanish was too strong -- a
+    label explains its own value, and "explained" is not "absent". The value
+    is unresolved: never an amount, always reported.
+    """
     evidence = unplaced_evidence(
         _row(["", "", "", "Software version", "1.20"], line=2),
         CLAIMS_MAPPING, "us", context="claims",
     )
     assert evidence.amounts == {}, evidence
-    assert evidence.ambiguous == {}, evidence
+    assert evidence.ambiguous.get("paid_total", (None,))[0] == "1.20", evidence
 
 
 # --------------------------------------------------------------------------
@@ -222,39 +227,38 @@ def test_a_genuinely_monetary_only_table_is_still_read_as_money():
 # --------------------------------------------------------------------------
 
 
-def test_vision_section_counts_do_not_become_the_document_count():
-    """Three scanned pages reporting 3, 2 and 1 state no report total.
+def test_vision_counts_are_evidence_and_never_a_document_total():
+    """A scanned page's count carries no wording, so it settles nothing.
 
-    The digital path learned this: a count under a policy section is that
-    section's. The vision path took the first count it was handed, so a
-    document holding six claims across three sections adopted 3 -- and where
-    3 happens to equal the number of claims extracted, R-05 falls silent and
-    the badge goes green on a document two thirds of which was never counted.
+    These three tests previously asserted that a single count, or the same
+    count repeated, could become the document's. Neither can. The digital path
+    tells a section's count from the report's by reading the words around the
+    number -- "Report Totals:" over "# Claims: 50" -- and the vision schema
+    returns the number alone. Three sections of three claims each agree at
+    three while the document holds nine; agreement is the same coincidence the
+    digital path already refuses. Extending the schema to carry that wording is
+    the real fix and is deliberately not attempted here, so the honest answer
+    is that the count is unresolved.
     """
-    from core.pipeline import vision_claim_count
+    from core.pipeline import vision_claim_evidence
 
-    counts = [
-        {"page": 1, "count": 3},
-        {"page": 2, "count": 2},
-        {"page": 3, "count": 1},
+    def tables(*counts):
+        return [
+            RawTable(page=page, headers=[], strategy="vision",
+                     printed_claim_count=count)
+            for page, count in enumerate(counts, start=1)
+        ]
+
+    # Distinct, repeated and single alike: evidence, with its pages, and never
+    # a document total.
+    assert vision_claim_evidence(tables(3, 2, 1)) == [
+        {"page": 1, "count": 3}, {"page": 2, "count": 2}, {"page": 3, "count": 1}
     ]
-    assert vision_claim_count(counts) is None
-
-
-def test_a_single_vision_count_is_still_adopted():
-    """One scanned page stating one count has stated the document's."""
-    from core.pipeline import vision_claim_count
-
-    assert vision_claim_count([{"page": 1, "count": 6}]) == 6
-
-
-def test_repeated_identical_vision_counts_are_one_statement():
-    """A running footer scanned on every page repeats one figure."""
-    from core.pipeline import vision_claim_count
-
-    assert vision_claim_count(
-        [{"page": 1, "count": 6}, {"page": 2, "count": 6}]
-    ) == 6
+    assert vision_claim_evidence(tables(3, 3, 3)) == [
+        {"page": 1, "count": 3}, {"page": 2, "count": 3}, {"page": 3, "count": 3}
+    ]
+    assert vision_claim_evidence(tables(6)) == [{"page": 1, "count": 6}]
+    assert vision_claim_evidence(tables(None)) == []
 
 
 def test_unresolved_vision_counts_are_preserved_and_require_review():
@@ -290,7 +294,9 @@ def test_an_unreadable_document_total_carries_its_row():
     finding = next(f for f in reconcile(doc).findings if f.rule_id == "R-26")
     assert "row-None" not in finding.condition, finding.condition
     assert "21" in finding.condition, finding.condition
-    assert "page 7, line 21" in finding.message, finding.message
+    # The reviewer-facing line counts from one, as every other "page N, line M"
+    # in the product does; the finding's identity stays on the index.
+    assert "page 7, line 22" in finding.message, finding.message
 
 
 def test_an_unknown_total_row_says_so_rather_than_inventing_one():

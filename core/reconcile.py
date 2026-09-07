@@ -1281,7 +1281,12 @@ def r26_unreadable_printed_totals(
         (
             (
                 f"the document's total row on page "
-                f"{doc.unreadable_totals_page}, line {doc.unreadable_totals_row}"
+                f"{doc.unreadable_totals_page}, line "
+                # Lines are numbered as the page prints them, from one -- the
+                # convention Claim.where and UnplacedRow.where already use.
+                # The finding's identity below stays on the index, so how it is
+                # displayed cannot move it.
+                f"{doc.unreadable_totals_row + 1}"
                 if doc.unreadable_totals_row is not None
                 else (
                     f"the document's total row on page "

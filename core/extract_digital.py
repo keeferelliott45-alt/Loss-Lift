@@ -1620,7 +1620,9 @@ def counted_claim_evidence(page_texts: Mapping[int, str]) -> list[dict[str, int]
     ]
 
 
-def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
+def document_claim_count(
+    page_texts: Mapping[int, str], extra_counts: Sequence[int] = ()
+) -> int | None:
     """How many claims the document says it holds -- or None if it never says.
 
     R-05 is one of the two rules that check against something the carrier
@@ -1636,6 +1638,11 @@ def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
     count on the document is written in the section form ("Claim Count = 4").
     Illinois is read by the first of those, its report total printed as
     "Report Totals:" over "# Claims: 50".
+
+    ``extra_counts`` are counts from readers that return a number without the
+    words around it -- the vision pass. They can never *be* the answer, having
+    no scope of their own, but they can deny one: a document is only
+    unambiguous when nothing else on it states a different figure.
 
     Nothing is inferred from the counts' arithmetic. A document whose sections
     hold one, two and three claims prints a 3 that is also 1+2, and adopting it
@@ -1655,9 +1662,20 @@ def document_claim_count(page_texts: Mapping[int, str]) -> int | None:
         for _page, text in sorted(page_texts.items())
         for entry in stated_claim_counts(text)
     ]
+    # Counts read off scanned pages carry no wording, so they can never be the
+    # document's own -- but they are still counts the document states, and the
+    # "nothing else to be confused with" rule below is exactly the rule they
+    # can refute. A digital page's lone count stops being unambiguous the
+    # moment a scanned page states a different one.
+    competing = len(stated) + len(extra_counts)
     if not stated:
         return None
-    if len(stated) == 1:
+    # A wordless count can deny, never supply. "The only count on the document"
+    # is the reason the single-count rule is safe, and a scanned page stating a
+    # different figure takes that reason away -- but a scanned page's number
+    # can no more be the report's total on its own than it can beside others,
+    # since nothing in it says what it counts.
+    if competing == 1:
         return stated[0][0]
     total_led = [count for count, is_total in stated if is_total]
     return total_led[0] if len(total_led) == 1 else None

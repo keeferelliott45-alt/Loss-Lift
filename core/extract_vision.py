@@ -124,6 +124,22 @@ def load_prompt() -> str:
     return text.split(marker, 1)[1].strip() if marker in text else text.strip()
 
 
+
+def _claim_count(value: object) -> int | None:
+    """A model's claim count, or None where it did not give one.
+
+    ``isinstance(True, int)`` is True in Python, so a model answering ``true``
+    became a printed claim count of 1 -- a number nobody printed, arriving on
+    the one rule that checks against what the carrier did print. A count is a
+    non-negative whole number and nothing else: not a boolean, not a float,
+    not a numeral in a string. Anything else is the model failing to answer,
+    which is not the same fact as a page stating no count, and is treated as
+    no count rather than guessed at.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
 def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> RawTable:
     """Turn the model's JSON into the same RawTable the digital path produces.
 
@@ -165,7 +181,7 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
             continue
         (totals if kind == "total" else rows).append(row)
 
-    count = data.get("printed_claim_count")
+    count = _claim_count(data.get("printed_claim_count"))
     valuation = data.get("valuation_date")
     return RawTable(
         page=page_number,
@@ -173,7 +189,7 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
         rows=rows,
         total_rows=totals,
         strategy="vision",
-        printed_claim_count=count if isinstance(count, int) else None,
+        printed_claim_count=count,
         valuation_date_text=clean_text(valuation) or None if valuation else None,
     )
 
