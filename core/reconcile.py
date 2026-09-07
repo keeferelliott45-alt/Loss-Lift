@@ -1159,7 +1159,7 @@ def r25_section_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
                     category=FindingCategory.EXTRACTION,
                     scope=FindingScope.DOCUMENT,
                     subject="document",
-                    condition=f"unscoped-page-{section.page}-{section.label}",
+                    condition=f"unscoped-page-{section.page}-row-{section.line_index}",
                     severity=Severity.WARN,
                     page=section.page,
                     message=(
@@ -1197,7 +1197,10 @@ def r25_section_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Fi
                     category=FindingCategory.FINANCIAL,
                     scope=FindingScope.DOCUMENT,
                     subject="document",
-                    condition="mismatch",
+                    condition=(
+                        f"mismatch-page-{section.page}-row-{section.line_index}"
+                        f"-{field_name}"
+                    ),
                     severity=Severity.ERROR,
                     field=field_name,
                     page=section.page,
@@ -1241,7 +1244,7 @@ def r26_unreadable_printed_totals(
                     category=FindingCategory.EXTRACTION,
                     scope=FindingScope.DOCUMENT,
                     subject="document",
-                    condition=f"page-{section.page}-{field_name}",
+                    condition=f"page-{section.page}-row-{section.line_index}-{field_name}",
                     severity=Severity.WARN,
                     field=field_name,
                     page=section.page,

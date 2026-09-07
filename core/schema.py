@@ -467,6 +467,12 @@ class PrintedSection(BaseModel):
     printed_claim_count: int | None = None
     page: int = 1
 
+    #: The printed line this subtotal was read from. A page can carry the same
+    #: subtotal twice -- Liberty prints its report total on page 41 in two
+    #: identical rows -- and without the line they are one object with one
+    #: identity, so a finding about the second silently answers for the first.
+    line_index: int = 0
+
     #: The physical rows this subtotal totals, where the document establishes
     #: that. A carrier printing "Claim Count = 4" at the foot of a page holding
     #: four extracted claims has said what the figures cover; a count that does

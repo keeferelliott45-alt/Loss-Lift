@@ -106,7 +106,7 @@ def test_the_real_sections_tie_against_their_own_claims(aig):
     proposition, and until now nothing was computing it.
     """
     findings = [f for f in reconcile(aig).findings if f.rule_id == "R-25"]
-    mismatches = [f for f in findings if f.condition == "mismatch"]
+    mismatches = [f for f in findings if f.condition.startswith("mismatch")]
     assert mismatches == [], [f.message for f in mismatches]
 
 
@@ -133,3 +133,27 @@ def test_the_claim_records_are_untouched(aig):
     by_row = {c.row_id: c for c in aig.claims}
     assert by_row["p4r12"].incurred_total == Decimal("15017.75")
     assert by_row["p4r9"].reserve_total == Decimal("500.00")
+
+
+LIBERTY = CORPUS.parent / "liberty.pdf"
+
+
+@pytest.mark.skipif(not LIBERTY.exists(), reason="reference corpus not present")
+def test_a_subtotal_printed_twice_on_one_page_keeps_two_identities(tmp_path):
+    """Liberty prints its report total on page 41 in two identical rows.
+
+    Keyed on page and label alone they are one object, and the engine's own
+    duplicate-identity check rejected the document outright. They are two
+    printed rows, so they are two sections and two findings: dismissing the
+    one must never answer for the other.
+    """
+    document = run_pipeline(
+        str(LIBERTY), use_vision=False, profiles_dir=tmp_path
+    ).document
+    on_41 = [s for s in document.printed_sections if s.page == 41]
+    assert len(on_41) == 2, [(s.page, s.line_index, s.label) for s in on_41]
+    assert on_41[0].line_index != on_41[1].line_index, on_41
+    conditions = [
+        f.condition for f in reconcile(document).findings if f.rule_id == "R-25"
+    ]
+    assert len(conditions) == len(set(conditions)), conditions

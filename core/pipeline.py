@@ -956,6 +956,7 @@ def collect_printed_sections(
                     printed_claim_count=parse_int(count.group(1)) if count else None,
                     unreadable_totals=unreadable,
                     page=row.page,
+                    line_index=row.line_index,
                 )
             )
     return sections
