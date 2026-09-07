@@ -467,6 +467,26 @@ class PrintedSection(BaseModel):
     printed_claim_count: int | None = None
     page: int = 1
 
+    #: The physical rows this subtotal totals, where the document establishes
+    #: that. A carrier printing "Claim Count = 4" at the foot of a page holding
+    #: four extracted claims has said what the figures cover; a count that does
+    #: not match the page has not, and this stays empty rather than being
+    #: filled with whatever claims are nearby. Empty therefore means one of two
+    #: things -- nothing to cover, or nothing established -- which
+    #: `scope_known` separates.
+    covers_rows: list[str] = Field(default_factory=list)
+
+    #: Whether the scope above was established at all. False is the honest
+    #: answer for a subtotal nothing can be checked against, and it must reach
+    #: a reviewer rather than leaving a captured figure looking verified.
+    scope_known: bool = False
+
+    #: Money columns whose printed cell could not be read, and what the page
+    #: shows in them. A refusal is right where the cell is ambiguous, but it
+    #: silently stops the column being checked, so the printed text survives
+    #: the refusal and can be reported with it.
+    unreadable_totals: dict[str, str] = Field(default_factory=dict)
+
 
 class LossRunDocument(BaseModel):
     model_config = ConfigDict(validate_assignment=True, extra="forbid")

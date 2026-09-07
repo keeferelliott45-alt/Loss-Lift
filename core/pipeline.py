@@ -832,7 +832,24 @@ def collect_printed_totals(
     claim_count: int | None = None,
 ) -> dict[str, Decimal | None]:
     """Read the footer totals row — the numbers R-04 checks against."""
+    return _document_total(tables, mapping, locale, claim_count)[0]
+
+
+def _document_total(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    claim_count: int | None = None,
+) -> tuple[dict[str, Decimal | None], tuple[int, int] | None]:
+    """The document's printed total, and which printed row it came from.
+
+    The row's identity matters as much as its figures: one printed row is
+    either the report's total or a section's subtotal, never both, and a row
+    counted twice is reported twice -- once by R-04 against the whole document
+    and again by R-25 as a subtotal covering claims it was never scoped to.
+    """
     best: dict[str, Decimal | None] = {}
+    best_row: tuple[int, int] | None = None
     best_rank = (0, 0, 0)
     for table in tables:
         table_mapping = mapping_for(table, mapping)
@@ -859,7 +876,8 @@ def collect_printed_totals(
             )
             if totals and rank > best_rank:
                 best, best_rank = totals, rank
-    return best
+                best_row = (row.page, row.line_index)
+    return best, best_row
 
 
 #: The claim count printed inside a subtotal row, e.g. "# Claims: 6" or
@@ -879,12 +897,20 @@ def collect_printed_sections(
     mapping: ColumnMapping,
     locale: str | None,
     date_order: str | None,
+    document_row: tuple[int, int] | None = None,
 ) -> list[PrintedSection]:
     """Read each per-term subtotal the document prints.
 
     These are the only other numbers besides the grand total that the carrier
     committed to, so they let each policy term be checked on its own rather
     than only the document as a whole.
+
+    ``document_row`` is the printed row the document total was taken from,
+    which is not a section. Excluding it by identity rather than by wording
+    matters: a footer labelled plainly "TOTALS" is the report's total on a
+    one-section document and would otherwise be collected twice, reported
+    once by R-04 against every claim and again by R-25 as a subtotal whose
+    scope nothing established.
     """
     sections: list[PrintedSection] = []
     for table in tables:
@@ -892,17 +918,29 @@ def collect_printed_sections(
         for row in table.total_rows:
             if GRAND_TOTAL_PATTERN.search(row.text()):
                 continue  # the report total, already held on the document
+            if document_row is not None and (row.page, row.line_index) == document_row:
+                continue  # the same, recognised by which row it is
 
             totals: dict[str, Decimal | None] = {}
+            unreadable: dict[str, str] = {}
             for index, field_name in table_mapping.fields.items():
                 if field_name not in MONEY_FIELDS:
                     continue
                 cell = row.cell(index).strip()
-                if cell and not _is_smeared(cell) and not _is_the_claim_count(row, index):
-                    parsed = parse_money(cell, locale)
-                    if parsed.value is not None:
-                        totals[field_name] = parsed.value
-            if not totals:
+                if not cell or _is_the_claim_count(row, index):
+                    continue
+                if _is_smeared(cell):
+                    # Refusing the cell is right; losing it is not. The column
+                    # stops being checked either way, and only the printed text
+                    # can tell a reviewer what was given up.
+                    unreadable[field_name] = cell
+                    continue
+                parsed = parse_money(cell, locale)
+                if parsed.value is not None:
+                    totals[field_name] = parsed.value
+                else:
+                    unreadable[field_name] = cell
+            if not totals and not unreadable:
                 continue
 
             text = row.text()
@@ -916,10 +954,45 @@ def collect_printed_sections(
                     ),
                     printed_totals=totals,
                     printed_claim_count=parse_int(count.group(1)) if count else None,
+                    unreadable_totals=unreadable,
                     page=row.page,
                 )
             )
     return sections
+
+
+def scope_sections(
+    sections: Sequence[PrintedSection], claims: Sequence[Claim]
+) -> None:
+    """Record which claims each printed subtotal covers, where the page says so.
+
+    A subtotal is worth nothing to a reviewer until something is compared
+    against it, and comparing needs a set of claims that the document -- not
+    this function -- says the figures cover.
+
+    The evidence used is the carrier's own claim count read against the page
+    the subtotal is printed on. A row reading "Claim Count = 4" at the foot of
+    a page from which exactly four claims were extracted has stated its scope:
+    those four. Where the count and the page disagree, the scope is *not*
+    established -- the section may span pages, or a claim on the page may have
+    been missed -- and nothing is recorded, because a subtotal checked against
+    the wrong claims is worse than one checked against nothing and said to be.
+
+    A count of zero is a scope like any other: the section covers no claims,
+    which is exactly what a "No Claims for Policy" page prints.
+    """
+    by_page: dict[int, list[Claim]] = {}
+    for claim in claims:
+        by_page.setdefault(claim.source_page, []).append(claim)
+
+    for section in sections:
+        if section.printed_claim_count is None:
+            continue
+        on_page = by_page.get(section.page, [])
+        if len(on_page) != section.printed_claim_count:
+            continue
+        section.covers_rows = [claim.row_id for claim in on_page]
+        section.scope_known = True
 
 
 # --------------------------------------------------------------------------
@@ -1240,7 +1313,9 @@ def run_pipeline(
             and text not in furniture
         )
 
-    printed_totals = collect_printed_totals(tables, mapping, locale, len(claims))
+    printed_totals, document_total_row = _document_total(
+        tables, mapping, locale, len(claims)
+    )
 
     # Recoveries: settle the carrier's sign convention before anything is
     # reconciled, and apply it to the printed totals too — otherwise R-04
@@ -1261,6 +1336,13 @@ def run_pipeline(
             confident=True,
             evidence="carrier profile",
         )
+    printed_sections = collect_printed_sections(
+        tables,
+        mapping,
+        locale_inference.locale,
+        date_inference.order,
+        document_row=document_total_row,
+    )
     if recovery_sign.should_negate:
         for claim in claims:
             if claim.recovery_total is not None:
@@ -1269,6 +1351,15 @@ def run_pipeline(
             name: (-value if name == "recovery_total" and value is not None else value)
             for name, value in printed_totals.items()
         }
+        # The same convention, applied to the same kind of figure. A subtotal's
+        # recovery column is printed exactly as the document total's is, so
+        # leaving it un-negated set every claim's flipped recovery against an
+        # unflipped subtotal and reported the difference twice over as an
+        # arithmetic error against the carrier.
+        for section in printed_sections:
+            value = section.printed_totals.get("recovery_total")
+            if value is not None:
+                section.printed_totals["recovery_total"] = -value
 
     # Currency: what the rows actually show, not what the default assumes.
     # Defaulting to USD and then comparing that default against a euro symbol
@@ -1342,9 +1433,7 @@ def run_pipeline(
         policy_periods=declared_periods,
         rows_seen_per_page=rows_seen_per_page,
         column_mapping=mapping.decisions,
-        printed_sections=collect_printed_sections(
-            tables, mapping, locale_inference.locale, date_inference.order
-        ),
+        printed_sections=printed_sections,
         claims=claims,
         currencies_seen=currencies_seen,
         document_issues=document_issues,
@@ -1352,6 +1441,9 @@ def run_pipeline(
         profile_name=profile.profile_name if profile else None,
         recovery_convention="credit" if recovery_sign.should_negate else None,
     )
+    # Scoping needs the claims and the sections together, so it happens once
+    # the document holds both rather than inside either collector.
+    scope_sections(document.printed_sections, document.claims)
 
     config = reconcile_config or _config_for(profile)
     return ExtractionResult(

@@ -1130,6 +1130,136 @@ def r24_column_split_table(
     ]
 
 
+@rule("R-25")
+def r25_section_totals(doc: LossRunDocument, config: ReconcileConfig) -> list[Finding]:
+    """Each printed subtotal against the claims the document says it covers.
+
+    R-04 checks the report total, which many carriers never print. AIG prints
+    none: it prints one subtotal per policy instead, at the foot of the page
+    whose claims it totals. Collecting those figures without comparing them to
+    anything was worse than not collecting them -- a captured number on screen
+    reads as a verified one, and mutating a captured AIG subtotal from
+    30,692.75 to 999,999.00 used to leave every finding identical.
+
+    Only a section whose scope the document established is checked. That scope
+    is the carrier's own claim count read against the page: "Claim Count = 4"
+    over a page holding exactly four extracted claims. Where the count and the
+    page disagree, the section is reported as unchecked rather than checked
+    against whichever claims happen to be nearby -- an invented association
+    would make the rule fire on the wrong rows, which is the one outcome worse
+    than no check at all.
+    """
+    findings: list[Finding] = []
+    by_row = {claim.row_id: claim for claim in doc.claims}
+    for section in doc.printed_sections:
+        if not section.scope_known:
+            findings.append(
+                Finding(
+                    rule_id="R-25",
+                    category=FindingCategory.EXTRACTION,
+                    scope=FindingScope.DOCUMENT,
+                    subject="document",
+                    condition=f"unscoped-page-{section.page}-{section.label}",
+                    severity=Severity.WARN,
+                    page=section.page,
+                    message=(
+                        f"The subtotal printed on page {section.page} "
+                        f"({section.label}) could not be checked: the document "
+                        f"does not say which claims it covers"
+                        + (
+                            f" -- it names {section.printed_claim_count} claim(s) "
+                            f"and that page yielded a different number."
+                            if section.printed_claim_count is not None
+                            else ", and it states no claim count."
+                        )
+                        + " Its figures are shown as printed, not verified."
+                    ),
+                    expected="a subtotal whose claims can be identified",
+                    actual=f"page {section.page} scope not established",
+                )
+            )
+            continue
+
+        claims = [by_row[row] for row in section.covers_rows if row in by_row]
+        for field_name, printed in sorted(section.printed_totals.items()):
+            if printed is None or field_name not in MONEY_FIELDS:
+                continue
+            extracted = sum(
+                (getattr(claim, field_name, None) or Decimal("0") for claim in claims),
+                Decimal("0"),
+            )
+            delta = extracted - printed
+            if config.within_tolerance(delta):
+                continue
+            findings.append(
+                Finding(
+                    rule_id="R-25",
+                    category=FindingCategory.FINANCIAL,
+                    scope=FindingScope.DOCUMENT,
+                    subject="document",
+                    condition="mismatch",
+                    severity=Severity.ERROR,
+                    field=field_name,
+                    page=section.page,
+                    message=(
+                        f"The {len(claims)} claim(s) covered by the subtotal on "
+                        f"page {section.page} ({section.label}) sum to "
+                        f"{_fmt(extracted)} for {_label(field_name)}, but that "
+                        f"subtotal prints {_fmt(printed)} (off by {_fmt(delta)})."
+                    ),
+                    expected=printed,
+                    actual=extracted,
+                    delta=delta,
+                )
+            )
+    return findings
+
+
+@rule("R-26")
+def r26_unreadable_printed_totals(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A printed total the reader refused, with the text it refused.
+
+    Refusing an ambiguous cell is correct: page 4 of AIG's run prints paid
+    indemnity 30,000.00 with the claim count fused to it by a column boundary,
+    and reading "4 30,000.00" as 430,000.00 would put a figure on the document
+    that nobody printed. But the refusal stops that column being checked, and
+    dropping it without a word leaves a reviewer believing the column was
+    verified when nothing looked at it.
+
+    So the printed text and its page survive the refusal. This reports what
+    was given up, not an error in the document -- which is why it is a warning
+    and why it carries what the page actually shows.
+    """
+    findings: list[Finding] = []
+    for section in doc.printed_sections:
+        for field_name, printed in sorted(section.unreadable_totals.items()):
+            findings.append(
+                Finding(
+                    rule_id="R-26",
+                    category=FindingCategory.EXTRACTION,
+                    scope=FindingScope.DOCUMENT,
+                    subject="document",
+                    condition=f"page-{section.page}-{field_name}",
+                    severity=Severity.WARN,
+                    field=field_name,
+                    page=section.page,
+                    message=(
+                        f"The {_label(field_name)} printed in the subtotal on "
+                        f"page {section.page} could not be read, so that column "
+                        f"is not checked against this section. The document "
+                        f"shows {printed!r} -- two values run together by a "
+                        f"column boundary read as one would invent a figure, so "
+                        f"none was taken. Read it from the page."
+                    ),
+                    expected="a printed subtotal that can be read",
+                    actual=printed,
+                )
+            )
+    return findings
+
+
 # --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
