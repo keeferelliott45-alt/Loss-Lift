@@ -1677,6 +1677,14 @@ def document_claim_count(
     # since nothing in it says what it counts.
     if competing == 1:
         return stated[0][0]
+    # A total-led count outranks a *section-form* count because the wording
+    # differs: "Total Claims: 3" names a total and "Claim Count = 4" names a
+    # policy's. It cannot outrank a wordless one, which says nothing the
+    # comparison could turn on -- a scanned page reporting 7 is a competing
+    # statement about how many claims there are, and no wording on either side
+    # settles which of them covers the document.
+    if extra_counts:
+        return None
     total_led = [count for count, is_total in stated if is_total]
     return total_led[0] if len(total_led) == 1 else None
 

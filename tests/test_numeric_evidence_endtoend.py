@@ -369,20 +369,25 @@ def test_a_label_carrying_a_digit_does_not_make_its_value_money(
 ):
     """The label's own digit is not evidence about the column beside it.
 
-    Whether the label names this value or a different one is exactly what is
-    uncertain, so the value is kept as unresolved -- never promoted to a
-    definite amount, never erased.
+    The label repeats the figure -- "Policy year 2024" over "2024.00" -- which
+    is the row saying the same thing twice, not two competing statements. It
+    is neither promoted to a definite amount nor held as unresolved: the row
+    has explained its own number, and an exceptions list carrying rows the
+    document already explained is one nobody reads to the end.
+
+    The neighbouring test above holds the other half of this: a label exempts
+    the value it names and cannot speak for an unrelated ``$500.00`` sharing
+    its row.
     """
     path = _write(
         tmp_path / "labelled.pdf", CLAIMS + ((label, "", "", printed, "", ""),)
     )
     result = run_pipeline(path, use_vision=False)
     document = result.document
-    money = {
-        text for row in document.unplaced_rows for text in row.amounts.values()
-    }
-    assert printed not in money, f"{label!r} made {printed!r} definite money"
-    assert printed in _unplaced_texts(document), f"{printed!r} was erased"
+    assert printed not in _unplaced_texts(document), (
+        f"{label!r} left {printed!r} on the exceptions list: "
+        f"{[(r.amounts, r.ambiguous_values) for r in document.unplaced_rows]}"
+    )
 
 
 # --------------------------------------------------------------------------

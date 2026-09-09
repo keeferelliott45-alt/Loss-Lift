@@ -358,20 +358,18 @@ def test_contextually_established_non_money_does_not_become_money(label, printed
         _row(["CLM-1", "01/05/2024", "Closed", "1,000.00", "1,000.00"], line=1),
         _row([label, "", "", printed, ""], line=2),
     ])
-    money = [row.amounts for row in unplaced]
-    assert not any("paid_total" in m and m["paid_total"] == printed for m in money), (
-        f"{label} {printed!r} was read as money: {money}"
-    )
-    # Not money, and not erased either. This test once required the value to
-    # disappear entirely; that conflated "the label says this is not an amount"
-    # with "there is nothing here to look at". Whether the label names *this*
-    # figure or another one on the row is exactly what is uncertain, so the
-    # value is kept as unresolved and reported in those words.
+    # Neither channel. An intervening unit weakened this to "not money, but
+    # kept as unresolved", on the reasoning that the label might be naming a
+    # different figure on the row. It cannot: the row holds one figure, the
+    # label sits beside it, and there is nothing left for the label to be
+    # about. What that weakening bought was an exceptions list carrying every
+    # row the document had already explained, and an exceptions list nobody
+    # finishes reading is one nobody reads.
     carried = [
         {**row.amounts, **row.ambiguous_values} for row in unplaced
     ]
-    assert any(c.get("paid_total") == printed for c in carried), (
-        f"{label} {printed!r} was erased: {carried}"
+    assert not any("paid_total" in c and c["paid_total"] == printed for c in carried), (
+        f"{label} {printed!r} was read as money: {carried}"
     )
 
 

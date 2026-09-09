@@ -163,19 +163,20 @@ def test_the_money_beside_a_version_label_still_blocks():
 
 
 def test_a_label_still_covers_the_value_it_names():
-    """The guard the rule exists for: alone on its row, the version is not
-    money.
+    """The guard the rule exists for is unchanged: alone on its row, the
+    version is not money -- and there is nothing left unresolved about it.
 
-    It is also not gone. The assertion that it vanish was too strong -- a
-    label explains its own value, and "explained" is not "absent". The value
-    is unresolved: never an amount, always reported.
+    An intervening unit kept the value as unresolved on the reasoning that
+    "explained" is not "absent". Both channels are reported, so that put a row
+    the document had already explained onto the exceptions list. The label
+    covers the one figure beside it; neither channel takes it.
     """
     evidence = unplaced_evidence(
         _row(["", "", "", "Software version", "1.20"], line=2),
         CLAIMS_MAPPING, "us", context="claims",
     )
     assert evidence.amounts == {}, evidence
-    assert evidence.ambiguous.get("paid_total", (None,))[0] == "1.20", evidence
+    assert evidence.ambiguous == {}, evidence
 
 
 # --------------------------------------------------------------------------
