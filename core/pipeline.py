@@ -341,8 +341,15 @@ def page_furniture(
     Repetition alone is not enough where the row carries figures. A spreadsheet
     paginated by column repeats the same amounts on every page it spans, and a
     whole-unit amount repeated three times is three unplaced figures, not one
-    strapline seen three times. A row with a parseable value under a mapped
-    money column is therefore never furniture, however often it appears.
+    strapline seen three times. A row carrying numeric evidence is therefore
+    never pooled here, however often it appears.
+
+    What comes back is the repeated *text*, which is the evidence that a line
+    repeats -- not a verdict on any particular line. Each occurrence is judged
+    again where the pool is consulted, because a line can be a running footer
+    on one page and a figure on another, and the occurrence that looks like
+    furniture must not reach across the document and delete the one that does
+    not.
     """
     pages = {table.page for table in tables}
     if len(pages) < 2:
@@ -351,20 +358,15 @@ def page_furniture(
     seen: dict[str, set[int]] = {}
     for table in tables:
         table_mapping = mapping_for(table, mapping) if mapping is not None else None
-        # Which columns this table actually uses for money, asked of the table
-        # rather than assumed from the mapping. A running footer whose print
-        # date lands under a heading that says "incurred" carries a figure, but
-        # not one of that column's figures, and exempting it from the furniture
-        # rule puts the letterhead on every page into a claim's description.
-        established = (
-            established_money_columns(table, table_mapping, locale)
-            if table_mapping is not None
-            else frozenset()
-        )
+        # The physically preceding line, which is what says whether this one is
+        # the tail of a paragraph printed above it.
+        previous: RawRow | None = None
         for row in list(table.rows) + list(table.total_rows):
-            if table_mapping is not None and _carries_numeric_evidence(
-                row, table_mapping, locale, established
-            ):
+            carries = table_mapping is not None and _carries_numeric_evidence(
+                row, table_mapping, locale, previous
+            )
+            previous = row
+            if carries:
                 continue
             text = _normalised(row)
             if text:
@@ -401,19 +403,6 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
 _FINANCIAL_NOTATION = re.compile(
     r"[.,()]|[$€£¥₤₹₽]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE
 )
-
-#: Written the way only money is written: a currency mark or a credit marker.
-#: A year, a version, a serial or an identifier never carries one, so a cell
-#: that does is money regardless of what words happen to share its row.
-#:
-#: Parentheses are deliberately *not* here. Accounting negatives use them, but
-#: so does every other trade that ever put a number in brackets, and a label
-#: saying "policy year" beside "(2024)" is the row explaining its own number.
-#: Reading the brackets as a currency mark made that the strongest possible
-#: reading of the weakest possible evidence -- enough to overrule the label
-#: sitting next to it. A parenthesised figure in a money column still parses
-#: as a negative amount; what it no longer does is override the row's words.
-_UNMISTAKABLY_MONEY = re.compile(r"[$€£¥₤₹₽]|\b(?:CR|DR)\b", re.IGNORECASE)
 
 #: A row that says outright what its number is. This is the row's own words --
 #: source evidence, the same kind ``is_structural_row`` already reads -- and it
@@ -455,101 +444,127 @@ _CURRENCY_MARK = re.compile(
 )
 
 
-def established_money_columns(
-    table: RawTable, mapping: ColumnMapping, locale: str | None
-) -> frozenset[str]:
-    """Which mapped money columns this table actually uses for money.
-
-    A mapping says what a column is *meant* to hold. Whether it holds it is a
-    question only the table answers: a column whose populated cells parse as
-    amounts at least as often as they do not is being used for money here, and
-    a cell in it that fails to parse is an amount the reader could not read. A
-    column carrying prose on most of its rows is not, whatever its header said
-    -- a disclaimer block and a running footer both map onto money headings
-    without a single amount under them.
-
-    This is the evidence that replaces counting a cell's numbers. "Paid
-    30,000.00" has one number and a word; "reported within 30 to 60 days" has
-    two numbers and several words. Nothing about either token says which is
-    money. What the column does on its other rows does.
-
-    Ties go to the mapping, which is itself evidence and said money. A page
-    holding one claim and one merged cell splits its column exactly in half,
-    and refusing to establish it there would erase the very figure this thread
-    exists to keep. The two outcomes are not equal in cost: a column wrongly
-    established puts a line on the exceptions list, and a column wrongly
-    denied loses a printed figure silently.
-    """
-    established: set[str] = set()
-    for index, name in mapping.fields.items():
-        if name not in MONEY_FIELDS:
-            continue
-        readable = unreadable = 0
-        for row in table.rows:
-            text = row.cell(index).strip()
-            if not text:
-                continue
-            if not _is_smeared(text) and parse_money(text, locale).value is not None:
-                readable += 1
-            else:
-                unreadable += 1
-        if readable and readable >= unreadable:
-            established.add(name)
-    return frozenset(established)
+def _reads_as_money(text: str, locale: str | None) -> bool:
+    """Whether this cell yields one confident amount."""
+    return not _is_smeared(text) and parse_money(text, locale).value is not None
 
 
-def _continues_from_the_left(row: RawRow, mapping: ColumnMapping, index: int) -> bool:
-    """Whether this cell is the tail of text that began outside a money column.
+def _runs_in_from_a_description(
+    row: RawRow, mapping: ColumnMapping, locale: str | None, index: int
+) -> bool:
+    """Whether this cell is the tail of a sentence that began outside the money.
 
     A description too long for its column spills rightward and the extractor
-    cuts it at the next boundary, so the second half of a sentence lands under
-    a money heading with the first half beside it. The cell belongs to that
-    run, and the evidence is on the row: something is printed immediately to
-    its left, in a column the mapping does not call money.
+    cuts it at each boundary it crosses, so the later words of a sentence land
+    under money headings with the earlier words beside them. Reading the tail
+    as a figure puts prose on the exceptions list.
 
-    A money cell whose left neighbour is empty stands alone. One whose left
-    neighbour is another money column is part of a row of figures, which is
-    what an unplaced money row looks like.
+    The run is *traced*, not guessed from the nearest neighbour. Walking left
+    from the cell, each populated cell is one of four things.
+
+    A cell in a column the mapping does not call money is where the sentence
+    started: narrative.
+
+    A money cell carrying no digit at all is text, by the same rule that says
+    a digit-free cell is not a figure -- so the sentence started here or
+    further left, and this is narrative too. That is what settles a block
+    mapping nothing but money, where there is no non-money column to reach:
+    "(4) any unauthorized" follows four wordy cells with not one digit among
+    them, and a row of figures never looks like that.
+
+    A money cell that yields an amount ends the walk the other way: this is a
+    row of figures, and the refused cell is one of its figures.
+
+    A money cell carrying digits but yielding no value is another refused
+    figure, or the middle of a sentence quoting a number. It settles nothing,
+    so the walk continues through it -- which is the whole point, since
+    "reported within | 30 to | 60 days" puts two of its three fragments in
+    money columns and stopping at the first would call the last one money.
+
+    Walking *through* the undecided case is what keeps this monotonic: another
+    unreadable figure appearing to the left can never turn its neighbour into
+    prose, so more parse failures never mean less evidence.
+
+    Empty cells are skipped rather than ending the walk: a description that
+    wraps need not fill every column it passes over.
     """
     for before in range(index - 1, -1, -1):
-        if not row.cell(before).strip():
+        text = row.cell(before).strip()
+        if not text:
             continue
-        return mapping.fields.get(before) not in MONEY_FIELDS
+        if mapping.fields.get(before) not in MONEY_FIELDS:
+            return True
+        if not any(character.isdigit() for character in text):
+            return True
+        if _reads_as_money(text, locale):
+            return False
     return False
+
+
+def _continues_the_line_above(
+    row: RawRow, previous: RawRow | None, mapping: ColumnMapping, locale: str | None
+) -> bool:
+    """Whether this row is the last line of a paragraph printed above it.
+
+    Some blocks map every column to money -- a five-column money grid with a
+    disclaimer wrapped across it -- and there is then no non-money column for
+    :func:`_runs_in_from_a_description` to trace back to. The evidence is on
+    the row above instead: a line spanning several columns, not one cell of
+    which yields an amount, is a paragraph line, and a short row under it that
+    also yields nothing is where that paragraph ended.
+
+    Deliberately narrow. It asks the row above to span *more than one column*,
+    so a refused figure standing alone never lends its line to the row beneath
+    it -- which is what keeps a page of merged cells a page of evidence rather
+    than one long sentence.
+    """
+    if previous is None:
+        return False
+    above = [cell.strip() for cell in previous.cells if cell.strip()]
+    if len(above) < 2 or any(_reads_as_money(cell, locale) for cell in above):
+        return False
+    here = [cell.strip() for cell in row.cells if cell.strip()]
+    return bool(here) and not any(_reads_as_money(cell, locale) for cell in here)
 
 
 def _numeric_cells(
     row: RawRow,
     mapping: ColumnMapping,
     locale: str | None,
-    established: frozenset[str],
+    previous: RawRow | None = None,
 ) -> tuple[dict[str, tuple[str, Decimal]], dict[str, str]]:
     """Money-column cells, split into what parsed and what could not be read.
 
     The second half is what this thread exists for: a cell refused as a value
-    is still a printed figure nobody placed. Three things have to hold before
-    a cell is kept as one.
+    is still a printed figure nobody placed. Keeping it is the default, and
+    discarding it needs a positive reason.
 
-    It contains a digit. This is not a count of how many numbers are in it --
-    that comparison was the thing that failed in both directions -- but the
-    precondition for there being numeric evidence at all. "LEFT SHOULDER" is
-    the tail of an injury description that reached a money column; there is no
-    figure in it to lose, and holding it as an unresolved amount would put
-    prose on the exceptions list.
+    That is the correction. The previous rule required a *reason to keep*: the
+    cell's column had to out-poll its own failures, counting readable cells
+    against unreadable ones. Absence of corroboration was read as proof of
+    prose, which made the rule non-monotonic -- one merged cell on a page of
+    claims survived, and a second one sank both, because the second failure
+    changed the poll that protected the first. No rule that preserves evidence
+    may lose more of it as more arrives.
 
-    Something establishes it as monetary: its column, or failing that its row.
-    The column is the ordinary answer -- a heading that says money over a
-    column of prose does not make prose money. But a column can be silent
-    rather than contrary: on a page carrying one row, the cell that failed to
-    parse is the only cell that column has, and it cannot vouch for itself.
-    The row then answers instead. A row whose other money cells read as
-    amounts, in columns this table did establish, is a row of figures, and a
-    cell sitting among them is one of its figures. A row with no such cell --
-    a disclaimer paragraph, a running footer carrying a print date -- is not,
-    and says so about every cell on it at once.
+    So the question is inverted. A cell in a mapped money column carrying a
+    digit is a figure nobody placed unless the page says otherwise, and the
+    page can say so in exactly two ways, both of them positive:
 
-    And it is not the tail of a sentence running in from the left, which is
-    what a description too long for its own column looks like.
+    it is the tail of a sentence traced back to a column the mapping does not
+    call money; or it is the last line of a paragraph printed above it, which
+    is the same fact where the block maps nothing but money and there is no
+    non-money column left to trace to.
+
+    Neither of those is available to a row that establishes itself as claim
+    data. A date and a status are what a claim line carries and a wrapped
+    sentence does not, and a claim line whose identifier went missing is the
+    one row most likely to be holding an amount nobody else will report.
+
+    The digit requirement stays: it is not a count of the cell's numbers but
+    the precondition for there being numeric evidence at all. "LEFT SHOULDER"
+    is an injury that reached a money column, and there is no figure in it to
+    lose.
     """
     values = _row_values(row, mapping)
     parsed: dict[str, tuple[str, Decimal]] = {}
@@ -560,18 +575,21 @@ def _numeric_cells(
         text = (values.get(name) or "").strip()
         if not text:
             continue
-        amount = None if _is_smeared(text) else parse_money(text, locale).value
-        if amount is not None:
-            parsed[name] = (text, amount)
+        if _reads_as_money(text, locale):
+            parsed[name] = (text, parse_money(text, locale).value)
         elif any(character.isdigit() for character in text):
             refused.append((index, name, text))
 
-    a_row_of_figures = any(name in established for name in parsed)
+    if not refused:
+        return parsed, {}
+    if _row_establishes_claim_data(values):
+        return parsed, {name: text for _index, name, text in refused}
+    if _continues_the_line_above(row, previous, mapping, locale):
+        return parsed, {}
     unreadable = {
         name: text
         for index, name, text in refused
-        if (name in established or a_row_of_figures)
-        and not _continues_from_the_left(row, mapping, index)
+        if not _runs_in_from_a_description(row, mapping, locale, index)
     }
     return parsed, unreadable
 
@@ -668,6 +686,55 @@ def _row_establishes_claim_data(values: dict[str, str]) -> bool:
     )
 
 
+#: A number as a label writes one, so "Policy year 2024" can be compared with
+#: the "2024.00" beside it. Used only for that comparison -- never to decide
+#: what a cell is, only whether two cells state the same figure.
+_NUMBER_IN_A_LABEL = re.compile(r"\d[\d,.']*")
+
+
+def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
+    """Which mapped money field, if any, the row's own words explain.
+
+    "Policy year" printed beside "2024.00" is the row saying what its number
+    is. The label explains the value it introduces -- the next populated cell
+    along the line -- and nothing further. A row reading "Policy year | 2024.00
+    | $1 $234" has explained the year and has said nothing whatever about the
+    refused cell beyond it.
+
+    A label may also carry its own number, and then it has already named it.
+    "Software version 1.20" beside "$500.00" explains the 1.20 inside itself
+    and says nothing about the $500 -- so such a label reaches the cell beside
+    it only when that cell is the *same* number, which is the row printing one
+    fact twice ("Policy year 2024 | 2024.00"). Repetition is the evidence, and
+    it is the only thing that ties the two cells together.
+
+    Returns the canonical field name of the explained cell, or ``None`` where
+    no cell carries such a label, nothing follows one, or the label has
+    already accounted for itself.
+    """
+    for index in range(len(row.cells)):
+        cell = row.cell(index).strip()
+        if not cell or not _NAMES_A_NON_MONEY_VALUE.search(clean_text(cell)):
+            continue
+        for after in range(index + 1, len(row.cells)):
+            value = row.cell(after).strip()
+            if not value:
+                continue
+            name = mapping.fields.get(after)
+            if name not in MONEY_FIELDS:
+                return None
+            if not any(character.isdigit() for character in cell):
+                return name
+            printed = parse_money(value, None).value
+            spoken = (
+                parse_money(token, None).value
+                for token in _NUMBER_IN_A_LABEL.findall(cell)
+            )
+            return name if printed is not None and printed in spoken else None
+        return None
+    return None
+
+
 def table_money_context(
     table: RawTable, mapping: ColumnMapping, shapes: set[str]
 ) -> str:
@@ -708,7 +775,7 @@ def unplaced_evidence(
     locale: str | None,
     *,
     context: str = "unknown",
-    established: frozenset[str] = frozenset(MONEY_FIELDS),
+    previous: RawRow | None = None,
 ) -> UnplacedEvidence:
     """Numeric cells on a row nothing claimed, classified by context.
 
@@ -740,7 +807,7 @@ def unplaced_evidence(
     # evidence: the page printed something under a money column and no claim
     # took it, which is exactly what an unplaced row is for. It goes straight
     # to the unresolved side, never to `amounts`, and never with a number.
-    parsed, merged = _numeric_cells(row, mapping, locale, established)
+    parsed, merged = _numeric_cells(row, mapping, locale, previous)
     if not parsed and not merged:
         return UnplacedEvidence({}, {})
 
@@ -748,39 +815,25 @@ def unplaced_evidence(
     if _row_establishes_claim_data(values):
         return UnplacedEvidence(parsed, unresolved, merged)
 
-    labelling = clean_text(
-        " ".join(
-            row.cell(index)
-            for index in range(len(row.cells))
-            if mapping.fields.get(index) not in MONEY_FIELDS
-        )
-    )
-    if _NAMES_A_NON_MONEY_VALUE.search(labelling):
-        # A label explains its own value. It is not evidence about any other
-        # cell on the row, and two opposite mistakes follow from treating it as
-        # though it were.
+    named = _labelled_value(row, mapping)
+    if named is not None:
+        # A label explains its own value and no other. The row has said what
+        # that number is, so nothing about it is unresolved and it is exempt
+        # from both channels -- an exceptions list carrying rows the document
+        # already explained is one nobody reads to the end.
         #
-        # It must not erase. "Software version unknown" beside a $500.00 says
-        # nothing about the $500, and a cell written unmistakably as money is
-        # money whatever words share its row.
-        #
-        # It must not promote. Whether "Policy year 2024" names the 2024.00
-        # beside it or some other figure is exactly what is uncertain, and the
-        # earlier test -- whether the label happened to contain a digit -- was
-        # never evidence about the money. Uncertain is recorded as uncertain:
-        # kept, reported, and never called an amount.
-        money = {
-            name: entry
-            for name, entry in parsed.items()
-            if _UNMISTAKABLY_MONEY.search(entry[0])
-        }
-        # Everything the label could be explaining is exempt, not merely
-        # un-promoted. The row has said what its number is, so nothing about it
-        # is unresolved, and filling the exceptions list with rows the document
-        # already explained is how an exceptions list stops being read. Only a
-        # cell written unmistakably as money survives: a label explains its own
-        # value and cannot speak for a $500.00 elsewhere on the row.
-        return UnplacedEvidence(money, {}, {}) if money else UnplacedEvidence({}, {})
+        # What the label may not do is speak for the rest of the row. Exempting
+        # every cell and re-admitting only those carrying a currency mark made
+        # "Software version 1.20" erase an ordinary 500.00 printed beside it,
+        # and made a refused "$1 $234" vanish for want of anything to re-admit
+        # it. Requiring a dollar sign before an unrelated amount may survive is
+        # the erasure this thread exists to stop, wearing an exemption's
+        # clothes. Only the value the label identifies is set aside; every
+        # other cell is classified as it would have been on any other row.
+        parsed = {name: entry for name, entry in parsed.items() if name != named}
+        merged = {name: text for name, text in merged.items() if name != named}
+        if not parsed and not merged:
+            return UnplacedEvidence({}, {})
 
     if context == "monetary-only":
         return UnplacedEvidence(parsed, unresolved, merged)
@@ -918,9 +971,11 @@ def build_claims(
     for table in tables:
         table_mapping = mapping_for(table, mapping)
         context = table_money_context(table, table_mapping, shapes)
-        established = established_money_columns(table, table_mapping, locale)
 
-        for row in table.rows:
+        for position, row in enumerate(table.rows):
+            # The physically preceding line, which is what says whether this
+            # one is the tail of a paragraph printed above it.
+            above = table.rows[position - 1] if position else None
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
                 # belongs to the document and not to any claim. It is trusted
@@ -930,7 +985,16 @@ def build_claims(
                 # longer sit in the cell ``is_structural_row`` reads.
                 continue
             text = _normalised(row)
-            if not text or text in furniture:
+            if not text:
+                continue
+            if text in furniture and not _carries_numeric_evidence(
+                row, table_mapping, locale, above
+            ):
+                # Furniture is decided on text pooled across pages, but applied
+                # to *this* occurrence. A line that repeats is usually a running
+                # header -- and where one occurrence of it carries evidence and
+                # another does not, the unprotected one must not reach back and
+                # delete the protected one. Each occurrence answers for itself.
                 continue  # a running header, footer or page marker
 
             # A row whose claim-number cell holds something that is not an
@@ -948,7 +1012,7 @@ def build_claims(
                 # figure that is not part of the accident.
                 evidence = unplaced_evidence(
                     row, table_mapping, locale,
-                    context=context, established=established,
+                    context=context, previous=above,
                 )
                 # A continuation line carries prose. A row carrying money or a
                 # date is a claim whose number could not be identified, and
@@ -957,7 +1021,7 @@ def build_claims(
                 if evidence:
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context, established=established,
+                        context=context, previous=above,
                     )
                 elif extra and claims and _continuation_text(row, table_mapping):
                     previous = claims[-1]
@@ -967,7 +1031,7 @@ def build_claims(
                 elif extra:
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context, established=established,
+                        context=context, previous=above,
                     )
                 continue
 
@@ -995,7 +1059,7 @@ def build_claims(
                 preview = " ".join(cell for cell in row.cells if cell)
                 _record_discard(
                     row, table_mapping, locale, warnings, unplaced, preview,
-                    context=context, established=established,
+                    context=context, previous=above,
                 )
     return claims, warnings, unplaced
 
@@ -1004,7 +1068,7 @@ def _carries_numeric_evidence(
     row: RawRow,
     mapping: ColumnMapping,
     locale: str | None,
-    established: frozenset[str] = frozenset(MONEY_FIELDS),
+    previous: RawRow | None = None,
 ) -> bool:
     """Whether this row carries numeric evidence furniture must not delete.
 
@@ -1015,7 +1079,7 @@ def _carries_numeric_evidence(
     a spreadsheet continuation repeating its figures on every page it spans
     looks exactly like a running footer.
     """
-    parsed, unreadable = _numeric_cells(row, mapping, locale, established)
+    parsed, unreadable = _numeric_cells(row, mapping, locale, previous)
     return bool(parsed or unreadable)
 
 
@@ -1028,7 +1092,7 @@ def _record_discard(
     preview: str,
     *,
     context: str = "unknown",
-    established: frozenset[str] = frozenset(MONEY_FIELDS),
+    previous: RawRow | None = None,
 ) -> None:
     """Note a row nothing could take, and keep any numeric evidence on it.
 
@@ -1041,7 +1105,7 @@ def _record_discard(
     acquires a claim.
     """
     evidence = unplaced_evidence(
-        row, mapping, locale, context=context, established=established
+        row, mapping, locale, context=context, previous=previous
     )
     if evidence:
         unplaced.append(
@@ -1231,15 +1295,7 @@ def _document_total(
     best: dict[str, Decimal | None] = {}
     best_row: tuple[int, int] | None = None
     best_unreadable: dict[str, str] = {}
-    best_rank = (0, 0, 0)
-    # A totals row every one of whose money cells was refused parses nothing,
-    # so it can never place in the ranking above. It is still a totals row, and
-    # which of them the document's total is remains the same question -- so it
-    # is ranked here on the same structural evidence, in its own tier below any
-    # row that could be read.
-    blind_row: tuple[int, int] | None = None
-    blind_unreadable: dict[str, str] = {}
-    blind_rank = (-2, -2, -2)
+    best_rank = (-2, -2, -2, -2)
     for table in tables:
         table_mapping = mapping_for(table, mapping)
         for row in table.total_rows:
@@ -1267,34 +1323,40 @@ def _document_total(
             # it outranks a subtotal no matter which was seen first. A row that
             # names a different claim count outranks nothing: whatever it
             # totals, it is not these claims.
+            # Which row is the document's total is a question about what the
+            # row says it is, and readability is not part of the answer. The
+            # wording comes first: a GRAND TOTAL covers the document and a
+            # policy subtotal covers one section, whichever of them the reader
+            # managed to parse. Only where the structure ties does it matter
+            # that one row could be read and the other could not -- so a
+            # subtotal never replaces an explicitly labelled grand total, and
+            # a readable row still beats an unreadable peer of equal standing.
+            #
+            # A row naming a different claim count outranks nothing: whatever
+            # it totals, it is not these claims.
+            covers = _covers(row.text(), claim_count)
+            if covers < 0:
+                # It names a claim count that is not the count extracted, so
+                # whatever it totals, it is not these claims. Board packets
+                # bind several loss runs together and checking against the
+                # wrong one reports a discrepancy nobody made. Not this
+                # document's total, whether or not it could be read.
+                continue
             rank = (
-                _covers(row.text(), claim_count),
+                covers,
                 1 if GRAND_TOTAL_PATTERN.search(row.text()) else 0,
+                1 if totals else 0,
                 len(totals),
             )
-            if totals and rank > best_rank:
+            if (totals or unreadable) and rank > best_rank:
+                # A totals row every one of whose cells was refused parses
+                # nothing, and was once dropped whole -- taking with it the
+                # fact that this document has a printed total at all. It is
+                # still the total row: R-04 is now checking nothing against it,
+                # which is precisely what has to be said, and about this row.
                 best, best_rank = totals, rank
                 best_row = (row.page, row.line_index)
                 best_unreadable = unreadable
-            elif not totals and unreadable and rank > blind_rank:
-                # Unreadable, and so dropped whole -- taking with it the fact
-                # that this document has a printed total at all. It is still
-                # the total row: R-04 is now checking nothing against it, which
-                # is precisely what has to be said, and about the right row.
-                # Being unreadable is not evidence of being the document's
-                # total, so "the first one seen" was the wrong answer: a policy
-                # subtotal printed above a GRAND TOTAL won on nothing but page
-                # order, and R-26 then named the subtotal's line as the row the
-                # document could not read its total from. What names the grand
-                # total among readable rows -- its wording, and whether it
-                # claims these claims -- names it here too.
-                blind_row = (row.page, row.line_index)
-                blind_unreadable = unreadable
-                blind_rank = rank
-    if best_row is None and blind_row is not None:
-        # Only where nothing readable was found, so a row that does tie is
-        # never displaced by one that cannot be read.
-        return best, blind_row, blind_unreadable
     return best, best_row, best_unreadable
 
 
