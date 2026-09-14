@@ -463,7 +463,20 @@ def _runs_in_from_a_description(
     from the cell, each populated cell is one of four things.
 
     A cell in a column the mapping does not call money is where the sentence
-    started: narrative.
+    started: narrative -- with one exception. The claim-number column is not
+    free text; it is the one field whose content decides whether the row is a
+    claim at all. "New loss" sitting there, with no date or status to
+    corroborate it, is exactly the "could be a claim row, could be a
+    continuation" case the row's own uncertainty describes, not proof the row
+    is prose -- and folding the amount beside it away as narrative on no
+    stronger evidence than "this text is not money" is the erasure this
+    correction exists to stop. Every other non-money column -- the
+    description, the claimant's name, a cause of loss, an unmapped overflow
+    column -- is read as before: report boilerplate ("This report was
+    produced using RISKTRAC (R) ... Page 2 of 11") routinely spills across
+    several such columns exactly the way a wrapped description does, and
+    narrowing this to a curated list of "narrative" fields is what mistook
+    that overflow for evidence.
 
     A money cell carrying no digit at all is text, by the same rule that says
     a digit-free cell is not a figure -- so the sentence started here or
@@ -492,8 +505,9 @@ def _runs_in_from_a_description(
         text = row.cell(before).strip()
         if not text:
             continue
-        if mapping.fields.get(before) not in MONEY_FIELDS:
-            return True
+        field = mapping.fields.get(before)
+        if field not in MONEY_FIELDS:
+            return field != "claim_number"
         if not any(character.isdigit() for character in text):
             return True
         if _reads_as_money(text, locale):
@@ -513,15 +527,42 @@ def _continues_the_line_above(
     which yields an amount, is a paragraph line, and a short row under it that
     also yields nothing is where that paragraph ended.
 
-    Deliberately narrow. It asks the row above to span *more than one column*,
-    so a refused figure standing alone never lends its line to the row beneath
-    it -- which is what keeps a page of merged cells a page of evidence rather
-    than one long sentence.
+    Two things disqualify the row above from counting as that paragraph line,
+    both positive reasons rather than the absence of one.
+
+    It may be furniture rather than prose. A row the pipeline itself already
+    excludes from claim data -- ``kind == "meta"``, or a colon-labelled
+    section heading :func:`is_structural_row` recognises -- still occupies a
+    position in ``table.rows`` and still becomes "previous" for the row after
+    it. Spanning several non-money columns is not proof of a sentence when the
+    row spanning them is a heading, not a paragraph.
+
+    It may itself be unresolved numeric evidence. A row holding two merged
+    cells across two money columns also has "several populated cells, none of
+    them money" -- the same shape genuine prose has -- and letting it license
+    discarding the row after it turns one row of refused figures into an
+    excuse to discard a second. A digit under a money heading is potential
+    evidence in its own right, not proof of prose, wherever it sits.
+
+    Deliberately narrow otherwise. It still asks the row above to span *more
+    than one column*, so a refused figure standing alone never lends its line
+    to the row beneath it -- which is what keeps a page of merged cells a page
+    of evidence rather than one long sentence.
     """
     if previous is None:
         return False
-    above = [cell.strip() for cell in previous.cells if cell.strip()]
-    if len(above) < 2 or any(_reads_as_money(cell, locale) for cell in above):
+    if previous.kind == "meta" or is_structural_row(previous, mapping):
+        return False
+    above = [(index, cell.strip()) for index, cell in enumerate(previous.cells)
+             if cell.strip()]
+    if len(above) < 2:
+        return False
+    for index, cell in above:
+        if mapping.fields.get(index) in MONEY_FIELDS and any(
+            character.isdigit() for character in cell
+        ):
+            return False
+    if any(_reads_as_money(cell, locale) for _index, cell in above):
         return False
     here = [cell.strip() for cell in row.cells if cell.strip()]
     return bool(here) and not any(_reads_as_money(cell, locale) for cell in here)
@@ -691,6 +732,18 @@ def _row_establishes_claim_data(values: dict[str, str]) -> bool:
 #: what a cell is, only whether two cells state the same figure.
 _NUMBER_IN_A_LABEL = re.compile(r"\d[\d,.']*")
 
+#: A label saying it has nothing to state. "Version unknown" matches the same
+#: base vocabulary as "Policy year" or "Software version" and, carrying no
+#: digit of its own, would otherwise be trusted to name whatever cell comes
+#: next -- but "unknown" is not a naming of that cell, it is the row admitting
+#: there is nothing here to name. Narrow and used only to stop this one
+#: mechanism trusting a label that has just disclaimed having a value; it does
+#: not decide what anything else on the row is.
+_STATES_NO_VALUE = re.compile(
+    r"\bunknown\b|\bn/?a\b|\bunavailable\b|\bmissing\b|\bnot\s+(?:available|provided|stated)\b",
+    re.IGNORECASE,
+)
+
 
 def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
     """Which mapped money field, if any, the row's own words explain.
@@ -701,21 +754,33 @@ def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
     | $1 $234" has explained the year and has said nothing whatever about the
     refused cell beyond it.
 
+    A label stating it has no value -- "Version unknown", "Status N/A" -- is
+    not naming anything: it carries no digit of its own by the same accident
+    that "Policy year" does, but "unknown" is a refusal, not a value. Trusting
+    it anyway consumes whatever cell happens to follow, on no better evidence
+    than that the label failed to state a number.
+
     A label may also carry its own number, and then it has already named it.
     "Software version 1.20" beside "$500.00" explains the 1.20 inside itself
     and says nothing about the $500 -- so such a label reaches the cell beside
-    it only when that cell is the *same* number, which is the row printing one
-    fact twice ("Policy year 2024 | 2024.00"). Repetition is the evidence, and
-    it is the only thing that ties the two cells together.
+    it only when that cell states the *same* number, which is the row printing
+    one fact twice ("Policy year 2024 | 2024.00"). The comparison is by
+    magnitude, not sign: a parenthesized "(2024)" parses as an accounting
+    negative, and the label's own digits never carry that convention, so
+    comparing signed values would read the identical fact as a mismatch. What
+    ties the two cells together is that they name the same number, not that
+    they name it the same way.
 
     Returns the canonical field name of the explained cell, or ``None`` where
-    no cell carries such a label, nothing follows one, or the label has
-    already accounted for itself.
+    no cell carries such a label, the label states it has no value, nothing
+    follows one, or the label has already accounted for itself.
     """
     for index in range(len(row.cells)):
         cell = row.cell(index).strip()
         if not cell or not _NAMES_A_NON_MONEY_VALUE.search(clean_text(cell)):
             continue
+        if _STATES_NO_VALUE.search(clean_text(cell)):
+            return None
         for after in range(index + 1, len(row.cells)):
             value = row.cell(after).strip()
             if not value:
@@ -726,11 +791,13 @@ def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
             if not any(character.isdigit() for character in cell):
                 return name
             printed = parse_money(value, None).value
-            spoken = (
+            spoken = [
                 parse_money(token, None).value
                 for token in _NUMBER_IN_A_LABEL.findall(cell)
-            )
-            return name if printed is not None and printed in spoken else None
+            ]
+            return name if printed is not None and any(
+                s is not None and abs(printed) == abs(s) for s in spoken
+            ) else None
         return None
     return None
 
