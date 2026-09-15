@@ -358,14 +358,10 @@ def page_furniture(
     seen: dict[str, set[int]] = {}
     for table in tables:
         table_mapping = mapping_for(table, mapping) if mapping is not None else None
-        # The physically preceding line, which is what says whether this one is
-        # the tail of a paragraph printed above it.
-        previous: RawRow | None = None
         for row in list(table.rows) + list(table.total_rows):
             carries = table_mapping is not None and _carries_numeric_evidence(
-                row, table_mapping, locale, previous
+                row, table_mapping, locale
             )
-            previous = row
             if carries:
                 continue
             text = _normalised(row)
@@ -383,8 +379,13 @@ def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
     # whichever columns they cross, money and date columns included. What marks
     # a row as data is whether those cells parse: "WHEEL" under a date column
     # is prose, and rejecting the row for it drops the description entirely.
-    for name in MONEY_FIELDS:
-        if parse_money(values.get(name, ""), None).value is not None:
+    for index, name in mapping.fields.items():
+        if name not in MONEY_FIELDS:
+            continue
+        if (
+            parse_money(values.get(name, ""), None).value is not None
+            and not _is_same_row_narrative(row, mapping, index)
+        ):
             return None
     for name in DATE_FIELDS:
         if parse_date(values.get(name, ""), None).value is not None:
@@ -414,6 +415,7 @@ _NAMES_A_NON_MONEY_VALUE = re.compile(
     r"\b(?:software\s+)?version\b"
     r"|\b(?:policy|calendar|fiscal|accident|loss)\s+year\b"
     r"|\bexcel(?:\s+serial)?(?:\s+date)?\b|\bdate\s+serial\b"
+    r"|\b(?:print|printed|report|reported|valuation|as\s+of)\s+date\b"
     r"|\b(?:policy|claim|claimant|file|account)\s*(?:identifier|id|ref|reference|no)\b"
     r"|\b(?:page|row|column|line)\s*(?:index|number|no|count)\b",
     re.IGNORECASE,
@@ -449,123 +451,121 @@ def _reads_as_money(text: str, locale: str | None) -> bool:
     return not _is_smeared(text) and parse_money(text, locale).value is not None
 
 
-def _runs_in_from_a_description(
-    row: RawRow, mapping: ColumnMapping, locale: str | None, index: int
-) -> bool:
-    """Whether this cell is the tail of a sentence that began outside the money.
+_FINANCIAL_DIRECTION = re.compile(
+    r"^\s*[+-]|[+-]\s*$|\b(?:CR|DR)\b", re.IGNORECASE
+)
+_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+_DURATION_AFTER_NUMBER = re.compile(
+    r"^\s*(?:[-–—]\s*)?(?:(?:to|through)\s+\d[\d.,']*\s*)?"
+    r"(?:business\s+)?(?:days?|weeks?|months?|years?|hours?|minutes?)\b",
+    re.IGNORECASE,
+)
+_COUNT_AFTER_NUMBER = re.compile(
+    r"^\s*(?:claims|cases|files|occurrences|pages|records|rows|vehicles)\b",
+    re.IGNORECASE,
+)
+_DATE_TOKEN = re.compile(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b")
+_DATE_CONTEXT = re.compile(
+    r"\b(?:as\s+of|date|dated|from|on|period|term|through|to)\b",
+    re.IGNORECASE,
+)
+_LIST_ITEM = re.compile(r"^\s*(?:\(\d+\)|\d+[.)])\s+[^\W\d_]", re.UNICODE)
+_NUMBER_TOKEN = re.compile(r"\d+(?:[.,']\d+)*")
+_TEMPORAL_CUE = re.compile(
+    r"\b(?:aged?|during|for|kept|last|over|past|retained|through|to|within)\s*$",
+    re.IGNORECASE,
+)
+_COUNT_CUE = re.compile(r"\b(?:count|number\s+of|total\s+of)\s*$", re.IGNORECASE)
+_FINANCIAL_VALUE_CUE = re.compile(
+    r"\b(?:amount|balance|cost|damages|deductible|indemnity|limit|paid|premium|"
+    r"recovery|reserve|settlement|total)\s*$",
+    re.IGNORECASE,
+)
 
-    A description too long for its column spills rightward and the extractor
-    cuts it at each boundary it crosses, so the later words of a sentence land
-    under money headings with the earlier words beside them. Reading the tail
-    as a figure puts prose on the exceptions list.
 
-    The run is *traced*, not guessed from the nearest neighbour. Walking left
-    from the cell, each populated cell is one of four things.
+def _has_explicit_financial_marker(text: str) -> bool:
+    """Whether the source explicitly presents this cell as financial."""
+    return bool(_CURRENCY_MARK.search(text) or _FINANCIAL_DIRECTION.search(text))
 
-    A cell in a column the mapping does not call money is where the sentence
-    started: narrative -- with one exception. The claim-number column is not
-    free text; it is the one field whose content decides whether the row is a
-    claim at all. "New loss" sitting there, with no date or status to
-    corroborate it, is exactly the "could be a claim row, could be a
-    continuation" case the row's own uncertainty describes, not proof the row
-    is prose -- and folding the amount beside it away as narrative on no
-    stronger evidence than "this text is not money" is the erasure this
-    correction exists to stop. Every other non-money column -- the
-    description, the claimant's name, a cause of loss, an unmapped overflow
-    column -- is read as before: report boilerplate ("This report was
-    produced using RISKTRAC (R) ... Page 2 of 11") routinely spills across
-    several such columns exactly the way a wrapped description does, and
-    narrowing this to a curated list of "narrative" fields is what mistook
-    that overflow for evidence.
 
-    A money cell carrying no digit at all is text, by the same rule that says
-    a digit-free cell is not a figure -- so the sentence started here or
-    further left, and this is narrative too. That is what settles a block
-    mapping nothing but money, where there is no non-money column to reach:
-    "(4) any unauthorized" follows four wordy cells with not one digit among
-    them, and a row of figures never looks like that.
+def _words(text: str) -> list[str]:
+    """Alphabetic words after currency notation is taken out of the way."""
+    without_currency = _CURRENCY_MARK.sub(" ", text)
+    return [word for word in _WORD.findall(without_currency) if len(word) > 1]
 
-    A money cell that yields an amount ends the walk the other way: this is a
-    row of figures, and the refused cell is one of its figures.
 
-    A money cell carrying digits but yielding no value is another refused
-    figure, or the middle of a sentence quoting a number. It settles nothing,
-    so the walk continues through it -- which is the whole point, since
-    "reported within | 30 to | 60 days" puts two of its three fragments in
-    money columns and stopping at the first would call the last one money.
+def _contiguous_span(row: RawRow, index: int) -> tuple[int, int]:
+    """Non-blank cells joined to ``index``; a blank column breaks the run."""
+    first = index
+    while first and row.cell(first - 1).strip():
+        first -= 1
+    last = index
+    while last + 1 < len(row.cells) and row.cell(last + 1).strip():
+        last += 1
+    return first, last
 
-    Walking *through* the undecided case is what keeps this monotonic: another
-    unreadable figure appearing to the left can never turn its neighbour into
-    prose, so more parse failures never mean less evidence.
 
-    Empty cells are skipped rather than ending the walk: a description that
-    wraps need not fill every column it passes over.
+def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> bool:
+    """Whether this exact numeric cell has a proven non-money role in prose.
+
+    Words on both sides are not enough: ``deductible is | 500 | per claim``
+    is grammatical and still carries unresolved financial evidence.  The
+    number itself must instead be bound to a non-money unit (a duration or an
+    explicit count), be a date in date/term grammar, or be a list marker in a
+    substantial same-row sentence.  These are candidate-local relationships;
+    a duration later on the row cannot excuse a different amount earlier on
+    it, and no previous row gets to decide what this one means.
+
+    Explicit currency or debit/credit/sign notation always wins.  Where the
+    row permits both readings, the function returns false so R-23 preserves
+    the uncertainty rather than folding it into another claim.
     """
-    for before in range(index - 1, -1, -1):
-        text = row.cell(before).strip()
-        if not text:
-            continue
-        field = mapping.fields.get(before)
-        if field not in MONEY_FIELDS:
-            return field != "claim_number"
-        if not any(character.isdigit() for character in text):
+    text = row.cell(index).strip()
+    if not text or _has_explicit_financial_marker(text):
+        return False
+    if not _PAGE_MARKER.sub("", text).strip():
+        return True
+    digits = [position for position, character in enumerate(text) if character.isdigit()]
+    if not digits:
+        return False
+
+    first, last = _contiguous_span(row, index)
+    span = " ".join(row.cell(position).strip() for position in range(first, last + 1))
+    before = " ".join(
+        [*(row.cell(position).strip() for position in range(first, index)),
+         text[: digits[0]]]
+    )
+    after = " ".join(
+        [text[digits[-1] + 1 :],
+         *(row.cell(position).strip() for position in range(index + 1, last + 1))]
+    )
+    numeric_tokens = _NUMBER_TOKEN.findall(text)
+    local_after = text[digits[-1] + 1 :]
+    if len(numeric_tokens) == 1 and _DURATION_AFTER_NUMBER.match(after):
+        if _DURATION_AFTER_NUMBER.match(local_after):
             return True
-        if _reads_as_money(text, locale):
-            return False
-    return False
-
-
-def _continues_the_line_above(
-    row: RawRow, previous: RawRow | None, mapping: ColumnMapping, locale: str | None
-) -> bool:
-    """Whether this row is the last line of a paragraph printed above it.
-
-    Some blocks map every column to money -- a five-column money grid with a
-    disclaimer wrapped across it -- and there is then no non-money column for
-    :func:`_runs_in_from_a_description` to trace back to. The evidence is on
-    the row above instead: a line spanning several columns, not one cell of
-    which yields an amount, is a paragraph line, and a short row under it that
-    also yields nothing is where that paragraph ended.
-
-    Two things disqualify the row above from counting as that paragraph line,
-    both positive reasons rather than the absence of one.
-
-    It may be furniture rather than prose. A row the pipeline itself already
-    excludes from claim data -- ``kind == "meta"``, or a colon-labelled
-    section heading :func:`is_structural_row` recognises -- still occupies a
-    position in ``table.rows`` and still becomes "previous" for the row after
-    it. Spanning several non-money columns is not proof of a sentence when the
-    row spanning them is a heading, not a paragraph.
-
-    It may itself be unresolved numeric evidence. A row holding two merged
-    cells across two money columns also has "several populated cells, none of
-    them money" -- the same shape genuine prose has -- and letting it license
-    discarding the row after it turns one row of refused figures into an
-    excuse to discard a second. A digit under a money heading is potential
-    evidence in its own right, not proof of prose, wherever it sits.
-
-    Deliberately narrow otherwise. It still asks the row above to span *more
-    than one column*, so a refused figure standing alone never lends its line
-    to the row beneath it -- which is what keeps a page of merged cells a page
-    of evidence rather than one long sentence.
-    """
-    if previous is None:
-        return False
-    if previous.kind == "meta" or is_structural_row(previous, mapping):
-        return False
-    above = [(index, cell.strip()) for index, cell in enumerate(previous.cells)
-             if cell.strip()]
-    if len(above) < 2:
-        return False
-    for index, cell in above:
-        if mapping.fields.get(index) in MONEY_FIELDS and any(
-            character.isdigit() for character in cell
+        if (
+            _TEMPORAL_CUE.search(before)
+            and not _FINANCIAL_VALUE_CUE.search(before)
         ):
-            return False
-    if any(_reads_as_money(cell, locale) for _index, cell in above):
-        return False
-    here = [cell.strip() for cell in row.cells if cell.strip()]
-    return bool(here) and not any(_reads_as_money(cell, locale) for cell in here)
+            return True
+    if len(numeric_tokens) == 1 and _COUNT_AFTER_NUMBER.match(after):
+        if _COUNT_AFTER_NUMBER.match(local_after):
+            return True
+        if _COUNT_CUE.search(before) and not _FINANCIAL_VALUE_CUE.search(before):
+            return True
+    date_token = _DATE_TOKEN.search(text)
+    if (
+        date_token
+        and parse_date(date_token.group(), None).value is not None
+        and _DATE_CONTEXT.search(f"{before} {after}")
+    ):
+        return True
+    return bool(
+        len(numeric_tokens) == 1
+        and _LIST_ITEM.match(text)
+        and len(_words(span)) >= 10
+    )
 
 
 def _numeric_cells(
@@ -609,29 +609,22 @@ def _numeric_cells(
     """
     values = _row_values(row, mapping)
     parsed: dict[str, tuple[str, Decimal]] = {}
-    refused: list[tuple[int, str, str]] = []
+    unreadable: dict[str, str] = {}
+    established = _row_establishes_claim_data(values)
     for index, name in sorted(mapping.fields.items()):
         if name not in MONEY_FIELDS:
             continue
         text = (values.get(name) or "").strip()
         if not text:
             continue
+        narrative = not established and _is_same_row_narrative(row, mapping, index)
         if _reads_as_money(text, locale):
-            parsed[name] = (text, parse_money(text, locale).value)
-        elif any(character.isdigit() for character in text):
-            refused.append((index, name, text))
-
-    if not refused:
-        return parsed, {}
-    if _row_establishes_claim_data(values):
-        return parsed, {name: text for _index, name, text in refused}
-    if _continues_the_line_above(row, previous, mapping, locale):
-        return parsed, {}
-    unreadable = {
-        name: text
-        for index, name, text in refused
-        if not _runs_in_from_a_description(row, mapping, locale, index)
-    }
+            if not narrative:
+                value = parse_money(text, locale).value
+                if value is not None:
+                    parsed[name] = (text, value)
+        elif any(character.isdigit() for character in text) and not narrative:
+            unreadable[name] = text
     return parsed, unreadable
 
 
@@ -740,13 +733,15 @@ _NUMBER_IN_A_LABEL = re.compile(r"\d[\d,.']*")
 #: mechanism trusting a label that has just disclaimed having a value; it does
 #: not decide what anything else on the row is.
 _STATES_NO_VALUE = re.compile(
-    r"\bunknown\b|\bn/?a\b|\bunavailable\b|\bmissing\b|\bnot\s+(?:available|provided|stated)\b",
+    r"\bunknown\b|\bn\s*(?:[./]\s*)?a\.?(?=\W|$)|\bunavailable\b|"
+    r"\bmissing\b|\btbd\b|\bnone\b|"
+    r"\bnot\s+(?:applicable|available|known|provided|stated)\b",
     re.IGNORECASE,
 )
 
 
-def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
-    """Which mapped money field, if any, the row's own words explain.
+def _labelled_values(row: RawRow, mapping: ColumnMapping) -> set[str]:
+    """Mapped money fields whose values the row's own words explain.
 
     "Policy year" printed beside "2024.00" is the row saying what its number
     is. The label explains the value it introduces -- the next populated cell
@@ -765,41 +760,82 @@ def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
     and says nothing about the $500 -- so such a label reaches the cell beside
     it only when that cell states the *same* number, which is the row printing
     one fact twice ("Policy year 2024 | 2024.00"). The comparison is by
-    magnitude, not sign: a parenthesized "(2024)" parses as an accounting
-    negative, and the label's own digits never carry that convention, so
-    comparing signed values would read the identical fact as a mismatch. What
-    ties the two cells together is that they name the same number, not that
-    they name it the same way.
+    signed value. A parenthesized "(2024)" is the one narrow exception: a
+    labelled year is sometimes printed that way even though the money parser
+    reads parentheses as an accounting negative. Other currency or direction
+    notation contradicts the non-money label and remains evidence.
 
-    Returns the canonical field name of the explained cell, or ``None`` where
-    no cell carries such a label, the label states it has no value, nothing
-    follows one, or the label has already accounted for itself.
+    Every label is evaluated independently.  A first label saying ``unknown``
+    or failing to match its neighbour cannot prevent a later ``Print Date`` or
+    ``Claim identifier`` from explaining a different cell on the same row.
     """
+    named: set[str] = set()
     for index in range(len(row.cells)):
         cell = row.cell(index).strip()
         if not cell or not _NAMES_A_NON_MONEY_VALUE.search(clean_text(cell)):
             continue
         if _STATES_NO_VALUE.search(clean_text(cell)):
-            return None
-        for after in range(index + 1, len(row.cells)):
-            value = row.cell(after).strip()
-            if not value:
-                continue
-            name = mapping.fields.get(after)
-            if name not in MONEY_FIELDS:
-                return None
-            if not any(character.isdigit() for character in cell):
-                return name
-            printed = parse_money(value, None).value
-            spoken = [
-                parse_money(token, None).value
-                for token in _NUMBER_IN_A_LABEL.findall(cell)
-            ]
-            return name if printed is not None and any(
-                s is not None and abs(printed) == abs(s) for s in spoken
-            ) else None
-        return None
-    return None
+            continue
+        after = index + 1
+        crossed_money_gap = False
+        while after < len(row.cells) and not row.cell(after).strip():
+            # A blank money column is meaningful: the label did not provide
+            # that value, so it cannot jump over the blank and explain a
+            # different financial field farther to the right. Blank identity,
+            # date, or status columns are merely layout space between a
+            # row-level label and the one value it prints.
+            if mapping.fields.get(after) in MONEY_FIELDS:
+                crossed_money_gap = True
+                break
+            after += 1
+        if crossed_money_gap or after >= len(row.cells):
+            continue
+        value = row.cell(after).strip()
+        name = mapping.fields.get(after)
+        if name not in MONEY_FIELDS:
+            continue
+        if _has_explicit_financial_marker(value):
+            continue
+        if (
+            "date" in normalize_label(cell).split()
+            and parse_date(value, None).value is not None
+        ):
+            named.add(name)
+            continue
+        if not any(character.isdigit() for character in value):
+            continue
+        if not any(character.isdigit() for character in cell):
+            # A label can name one value, not a collision of two source
+            # figures.  ``Policy year | 4 / 30,000.00`` remains unresolved.
+            if len(_NUMBER_TOKEN.findall(value)) == 1:
+                named.add(name)
+            continue
+
+        printed = parse_money(value, None).value
+        spoken = [
+            parse_money(token, None).value
+            for token in _NUMBER_IN_A_LABEL.findall(cell)
+        ]
+        if printed is None:
+            continue
+        if printed in spoken:
+            named.add(name)
+            continue
+        stripped = value.strip()
+        if stripped.startswith("(") and stripped.endswith(")") and any(
+            number is not None and printed == -number for number in spoken
+        ):
+            named.add(name)
+    return named
+
+
+def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
+    """Backward-compatible singular view of :func:`_labelled_values`."""
+    named = _labelled_values(row, mapping)
+    return next(
+        (field for _index, field in sorted(mapping.fields.items()) if field in named),
+        None,
+    )
 
 
 def table_money_context(
@@ -882,8 +918,8 @@ def unplaced_evidence(
     if _row_establishes_claim_data(values):
         return UnplacedEvidence(parsed, unresolved, merged)
 
-    named = _labelled_value(row, mapping)
-    if named is not None:
+    named = _labelled_values(row, mapping)
+    if named:
         # A label explains its own value and no other. The row has said what
         # that number is, so nothing about it is unresolved and it is exempt
         # from both channels -- an exceptions list carrying rows the document
@@ -897,8 +933,8 @@ def unplaced_evidence(
         # the erasure this thread exists to stop, wearing an exemption's
         # clothes. Only the value the label identifies is set aside; every
         # other cell is classified as it would have been on any other row.
-        parsed = {name: entry for name, entry in parsed.items() if name != named}
-        merged = {name: text for name, text in merged.items() if name != named}
+        parsed = {name: entry for name, entry in parsed.items() if name not in named}
+        merged = {name: text for name, text in merged.items() if name not in named}
         if not parsed and not merged:
             return UnplacedEvidence({}, {})
 
@@ -1146,8 +1182,20 @@ def _carries_numeric_evidence(
     a spreadsheet continuation repeating its figures on every page it spans
     looks exactly like a running footer.
     """
-    parsed, unreadable = _numeric_cells(row, mapping, locale, previous)
-    return bool(parsed or unreadable)
+    # Route the row through the complete evidence classifier, including
+    # row-local labels such as ``Print Date: | 5/23/2023``.  Calling only the
+    # numeric scanner here made furniture protection disagree with R-23: the
+    # latter correctly resolved the date while the former still treated it as
+    # unresolved numeric evidence.
+    return bool(
+        unplaced_evidence(
+            row,
+            mapping,
+            locale,
+            context="unknown",
+            previous=previous,
+        )
+    )
 
 
 def _record_discard(
