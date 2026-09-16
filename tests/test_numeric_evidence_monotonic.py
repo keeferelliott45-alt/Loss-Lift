@@ -348,11 +348,23 @@ def test_a_wrapped_description_reaching_a_money_column_is_not_evidence(tmp_path)
 def test_a_narrative_is_traced_across_the_money_column_it_crosses(tmp_path):
     """"reported within | 30 to | 60 days" over Description, Paid, Incurred.
 
-    The tail in the incurred column has a money column immediately to its
-    left, so a rule that stops at the first populated cell calls it a row of
-    figures. The run has to be followed: "30 to" is itself narrative, and
-    behind it "reported within" sits in the description column, which is where
-    the sentence started.
+    Correction-8 update: "30 to" and "60 days" are two separate physical
+    cells, and this test originally asserted that reading them as one
+    range -- "30 to 60 days" -- was safe. An independent review found that
+    the same cross-cell reach, applied to a label instead of a range tail,
+    was letting whole-dollar figures ("held for | 45000 | days") vanish
+    into an unrelated claim's own description. Correction-8 retired the
+    reach for both shapes at once: a unit word has to be in the *same*
+    cell as the number it excuses, and "60 days" in the next cell is not
+    evidence about what "30 to" is, any more than a label three cells away
+    would be.
+
+    So "60 days" keeps its own exemption -- the digit and its unit are
+    both printed in that one cell, which is exactly the proof this unit
+    still accepts -- but "30 to" now correctly stays live: nothing in its
+    own cell says what the dangling "to" was pointing at, and a range
+    fragment split across a column boundary is precisely the kind of
+    uncertainty R-23 exists to surface rather than paper over.
     """
     path = _write(
         tmp_path / "narrative.pdf",
@@ -360,10 +372,19 @@ def test_a_narrative_is_traced_across_the_money_column_it_crosses(tmp_path):
     )
     result = run_pipeline(path, use_vision=False)
     carried = _texts(result.document)
-    assert "30 to" not in carried and "60 days" not in carried, (
-        f"a narrative crossing a money column became evidence: {carried}"
+    assert "30 to" in carried, (
+        f"a range fragment split across a column boundary vanished to zero "
+        f"trace: {carried}"
     )
-    assert not _r23(result), [f.message for f in _r23(result)]
+    assert "60 days" not in carried, (
+        f"a genuine same-cell duration raised a false R-23: {carried}"
+    )
+    assert "30 to" not in _descriptions(result.document), (
+        f"the fragment was folded into a claim description instead: "
+        f"{result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for a live, unowned fragment"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_labelled_amount_is_still_not_a_narrative(tmp_path):

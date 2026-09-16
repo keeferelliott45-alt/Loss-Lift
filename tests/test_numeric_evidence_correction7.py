@@ -262,22 +262,27 @@ def test_a_genuinely_unmerged_date_is_still_exempted():
     ],
     ids=["settled-in", "closed-within-the", "filed-after", "reviewed-every"],
 )
-def test_ordinary_duration_phrasing_stays_clean_and_untouched(before, value, after):
-    """None of these prepositions ("in", "within the", "after", "every")
-    appear on any list the classifier consults. What is checked is the
-    number's own printed form (a bare integer) bound to a genuine unit
-    word -- and the absence of financial vocabulary immediately before it,
-    never the presence of a recognised temporal phrase.
+def test_ordinary_duration_phrasing_split_across_cells_now_needs_review(before, value, after):
+    """Correction-8 update: this row spreads the label, the number, and the
+    unit word across three separate physical cells ("Claim settled in" |
+    "30" | "days"). This test originally asserted that reading was safely
+    exempted, on the theory that no enumerated phrase list was needed to
+    trust it. An independent review found the real cost of that theory: the
+    same cross-cell reasoning could not tell "Claim settled in | 30 | days"
+    apart from "held for | 45000 | days" or "Entry | 500 | days" -- and for
+    every label outside a twelve-word denylist, it let a whole-dollar figure
+    vanish exactly like the values this whole thread exists to protect.
 
-    Descriptions are inspected here too, per requirement 4 -- but for a
-    value *confirmed* narrative the assertion is different from the other
-    groups in this file: the text is free to fold into the neighbouring
-    claim's own description exactly as any other wrapped continuation
-    would (that is what a text-only continuation line is for), and the
-    invariant is only that it never *also* surfaces as live, unowned
-    evidence at the same time. Requirement 4's "uncertain numeric evidence"
-    describes the confident-money and merged-fragment cases above, not a
-    value this unit has itself proven to be a duration.
+    Correction-8 retired the cross-cell reading entirely: proof now has to
+    come from the number's *own* cell, never a neighbour's. A label three
+    cells away no longer counts, for a genuine duration exactly as much as
+    for a disguised amount -- there is no way to trust one without trusting
+    the other, since both look identical from here. This is the accepted
+    trade named in that unit's own invariant: a safe false positive over
+    silent financial loss. A genuine same-cell duration ("30 days" printed
+    as one cell) remains exempt without needing any phrase list -- see
+    ``test_a_genuine_same_cell_duration_remains_exempt_and_reads_clean`` in
+    ``test_numeric_evidence_correction8.py``.
     """
     row = _raw(["", "", "", before, value, after, ""], line=102)
     claims, _warnings, unplaced = _build([row])
@@ -285,12 +290,13 @@ def test_ordinary_duration_phrasing_stays_clean_and_untouched(before, value, aft
         text for item in unplaced
         for text in list(item.amounts.values()) + list(item.ambiguous_values.values())
     }
-    assert value not in carried, (
-        f"ordinary duration prose {before!r} still raised evidence: {unplaced}"
+    assert value in carried, (
+        f"a whole-unit value split across cells vanished to zero trace: {unplaced}"
     )
-    # Informational, not a failure either way: confirms the text actually
-    # took the continuation path rather than vanishing as a bare warning.
-    _descriptions(claims)
+    assert value not in _descriptions(claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in claims]}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -303,33 +309,42 @@ def test_ordinary_duration_phrasing_stays_clean_and_untouched(before, value, aft
     ],
     ids=["settled-in", "closed-within-the", "filed-after", "reviewed-every"],
 )
-def test_ordinary_duration_phrasing_end_to_end_reads_clean(tmp_path, before, value, after):
+def test_ordinary_duration_phrasing_split_across_cells_needs_review_end_to_end(
+    tmp_path, before, value, after
+):
+    """Correction-8 update, end-to-end counterpart of the direct-call test
+    above: see that test's docstring for why this row's old CLEAN
+    expectation required trusting an inference the review showed was
+    unsafe, and why the value must now survive as unresolved evidence.
+    """
     rows = CLAIMS + (("", "", "", before, value, after, ""),)
     result = run_pipeline(
         _write(tmp_path / f"duration-{before.replace(' ', '_')}.pdf", rows),
         use_vision=False,
     )
-    assert value not in _texts(result.document), (
-        f"{before!r} raised a false R-23: {result.document.unplaced_rows}"
+    assert value in _texts(result.document), (
+        f"a whole-unit value split across cells vanished to zero trace: "
+        f"{result.document.unplaced_rows}"
     )
-    # Inspected per requirement 4; see the direct-call test above for why a
-    # confirmed-narrative value legitimately folding into a claim's own
-    # description, rather than vanishing, is not the failure this checks
-    # for. The failure mode is the value surfacing as evidence *and* CLEAN
-    # being reached anyway -- ruled out by the two assertions below.
-    _descriptions(result.document.claims)
-    assert not _r23(result), [f.message for f in _r23(result)]
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert value not in _descriptions(result.document.claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in result.document.claims]}"
+    )
+    assert _r23(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_financial_cue_word_vetoes_the_duration_reading_even_for_a_bare_integer():
-    """The negative check that keeps requirement 3's fix from over-firing.
-
-    "Loss reserve | 500 | days outstanding" is the same shape as "Claim
-    settled in | 30 | days" -- a bare integer immediately followed by a
-    duration word -- but "reserve" immediately in front of the number is
-    explicit financial vocabulary, and that must still block the exemption
-    regardless of how the number is formatted.
+    """Correction-8 note: "days outstanding" is a different physical cell
+    from "500", so under correction-8's same-cell requirement this row no
+    longer even reaches the duration/count check -- there is no unit word
+    in "500"'s own cell for it to match. The value stays live evidence for
+    that more direct reason now, not because the veto below fired, but the
+    outcome this test guards is unchanged. For the veto still doing its own
+    job -- refusing a duration reading that a unit word *inside the same
+    cell* would otherwise support -- see
+    ``test_a_financial_cue_word_still_vetoes_a_same_cell_duration_reading``
+    in ``test_numeric_evidence_correction8.py``.
     """
     row = _raw(["", "", "", "Loss reserve", "500", "days outstanding", ""], line=103)
     claims, _warnings, unplaced = _build([row])

@@ -406,18 +406,37 @@ def test_words_around_a_number_do_not_prove_it_is_prose(
         ("recovery records kept", "7", "years"),
     ],
 )
-def test_a_duration_remains_prose_despite_financial_words(
+def test_a_duration_split_across_cells_stays_unresolved_despite_financial_words(
     tmp_path, before, value, after
 ):
+    """Correction-8: the label, the number, and the unit word here are three
+    separate physical cells ("reserve records kept" | "7" | "years"). This
+    test originally asserted that cross-cell reading was safely exempted --
+    but a table laying three cells beside each other is not the same fact
+    as a source printing one sentence, and every label that inference did
+    not happen to name (most of them; see the independent review that led
+    to correction-8) was passing an unrelated whole-dollar figure through
+    as prose the exact same way. The value must now survive as unresolved
+    evidence instead of vanishing. A genuine same-cell duration ("7 years"
+    printed as one cell) is unaffected -- see
+    ``test_a_genuine_same_cell_duration_remains_exempt_and_reads_clean`` in
+    ``test_numeric_evidence_correction8.py``.
+    """
     rows = CLAIMS + (("", "", "", before, value, after, ""),)
     result = run_pipeline(
         _write(tmp_path / f"duration-{value}-{len(before)}.pdf", rows),
         use_vision=False,
     )
 
-    assert value not in _document_texts(result.document)
-    assert not _r23(result)
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert value in _document_texts(result.document), (
+        f"a whole-unit value vanished to zero trace: {result.document.unplaced_rows}"
+    )
+    assert value not in _descriptions(result.document.claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in result.document.claims]}"
+    )
+    assert _r23(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_decimal_formatted_value_is_not_a_duration_despite_financial_words(

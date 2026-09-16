@@ -529,19 +529,31 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
     row permits both readings, the function returns false so R-23 preserves
     the uncertainty rather than folding it into another claim.
 
-    Duration and count are recognised by what the *number itself* cannot
-    fake: a plainly printed whole number (no grouping, no decimal fraction)
-    bound to its own unit word. Money is grouped and/or carries a decimal
-    fraction even at a duration's magnitude -- "45,000.00" is not a day
-    count merely because "days" sits beside it -- so a value printed that
-    way is refused this reading before any surrounding word is even read.
-    There is deliberately no enumerated list of words that *proves* a
-    duration ("in", "within", "after", "every" would each need naming, and
-    the next document brings a preposition none of them listed). What is
-    checked instead is the one thing a genuine duration or count cannot
-    avoid contradicting: explicit financial vocabulary immediately before
-    the number vetoes the reading, because a printed total or reserve line
-    is headed with exactly those words regardless of what follows it.
+    A duration or a count must be proven inside the *one cell the number was
+    printed in*. A table lays cells out beside each other; it does not say
+    that cell 4 continues a sentence cell 3 started and cell 6 finishes.
+    "held for | 500 | days" is three physical cells nobody printed as one
+    sentence, and reading a duration out of it is an inference about the
+    table's layout wearing the clothes of a reading of its text -- and every
+    label that inference does not happen to recognise, which is most of
+    them, was passing "500" through as prose regardless of the veto below.
+    "500 days" printed as the single cell this number came from is a
+    different fact: the source itself ties the unit to this exact digit run,
+    which a neighbouring cell's word never can, however grammatical the row
+    reads once the cells are joined back together. So the unit word is read
+    only from this cell's own remainder after its digits -- never from a
+    cell before or after it -- and there is deliberately no enumerated list
+    of phrases standing in for that reach, because the fix for an
+    unverifiable guess is not a longer guess.
+
+    The number's own printed form still matters, but only as a second,
+    narrowing condition, never as what decides the reading by itself: money
+    grouped or carrying a decimal fraction is refused this exemption even
+    printed as "45,000.00 days" in one cell, because a duration or a count
+    is never printed with either, at any magnitude. And explicit financial
+    vocabulary immediately before the number, within that same cell, still
+    vetoes the reading -- "Reserve 500 days" in one cell is refused for the
+    same reason "Loss reserve | 500 | days outstanding" always was.
     """
     text = row.cell(index).strip()
     if not text or _has_explicit_financial_marker(text):
@@ -563,19 +575,36 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
          *(row.cell(position).strip() for position in range(index + 1, last + 1))]
     )
     numeric_tokens = _NUMBER_TOKEN.findall(text)
+
+    # Same-cell evidence only: the unit word must follow the digits inside
+    # *this* cell's own text. `local_after` never reaches into `after`'s
+    # neighbouring cells, which is the one change this unit makes -- a word
+    # a different cell happens to hold is not evidence about this one.
+    local_before = text[: digits[0]]
+    local_after = text[digits[-1] + 1 :]
     if (
         len(numeric_tokens) == 1
         and _BARE_INTEGER.fullmatch(numeric_tokens[0])
-        and not _FINANCIAL_VALUE_CUE.search(before)
+        and not _FINANCIAL_VALUE_CUE.search(local_before)
+        and (
+            _DURATION_AFTER_NUMBER.match(local_after)
+            or _COUNT_AFTER_NUMBER.match(local_after)
+        )
     ):
-        if _DURATION_AFTER_NUMBER.match(after) or _COUNT_AFTER_NUMBER.match(after):
-            return True
+        return True
 
     # A date is exempt on the same principle a merged fragment already
     # follows elsewhere: the cell must be *one* value. "4 5/23/2023" fuses a
     # count digit to a date at a column boundary, and removing the matched
     # date leaves the "4" behind -- proof this is two figures wearing one
     # cell, so the exemption meant for a single clean date must not reach it.
+    #
+    # Its context is still read across the row, unlike the duration/count
+    # check above: the value's own shape already does most of the proving
+    # here (an unambiguous date token that goes on to parse), so a
+    # neighbouring cell's word only ever narrows that reading further -- it
+    # is never asked to supply, by itself, the one fact a bare integer has
+    # no shape of its own to offer.
     date_token = _DATE_TOKEN.search(text)
     if date_token:
         remainder = text[: date_token.start()] + text[date_token.end() :]
