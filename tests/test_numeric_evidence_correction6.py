@@ -10,6 +10,8 @@ into a neighbouring claim.  No fixture contains real claimant information.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pymupdf
 import pytest
 
@@ -306,17 +308,34 @@ def test_digit_free_money_cell_cannot_hide_unreadable_neighbour(marker):
     assert MERGED not in _descriptions(claims)
 
 
-def test_split_parseable_prose_does_not_manufacture_r23(tmp_path):
+def test_split_parseable_prose_with_a_decimal_value_stays_unresolved(tmp_path):
+    """Correction-7: "30.00" is printed the way an amount is, not a duration.
+
+    This test originally asserted the value vanished to zero trace and the
+    document read CLEAN. That is the exact failure an independent review
+    reproduced with values at a claim's own magnitude ("45,000.00" held for
+    "days"): a decimal-formatted number is money-shaped regardless of what
+    grammar surrounds it, so it is never exempted on the duration/count
+    path -- it must survive as unresolved evidence instead. A genuine,
+    plainly-printed duration ("30", no decimal) is unaffected; see
+    ``test_ordinary_duration_phrasing_stays_clean_and_untouched`` in
+    ``test_numeric_evidence_correction7.py`` for that case.
+    """
     rows = CLAIMS + (
         ("", "", "", "reported within", "30.00", "days", ""),
     )
     result = run_pipeline(_write(tmp_path / "numeric-prose.pdf", rows), use_vision=False)
 
-    assert "30.00" not in _document_texts(result.document), (
-        result.document.unplaced_rows
+    assert "30.00" in _document_texts(result.document), (
+        f"a decimal-formatted value vanished to zero trace: "
+        f"{result.document.unplaced_rows}"
     )
-    assert not _r23(result)
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert "30.00" not in _descriptions(result.document.claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in result.document.claims]}"
+    )
+    assert _r23(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 @pytest.mark.parametrize("value", ["30.00", "$30.00"])
@@ -382,7 +401,6 @@ def test_words_around_a_number_do_not_prove_it_is_prose(
 @pytest.mark.parametrize(
     "before, value, after",
     [
-        ("claims are paid within", "30.00", "days"),
         ("reserve records kept", "7", "years"),
         ("payment due within", "30", "days"),
         ("recovery records kept", "7", "years"),
@@ -402,7 +420,35 @@ def test_a_duration_remains_prose_despite_financial_words(
     assert result.reconciliation.status is DocumentStatus.CLEAN
 
 
+def test_a_decimal_formatted_value_is_not_a_duration_despite_financial_words(
+    tmp_path,
+):
+    """The one case moved out of the parametrized test above: "30.00" beside
+    "paid within ... days" is not a bare integer, so correction-7 refuses it
+    the duration exemption regardless of the surrounding financial words --
+    it must survive as unresolved evidence instead of vanishing. See
+    ``test_split_parseable_prose_with_a_decimal_value_stays_unresolved``.
+    """
+    rows = CLAIMS + (("", "", "", "claims are paid within", "30.00", "days", ""),)
+    result = run_pipeline(
+        _write(tmp_path / "duration-decimal-financial.pdf", rows), use_vision=False
+    )
+
+    assert "30.00" in _document_texts(result.document), (
+        result.document.unplaced_rows
+    )
+    assert "30.00" not in _descriptions(result.document.claims)
+    assert _r23(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
 def test_duration_prose_does_not_hide_a_different_amount_on_the_same_row():
+    """"30.00" is decimal-formatted, so correction-7 no longer exempts it as
+    a duration regardless of "reported within ... days" beside it -- it now
+    joins "$500.00" as a second, independent piece of live evidence on the
+    same row, rather than being waved through as this test originally
+    expected. Both figures must survive; neither may swallow the other.
+    """
     mapping = ColumnMapping(
         headers=["Paid", "Note", "Reserve", "Note"],
         fields={
@@ -415,8 +461,10 @@ def test_duration_prose_does_not_hide_a_different_amount_on_the_same_row():
     row = _raw(["$500.00", "reported within", "30.00", "days"], line=82)
     evidence = unplaced_evidence(row, mapping, "us", context="unknown")
 
-    assert evidence.ambiguous == {"paid_total": ("$500.00", 500)}
-    assert "reserve_total" not in evidence.ambiguous
+    assert evidence.ambiguous == {
+        "paid_total": ("$500.00", 500),
+        "reserve_total": ("30.00", Decimal("30.00")),
+    }
     assert evidence.unreadable == {}
 
 

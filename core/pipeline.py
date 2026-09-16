@@ -471,11 +471,20 @@ _DATE_CONTEXT = re.compile(
 )
 _LIST_ITEM = re.compile(r"^\s*(?:\(\d+\)|\d+[.)])\s+[^\W\d_]", re.UNICODE)
 _NUMBER_TOKEN = re.compile(r"\d+(?:[.,']\d+)*")
-_TEMPORAL_CUE = re.compile(
-    r"\b(?:aged?|during|for|kept|last|over|past|retained|through|to|within)\s*$",
-    re.IGNORECASE,
-)
-_COUNT_CUE = re.compile(r"\b(?:count|number\s+of|total\s+of)\s*$", re.IGNORECASE)
+#: A number with no grouping and no decimal fraction: exactly what a duration
+#: or a count is printed as, and exactly what an amount at any size is not --
+#: "45,000.00" and "128,500.00" carry the grouping and the fraction even at a
+#: magnitude a bare day-count never reaches. This is a constraint on the
+#: number's own printed form, not on how large it is or which words sit near
+#: it, so it holds without regard to either.
+_BARE_INTEGER = re.compile(r"^\d+$")
+#: Explicit financial vocabulary immediately in front of a candidate number.
+#: Not a list of words that prove a duration or a count -- there is no such
+#: list here, on purpose, because the next document brings a preposition none
+#: of them named. This is the opposite kind of check: a small, named set of
+#: words that a printed total or reserve line is headed with, checked only to
+#: *veto* the reading. "Loss reserve | 500 | days outstanding" names a dollar
+#: figure whatever unit-shaped word follows it.
 _FINANCIAL_VALUE_CUE = re.compile(
     r"\b(?:amount|balance|cost|damages|deductible|indemnity|limit|paid|premium|"
     r"recovery|reserve|settlement|total)\s*$",
@@ -519,6 +528,20 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
     Explicit currency or debit/credit/sign notation always wins.  Where the
     row permits both readings, the function returns false so R-23 preserves
     the uncertainty rather than folding it into another claim.
+
+    Duration and count are recognised by what the *number itself* cannot
+    fake: a plainly printed whole number (no grouping, no decimal fraction)
+    bound to its own unit word. Money is grouped and/or carries a decimal
+    fraction even at a duration's magnitude -- "45,000.00" is not a day
+    count merely because "days" sits beside it -- so a value printed that
+    way is refused this reading before any surrounding word is even read.
+    There is deliberately no enumerated list of words that *proves* a
+    duration ("in", "within", "after", "every" would each need naming, and
+    the next document brings a preposition none of them listed). What is
+    checked instead is the one thing a genuine duration or count cannot
+    avoid contradicting: explicit financial vocabulary immediately before
+    the number vetoes the reading, because a printed total or reserve line
+    is headed with exactly those words regardless of what follows it.
     """
     text = row.cell(index).strip()
     if not text or _has_explicit_financial_marker(text):
@@ -540,27 +563,29 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
          *(row.cell(position).strip() for position in range(index + 1, last + 1))]
     )
     numeric_tokens = _NUMBER_TOKEN.findall(text)
-    local_after = text[digits[-1] + 1 :]
-    if len(numeric_tokens) == 1 and _DURATION_AFTER_NUMBER.match(after):
-        if _DURATION_AFTER_NUMBER.match(local_after):
+    if (
+        len(numeric_tokens) == 1
+        and _BARE_INTEGER.fullmatch(numeric_tokens[0])
+        and not _FINANCIAL_VALUE_CUE.search(before)
+    ):
+        if _DURATION_AFTER_NUMBER.match(after) or _COUNT_AFTER_NUMBER.match(after):
             return True
+
+    # A date is exempt on the same principle a merged fragment already
+    # follows elsewhere: the cell must be *one* value. "4 5/23/2023" fuses a
+    # count digit to a date at a column boundary, and removing the matched
+    # date leaves the "4" behind -- proof this is two figures wearing one
+    # cell, so the exemption meant for a single clean date must not reach it.
+    date_token = _DATE_TOKEN.search(text)
+    if date_token:
+        remainder = text[: date_token.start()] + text[date_token.end() :]
         if (
-            _TEMPORAL_CUE.search(before)
-            and not _FINANCIAL_VALUE_CUE.search(before)
+            not any(character.isdigit() for character in remainder)
+            and parse_date(date_token.group(), None).value is not None
+            and _DATE_CONTEXT.search(f"{before} {after}")
         ):
             return True
-    if len(numeric_tokens) == 1 and _COUNT_AFTER_NUMBER.match(after):
-        if _COUNT_AFTER_NUMBER.match(local_after):
-            return True
-        if _COUNT_CUE.search(before) and not _FINANCIAL_VALUE_CUE.search(before):
-            return True
-    date_token = _DATE_TOKEN.search(text)
-    if (
-        date_token
-        and parse_date(date_token.group(), None).value is not None
-        and _DATE_CONTEXT.search(f"{before} {after}")
-    ):
-        return True
+
     return bool(
         len(numeric_tokens) == 1
         and _LIST_ITEM.match(text)
@@ -572,7 +597,6 @@ def _numeric_cells(
     row: RawRow,
     mapping: ColumnMapping,
     locale: str | None,
-    previous: RawRow | None = None,
 ) -> tuple[dict[str, tuple[str, Decimal]], dict[str, str]]:
     """Money-column cells, split into what parsed and what could not be read.
 
@@ -580,7 +604,7 @@ def _numeric_cells(
     is still a printed figure nobody placed. Keeping it is the default, and
     discarding it needs a positive reason.
 
-    That is the correction. The previous rule required a *reason to keep*: the
+    That is the correction. An earlier rule required a *reason to keep*: the
     cell's column had to out-poll its own failures, counting readable cells
     against unreadable ones. Absence of corroboration was read as proof of
     prose, which made the rule non-monotonic -- one merged cell on a page of
@@ -589,18 +613,29 @@ def _numeric_cells(
     may lose more of it as more arrives.
 
     So the question is inverted. A cell in a mapped money column carrying a
-    digit is a figure nobody placed unless the page says otherwise, and the
-    page can say so in exactly two ways, both of them positive:
+    digit is a figure nobody placed unless the row says otherwise, and the row
+    can say so in exactly two ways, both of them positive: it establishes
+    itself as claim data (a date and a status are what a claim line carries
+    and a wrapped sentence does not, so a claim line whose identifier went
+    missing is the one row most likely to be holding an amount nobody else
+    will report -- and neither of the checks below applies to it); or the
+    exact cell has a proven non-money role in the row's own words, decided by
+    :func:`_is_same_row_narrative` on that cell alone. No row above or below
+    this one is consulted for either question: cross-row reasoning was tried
+    and removed, because a row of unresolved figures above this one has the
+    same shape -- "several populated cells, none of them money" -- as a row
+    of genuine prose, and letting it license discarding the row after it
+    turned one row of refused evidence into an excuse to discard a second.
 
-    it is the tail of a sentence traced back to a column the mapping does not
-    call money; or it is the last line of a paragraph printed above it, which
-    is the same fact where the block maps nothing but money and there is no
-    non-money column left to trace to.
-
-    Neither of those is available to a row that establishes itself as claim
-    data. A date and a status are what a claim line carries and a wrapped
-    sentence does not, and a claim line whose identifier went missing is the
-    one row most likely to be holding an amount nobody else will report.
+    A cell classified as narrative is refused *both* channels, not merely
+    demoted from parsed to unreadable: the classifier's whole claim is that
+    the figure is not a figure at all -- a duration, a count, a date, a list
+    marker -- and reporting it as unresolved evidence would put a proven
+    non-issue on the exceptions list. That claim has to be earned; see
+    :func:`_is_same_row_narrative` for what it takes to prove it, and note
+    that a cell which merely *parses* as money is never on that account alone
+    treated as proven narrative -- a confident amount reaches this function's
+    output in one channel or the other, never neither.
 
     The digit requirement stays: it is not a count of the cell's numbers but
     the precondition for there being numeric evidence at all. "LEFT SHOULDER"
@@ -878,7 +913,6 @@ def unplaced_evidence(
     locale: str | None,
     *,
     context: str = "unknown",
-    previous: RawRow | None = None,
 ) -> UnplacedEvidence:
     """Numeric cells on a row nothing claimed, classified by context.
 
@@ -910,7 +944,7 @@ def unplaced_evidence(
     # evidence: the page printed something under a money column and no claim
     # took it, which is exactly what an unplaced row is for. It goes straight
     # to the unresolved side, never to `amounts`, and never with a number.
-    parsed, merged = _numeric_cells(row, mapping, locale, previous)
+    parsed, merged = _numeric_cells(row, mapping, locale)
     if not parsed and not merged:
         return UnplacedEvidence({}, {})
 
@@ -1075,10 +1109,7 @@ def build_claims(
         table_mapping = mapping_for(table, mapping)
         context = table_money_context(table, table_mapping, shapes)
 
-        for position, row in enumerate(table.rows):
-            # The physically preceding line, which is what says whether this
-            # one is the tail of a paragraph printed above it.
-            above = table.rows[position - 1] if position else None
+        for row in table.rows:
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
                 # belongs to the document and not to any claim. It is trusted
@@ -1091,7 +1122,7 @@ def build_claims(
             if not text:
                 continue
             if text in furniture and not _carries_numeric_evidence(
-                row, table_mapping, locale, above
+                row, table_mapping, locale
             ):
                 # Furniture is decided on text pooled across pages, but applied
                 # to *this* occurrence. A line that repeats is usually a running
@@ -1115,7 +1146,7 @@ def build_claims(
                 # figure that is not part of the accident.
                 evidence = unplaced_evidence(
                     row, table_mapping, locale,
-                    context=context, previous=above,
+                    context=context,
                 )
                 # A continuation line carries prose. A row carrying money or a
                 # date is a claim whose number could not be identified, and
@@ -1124,7 +1155,7 @@ def build_claims(
                 if evidence:
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context, previous=above,
+                        context=context,
                     )
                 elif extra and claims and _continuation_text(row, table_mapping):
                     previous = claims[-1]
@@ -1134,7 +1165,7 @@ def build_claims(
                 elif extra:
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context, previous=above,
+                        context=context,
                     )
                 continue
 
@@ -1162,7 +1193,7 @@ def build_claims(
                 preview = " ".join(cell for cell in row.cells if cell)
                 _record_discard(
                     row, table_mapping, locale, warnings, unplaced, preview,
-                    context=context, previous=above,
+                    context=context,
                 )
     return claims, warnings, unplaced
 
@@ -1171,7 +1202,6 @@ def _carries_numeric_evidence(
     row: RawRow,
     mapping: ColumnMapping,
     locale: str | None,
-    previous: RawRow | None = None,
 ) -> bool:
     """Whether this row carries numeric evidence furniture must not delete.
 
@@ -1187,15 +1217,7 @@ def _carries_numeric_evidence(
     # numeric scanner here made furniture protection disagree with R-23: the
     # latter correctly resolved the date while the former still treated it as
     # unresolved numeric evidence.
-    return bool(
-        unplaced_evidence(
-            row,
-            mapping,
-            locale,
-            context="unknown",
-            previous=previous,
-        )
-    )
+    return bool(unplaced_evidence(row, mapping, locale, context="unknown"))
 
 
 def _record_discard(
@@ -1207,7 +1229,6 @@ def _record_discard(
     preview: str,
     *,
     context: str = "unknown",
-    previous: RawRow | None = None,
 ) -> None:
     """Note a row nothing could take, and keep any numeric evidence on it.
 
@@ -1219,9 +1240,7 @@ def _record_discard(
     the second as the first is how a number the carrier never printed as money
     acquires a claim.
     """
-    evidence = unplaced_evidence(
-        row, mapping, locale, context=context, previous=previous
-    )
+    evidence = unplaced_evidence(row, mapping, locale, context=context)
     if evidence:
         unplaced.append(
             UnplacedRow(
