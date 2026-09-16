@@ -454,25 +454,17 @@ def _reads_as_money(text: str, locale: str | None) -> bool:
 _FINANCIAL_DIRECTION = re.compile(
     r"^\s*[+-]|[+-]\s*$|\b(?:CR|DR)\b", re.IGNORECASE
 )
-_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 _DATE_TOKEN = re.compile(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b")
 _DATE_CONTEXT = re.compile(
     r"\b(?:as\s+of|date|dated|from|on|period|term|through|to)\b",
     re.IGNORECASE,
 )
-_LIST_ITEM = re.compile(r"^\s*(?:\(\d+\)|\d+[.)])\s+[^\W\d_]", re.UNICODE)
 _NUMBER_TOKEN = re.compile(r"\d+(?:[.,']\d+)*")
 
 
 def _has_explicit_financial_marker(text: str) -> bool:
     """Whether the source explicitly presents this cell as financial."""
     return bool(_CURRENCY_MARK.search(text) or _FINANCIAL_DIRECTION.search(text))
-
-
-def _words(text: str) -> list[str]:
-    """Alphabetic words after currency notation is taken out of the way."""
-    without_currency = _CURRENCY_MARK.sub(" ", text)
-    return [word for word in _WORD.findall(without_currency) if len(word) > 1]
 
 
 def _contiguous_span(row: RawRow, index: int) -> tuple[int, int]:
@@ -490,41 +482,50 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
     """Whether this exact numeric cell has a proven non-money role in prose.
 
     Words on both sides are not enough: ``deductible is | 500 | per claim``
-    is grammatical and still carries unresolved financial evidence. Only
-    three things are accepted as proof that a digit-bearing cell in a mapped
-    money column is not money: the cell is entirely a page marker; it is a
-    date in date/term grammar; or it is a list marker introducing a
-    substantial same-row sentence. These are candidate-local relationships;
-    a reading elsewhere on the row cannot excuse a different amount, and no
-    previous row gets to decide what this one means.
+    is grammatical and still carries unresolved financial evidence. Only two
+    things are accepted as proof that a digit-bearing cell in a mapped money
+    column is not money: the cell is entirely a page marker, or it is a date
+    in date/term grammar. These are candidate-local relationships; a reading
+    elsewhere on the row cannot excuse a different amount, and no previous
+    row gets to decide what this one means.
 
     Explicit currency or debit/credit/sign notation always wins.  Where the
     row permits both readings, the function returns false so R-23 preserves
     the uncertainty rather than folding it into another claim.
 
     Duration and count grammar -- "held for | 500 | days", "500 days" in one
-    cell, "number of | 9400 | claims" -- is deliberately not one of the three
-    above, and was tried twice and retired both times. Reading it across
-    cells could not tell a genuine duration from a disguised amount for any
-    label outside a short denylist; reading it from one cell instead could
-    not tell either, because the cell boundary itself is not evidence of
-    what the carrier printed together. ``assign_to_columns`` in the
-    extraction layer buckets a stray word into a money column whenever its
-    midpoint drifts within slack its own docstring calls "most of a column"
-    wide, and ``split_words`` groups words into one cell on a bare position
-    gap with no notion of which field a word belongs to -- this codebase
-    already has a test proving a single reported cell can carry text smeared
-    in from a neighbouring column
-    (``test_an_identifier_smeared_with_a_neighbouring_column_is_kept``). A
-    cell boundary records how two geometric heuristics clustered words on
-    one page, not what the source meant, so no phrase list, financial-word
-    veto, magnitude threshold, or printed-format rule fixes it either --
-    each only relocates which shape of adjacent text gets trusted. A bare
-    integer followed by "days" or "claims", in this cell or a neighbouring
-    one, proves nothing on its own and is left as unresolved evidence like
-    any other unparsed figure; a genuine duration or count column is a
-    column-mapping question (:func:`_labelled_values`, or an actual
-    non-money field), not a per-cell guess.
+    cell, "number of | 9400 | claims" -- was tried twice and retired both
+    times: reading it across cells could not tell a genuine duration from a
+    disguised amount for any label outside a short denylist, and reading it
+    from one cell instead could not tell either, because the cell boundary
+    itself is not evidence of what the carrier printed together.
+    ``assign_to_columns`` in the extraction layer buckets a stray word into a
+    money column whenever its midpoint drifts within slack its own docstring
+    calls "most of a column" wide, and ``split_words`` groups words into one
+    cell on a bare position gap with no notion of which field a word belongs
+    to -- this codebase already has a test proving a single reported cell can
+    carry text smeared in from a neighbouring column
+    (``test_an_identifier_smeared_with_a_neighbouring_column_is_kept``).
+
+    List markers were the third exemption and are retired for the identical
+    reason. ``(500)``, ``500.``, and ``9400)`` match a leading list-marker
+    pattern exactly as well as a genuine ``(4)`` does -- the pattern is
+    purely syntactic, parentheses are also valid accounting-negative
+    notation, and a row reaching ten or more words proves only that the row
+    is long, not that this cell's number is an index rather than an amount.
+    A disclaimer paragraph and a disguised amount look identical from here.
+    No replacement heuristic is used: not a higher or different word-count
+    threshold, not a magnitude limit on the number, not a phrase list, and
+    not a check for a genuine sibling sequence ("(1) ... (2) ... (3)")
+    elsewhere in the document -- each would only relocate which shape of
+    adjacent text gets trusted, the same mistake duration and count grammar
+    already made twice. A cell boundary records how two geometric heuristics
+    clustered words on one page, not what the source meant, so nothing about
+    a cell's own text -- its printed form, its neighbours, or how long the
+    row around it runs -- is read as proof of a non-money role any more. A
+    genuine duration, count, or list-numbered column is a column-mapping
+    question (:func:`_labelled_values`, or an actual non-money field), not a
+    per-cell guess.
     """
     text = row.cell(index).strip()
     if not text or _has_explicit_financial_marker(text):
@@ -536,7 +537,6 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
         return False
 
     first, last = _contiguous_span(row, index)
-    span = " ".join(row.cell(position).strip() for position in range(first, last + 1))
     before = " ".join(
         [*(row.cell(position).strip() for position in range(first, index)),
          text[: digits[0]]]
@@ -545,7 +545,6 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
         [text[digits[-1] + 1 :],
          *(row.cell(position).strip() for position in range(index + 1, last + 1))]
     )
-    numeric_tokens = _NUMBER_TOKEN.findall(text)
 
     # A date is exempt only when its own shape already does the proving: an
     # unambiguous date token that goes on to parse, with nothing else in the
@@ -554,7 +553,7 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
     # narrow this reading further; they are never asked to supply, by
     # themselves, the one fact a bare integer has no shape of its own to
     # offer, which is exactly why no equivalent exemption exists above for
-    # duration or count grammar.
+    # duration, count, or list-marker grammar.
     date_token = _DATE_TOKEN.search(text)
     if date_token:
         remainder = text[: date_token.start()] + text[date_token.end() :]
@@ -565,11 +564,7 @@ def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> b
         ):
             return True
 
-    return bool(
-        len(numeric_tokens) == 1
-        and _LIST_ITEM.match(text)
-        and len(_words(span)) >= 10
-    )
+    return False
 
 
 def _numeric_cells(
@@ -608,9 +603,9 @@ def _numeric_cells(
 
     A cell classified as narrative is refused *both* channels, not merely
     demoted from parsed to unreadable: the classifier's whole claim is that
-    the figure is not a figure at all -- a page marker, a date, a list
-    marker -- and reporting it as unresolved evidence would put a proven
-    non-issue on the exceptions list. That claim has to be earned; see
+    the figure is not a figure at all -- a page marker or a date -- and
+    reporting it as unresolved evidence would put a proven non-issue on the
+    exceptions list. That claim has to be earned; see
     :func:`_is_same_row_narrative` for what it takes to prove it, and note
     that a cell which merely *parses* as money is never on that account alone
     treated as proven narrative -- a confident amount reaches this function's

@@ -542,24 +542,28 @@ DISCLAIMER_MAPPING = ColumnMapping(
 )
 
 
-def test_a_disclaimer_paragraph_under_money_headings_is_mostly_not_evidence():
+def test_a_disclaimer_paragraph_under_money_headings_now_needs_review():
     """A legal notice wrapped across the page, every column of it mapped money.
 
     The extractor cuts the paragraph at whatever boundaries the claims table
-    set, so its fragments land under money headings. "(4) any unauthorized"
-    carries a digit and sits in a mapped money column, but its own cell
-    proves it a list marker (:func:`_is_same_row_narrative`'s list-item
-    path, untouched by correction-9), so it stays out of evidence.
+    set, so its fragments land under money headings.
 
-    Correction-9 update: "last 30 days." no longer gets the same pass.
-    It used to be exempted the same way "held for 500 days" was, on the
-    theory that a bare integer plus duration wording in one cell is proof
-    enough -- but a cell boundary is not evidence of what a disclaimer
-    author printed together any more than it is for a disguised amount, so
-    correction-9 retired that exemption for every case, this one included.
-    The figure now correctly surfaces as unresolved evidence -- there are
-    no claims in this fixture for it to be folded into, so the only
-    outstanding question is that it stays visible rather than vanishing.
+    Correction-9 update (superseded below): "last 30 days." lost its
+    duration/count exemption -- a bare integer plus duration wording in one
+    cell was never proof, only a cell boundary the carrier's layout happened
+    to draw there.
+
+    Correction-10 update: "(4) any unauthorized" loses its exemption too.
+    An independent review found the identical defect one door over: the
+    list-marker path could not tell this genuine disclaimer clause apart
+    from "(500) any unauthorized payment ..." or "(9400) any unauthorized
+    payment ..." -- both matched the identical pattern, since a leading
+    ``(N)`` is exactly as valid as accounting-negative notation as it is as
+    a list index, and the row's word count says only that the row is long.
+    Correction-10 retired the exemption for every case, this one included.
+    Both fragments now correctly surface as unresolved evidence -- there
+    are no claims in this fixture for either to be folded into, so the only
+    outstanding question is that both stay visible rather than vanishing.
     """
     tables = _tables(
         [
@@ -573,7 +577,10 @@ def test_a_disclaimer_paragraph_under_money_headings_is_mostly_not_evidence():
     claims, _, unplaced = build_claims(tables, DISCLAIMER_MAPPING, "us", "mdy")
     carried = {t for row in unplaced for t in
                list(row.amounts.values()) + list(row.ambiguous_values.values())}
-    assert carried == {"last 30 days."}, (
-        f"expected only the duration fragment to surface as evidence: {carried}"
+    assert carried == {"(4) any unauthorized", "last 30 days."}, (
+        f"expected both fragments to surface as evidence: {carried}"
     )
-    assert not claims, claims
+    assert not claims, (
+        f"there should be no claims in this fixture for either fragment to "
+        f"be folded into, but found: {claims}"
+    )
