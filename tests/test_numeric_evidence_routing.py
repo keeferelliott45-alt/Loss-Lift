@@ -201,7 +201,6 @@ def test_a_labelled_amount_alone_in_a_money_column_is_evidence(tmp_path, printed
 @pytest.mark.parametrize(
     "left, right",
     [
-        ("reported within 30", "to 60 days"),
         ("2 of 3 vehicles", "were total losses"),
         ("01/01/2024 to", "12/31/2024 term"),
     ],
@@ -215,8 +214,12 @@ def test_prose_running_into_a_money_column_is_not_a_finding(tmp_path, left, righ
     the evidence for that is on the row: text immediately to its left, in a
     column that is not money, continuing into it.
 
-    Counting numbers cannot see this. "reported within 30 to 60 days" carries
-    two, which is precisely why the counting rule called it money.
+    Neither case left here carries a digit-plus-duration/count shape in the
+    money cell itself: "were total losses" has no digit at all, and
+    "12/31/2024 term" is proven by its own shape as a date, a mechanism
+    correction-9 leaves untouched. See
+    ``test_a_duration_fragment_running_into_a_money_column_now_needs_review``
+    for the third case this parametrize list used to carry.
     """
     path = _write(
         tmp_path / "prose.pdf",
@@ -230,6 +233,31 @@ def test_prose_running_into_a_money_column_is_not_a_finding(tmp_path, left, righ
     assert not any(right in f.message for f in _r23(result)), [
         f.message for f in _r23(result)
     ]
+
+
+def test_a_duration_fragment_running_into_a_money_column_now_needs_review(tmp_path):
+    """The case moved out of the parametrize list above.
+
+    Correction-9 update: "to 60 days" is a bare integer plus duration
+    wording in the money cell itself, and this test originally trusted
+    that shape -- plus "reported within 30" continuing from the
+    description column -- as proof it was prose rather than a figure.
+    Correction-9 retires that trust: the fragment must now survive as
+    unresolved evidence instead of silently completing the sentence.
+    """
+    path = _write(
+        tmp_path / "prose-duration.pdf",
+        CLAIMS + (("", "", "", "reported within 30", "to 60 days", ""),),
+    )
+    result = run_pipeline(path, use_vision=False)
+    assert "to 60 days" in _texts(result.document), (
+        f"a whole-unit value vanished to zero trace: {result.document.unplaced_rows}"
+    )
+    assert "to 60 days" not in _descriptions(result.document), (
+        f"it was folded into a claim description instead: {result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for a live, unowned fragment"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 # --------------------------------------------------------------------------
@@ -514,14 +542,24 @@ DISCLAIMER_MAPPING = ColumnMapping(
 )
 
 
-def test_a_disclaimer_paragraph_under_money_headings_is_not_evidence():
+def test_a_disclaimer_paragraph_under_money_headings_is_mostly_not_evidence():
     """A legal notice wrapped across the page, every column of it mapped money.
 
     The extractor cuts the paragraph at whatever boundaries the claims table
     set, so its fragments land under money headings. "(4) any unauthorized"
-    and "last 30 days." carry digits and sit in mapped money columns -- and no
-    cell anywhere in the block reads as an amount, which is what says the
-    whole block is prose.
+    carries a digit and sits in a mapped money column, but its own cell
+    proves it a list marker (:func:`_is_same_row_narrative`'s list-item
+    path, untouched by correction-9), so it stays out of evidence.
+
+    Correction-9 update: "last 30 days." no longer gets the same pass.
+    It used to be exempted the same way "held for 500 days" was, on the
+    theory that a bare integer plus duration wording in one cell is proof
+    enough -- but a cell boundary is not evidence of what a disclaimer
+    author printed together any more than it is for a disguised amount, so
+    correction-9 retired that exemption for every case, this one included.
+    The figure now correctly surfaces as unresolved evidence -- there are
+    no claims in this fixture for it to be folded into, so the only
+    outstanding question is that it stays visible rather than vanishing.
     """
     tables = _tables(
         [
@@ -532,7 +570,10 @@ def test_a_disclaimer_paragraph_under_money_headings_is_not_evidence():
         ],
         DISCLAIMER_MAPPING.fields, DISCLAIMER_HEADERS,
     )
-    _, _, unplaced = build_claims(tables, DISCLAIMER_MAPPING, "us", "mdy")
+    claims, _, unplaced = build_claims(tables, DISCLAIMER_MAPPING, "us", "mdy")
     carried = {t for row in unplaced for t in
                list(row.amounts.values()) + list(row.ambiguous_values.values())}
-    assert not carried, f"prose in a money column became evidence: {carried}"
+    assert carried == {"last 30 days."}, (
+        f"expected only the duration fragment to surface as evidence: {carried}"
+    )
+    assert not claims, claims

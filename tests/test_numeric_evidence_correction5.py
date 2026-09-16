@@ -442,10 +442,17 @@ def test_a_parenthesized_year_end_to_end_raises_no_r23(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_isolated_prose_anchored_to_a_description_raises_no_r23(tmp_path):
+def test_isolated_prose_anchored_to_a_description_now_needs_review(tmp_path):
     """"within last 30 days" anchored to a real description cell on the same
-    row: positive surrounding evidence establishes narrative, and it must
-    not create R-23 merely because geometry placed it under a money column.
+    row.
+
+    Correction-9 update: this test originally trusted the description cell
+    beside it, plus the duration wording in its own cell, as proof the
+    figure was narrative rather than money placed by geometry. Neither is
+    one of the narrow mechanisms correction-9 leaves standing (an explicit
+    label tied to this exact value, a page marker, a validated date, or an
+    actual non-money column), so the figure must now survive as unresolved
+    evidence instead.
     """
     path = _write(
         tmp_path / "isolated-prose.pdf",
@@ -453,10 +460,14 @@ def test_isolated_prose_anchored_to_a_description_raises_no_r23(tmp_path):
                     "within last 30 days", ""),),
     )
     result = run_pipeline(path, use_vision=False)
-    assert "within last 30 days" not in _texts(result.document), (
-        f"anchored prose became monetary evidence: {_texts(result.document)}"
+    assert "within last 30 days" in _texts(result.document), (
+        f"a whole-unit value vanished to zero trace: {result.document.unplaced_rows}"
     )
-    assert not _r23(result), [f.message for f in _r23(result)]
+    assert "within last 30 days" not in _descriptions(result.document), (
+        f"it was folded into a claim description instead: {result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for a live, unowned figure"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_an_isolated_value_in_the_same_column_still_requires_review(tmp_path):

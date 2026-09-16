@@ -303,11 +303,20 @@ def test_whole_unit_value_survives_repetition_across_pages_end_to_end(tmp_path):
 
 
 def test_a_genuine_same_cell_duration_remains_exempt_and_reads_clean():
-    """"30 days" printed as one physical cell is exactly the evidence this
-    unit says is defensible: the source itself ties the unit to this exact
-    digit run. It must remain exempt -- this is not a blanket retreat to
-    NEEDS_REVIEW for every duration, only for the ones that were never
-    actually proven.
+    """Correction-9 update: this test's own premise -- that "30 days"
+    printed as one physical cell is proof the source tied the unit to this
+    digit run -- turned out not to hold. `assign_to_columns` in the
+    extraction layer buckets a stray word into a money column whenever its
+    midpoint drifts within slack its own docstring calls "most of a column"
+    wide, and this codebase already has a test proving a single reported
+    cell can carry text smeared in from a neighbouring column
+    (`test_an_identifier_smeared_with_a_neighbouring_column_is_kept`). A
+    cell boundary is not evidence of what the carrier printed together, so
+    correction-9 retired the same-cell duration/count exemption entirely
+    rather than trying to patch it further. This value must now survive as
+    unresolved evidence instead of vanishing -- exactly the "safe false
+    positive over silent financial loss" trade correction-9's own invariant
+    names.
     """
     row = _raw(["", "", "", "Claim settled in", "30 days", "", ""], line=105)
     claims, _warnings, unplaced = _build([row])
@@ -315,21 +324,34 @@ def test_a_genuine_same_cell_duration_remains_exempt_and_reads_clean():
         text for item in unplaced
         for text in list(item.amounts.values()) + list(item.ambiguous_values.values())
     }
-    assert not any("30" in text for text in carried), (
-        f"a genuine same-cell duration raised false evidence: {unplaced}"
+    assert any("30" in text for text in carried), (
+        f"a whole-unit value vanished to zero trace: {unplaced}"
+    )
+    assert not any("30" in (claim.loss_description or "") for claim in claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in claims]}"
     )
 
 
-def test_a_genuine_same_cell_count_end_to_end_reads_clean(tmp_path):
+def test_a_genuine_same_cell_count_needs_review_end_to_end(tmp_path):
+    """Correction-9 update: see the direct-call test above for why this
+    row's old CLEAN expectation is retired along with the same-cell
+    duration/count exemption itself.
+    """
     rows = CLAIMS + (("", "", "", "Number of related", "12 claims", "filed", ""),)
     result = run_pipeline(
         _write(tmp_path / "same-cell-count.pdf", rows), use_vision=False
     )
-    assert "12" not in _texts(result.document), (
-        f"a genuine same-cell count raised a false R-23: {result.document.unplaced_rows}"
+    evidence = _texts(result.document)
+    assert any("12" in text for text in evidence), (
+        f"a whole-unit value vanished to zero trace: {result.document.unplaced_rows}"
     )
-    assert not _r23(result), [f.message for f in _r23(result)]
-    assert result.reconciliation.status is DocumentStatus.CLEAN
+    assert "12" not in _descriptions(result.document.claims), (
+        f"it was folded into a claim description instead: "
+        f"{[(c.claim_number, c.loss_description) for c in result.document.claims]}"
+    )
+    assert _r23(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_financial_cue_word_still_vetoes_a_same_cell_duration_reading():

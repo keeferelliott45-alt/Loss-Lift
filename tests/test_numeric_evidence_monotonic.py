@@ -332,39 +332,50 @@ def test_a_label_exempts_its_year_but_not_a_refused_cell(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_a_wrapped_description_reaching_a_money_column_is_not_evidence(tmp_path):
-    """The claim above wraps, and its tail lands under the paid heading."""
+def test_a_wrapped_description_reaching_a_money_column_now_needs_review(tmp_path):
+    """The claim above wraps, and its tail lands under the paid heading.
+
+    Correction-9 update: "within last 30 days" is a bare integer plus
+    duration wording in one cell -- the same shape as "30 days" or "held
+    for 45000 days" -- and this test originally trusted that shape as proof
+    the cell was a genuine wrapped continuation rather than a disguised
+    amount. Correction-9 retired that trust for every case, not only the
+    adversarial ones: a cell boundary is not evidence of what the source
+    printed together, so this row can no longer be told apart, from inside
+    the classifier, from an amount that happened to land under the same
+    heading. The number must now survive as unresolved evidence instead of
+    silently completing the claim above it -- a safe false positive on a
+    genuine wrap, in exchange for never again silently absorbing a real
+    figure the same way.
+    """
     path = _write(
         tmp_path / "wrap.pdf",
         CLAIMS + (("", "", "", "sustained further damage", "within last 30 days", ""),),
     )
     result = run_pipeline(path, use_vision=False)
-    assert "within last 30 days" not in _texts(result.document), (
-        f"a wrapped description became monetary evidence: {_texts(result.document)}"
+    assert "within last 30 days" in _texts(result.document), (
+        f"a whole-unit value vanished to zero trace: {result.document.unplaced_rows}"
     )
-    assert not _r23(result), [f.message for f in _r23(result)]
+    assert "within last 30 days" not in _descriptions(result.document), (
+        f"it was folded into a claim description instead: {result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for a live, unowned figure"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_narrative_is_traced_across_the_money_column_it_crosses(tmp_path):
     """"reported within | 30 to | 60 days" over Description, Paid, Incurred.
 
-    Correction-8 update: "30 to" and "60 days" are two separate physical
-    cells, and this test originally asserted that reading them as one
-    range -- "30 to 60 days" -- was safe. An independent review found that
-    the same cross-cell reach, applied to a label instead of a range tail,
-    was letting whole-dollar figures ("held for | 45000 | days") vanish
-    into an unrelated claim's own description. Correction-8 retired the
-    reach for both shapes at once: a unit word has to be in the *same*
-    cell as the number it excuses, and "60 days" in the next cell is not
-    evidence about what "30 to" is, any more than a label three cells away
-    would be.
-
-    So "60 days" keeps its own exemption -- the digit and its unit are
-    both printed in that one cell, which is exactly the proof this unit
-    still accepts -- but "30 to" now correctly stays live: nothing in its
-    own cell says what the dangling "to" was pointing at, and a range
-    fragment split across a column boundary is precisely the kind of
-    uncertainty R-23 exists to surface rather than paper over.
+    Correction-9 update: correction-8 kept "60 days" exempt because its
+    digit and unit are printed in one cell -- proof, at the time, that the
+    reading was safe. An independent review found that a cell boundary
+    does not actually prove that: the extraction layer can bucket a stray
+    word into a money column, or cluster two logically separate fields
+    into one reported cell, on nothing more than how close together they
+    happened to render on the page. Correction-9 retired the same-cell
+    duration/count exemption entirely, so "60 days" now joins "30 to" as
+    live, unresolved evidence -- both figures stay visible for review
+    rather than either one being waved through on a cell boundary's say-so.
     """
     path = _write(
         tmp_path / "narrative.pdf",
@@ -376,14 +387,18 @@ def test_a_narrative_is_traced_across_the_money_column_it_crosses(tmp_path):
         f"a range fragment split across a column boundary vanished to zero "
         f"trace: {carried}"
     )
-    assert "60 days" not in carried, (
-        f"a genuine same-cell duration raised a false R-23: {carried}"
+    assert "60 days" in carried, (
+        f"a whole-unit value vanished to zero trace: {carried}"
     )
     assert "30 to" not in _descriptions(result.document), (
         f"the fragment was folded into a claim description instead: "
         f"{result.document.claims}"
     )
-    assert _r23(result), "no R-23 finding was raised for a live, unowned fragment"
+    assert "60 days" not in _descriptions(result.document), (
+        f"the value was folded into a claim description instead: "
+        f"{result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for live, unowned evidence"
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
@@ -455,21 +470,18 @@ def test_an_unreadable_grand_total_outranks_a_readable_subtotal(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_a_paragraph_ending_in_a_money_grid_is_not_evidence(tmp_path):
+def test_a_paragraph_ending_in_a_money_grid_now_needs_review(tmp_path):
     """A disclaimer wrapped across a block that maps nothing but money.
 
-    There is no non-money column here for the narrative trace to reach, and
-    the last line of the paragraph -- "last 30 days." -- carries a digit and
-    stands alone in the first column with nothing to its left. Every test that
-    reads along the row runs out of row.
-
-    The evidence is the line above it: several columns of text, not one cell
-    of which yields an amount, is a paragraph line, and a short line under it
-    that also yields nothing is where that paragraph ended.
-
-    Deliberately narrow, and the control below is what keeps it so: the row
-    above must span more than one column, so a lone refused figure never lends
-    its line to the row beneath it.
+    Correction-9 update: the last line of the paragraph -- "last 30 days."
+    -- carries a digit and duration wording in one cell, and this test
+    originally trusted that shape, plus the paragraph text on the rows
+    above it, as proof the line was prose rather than a figure. That is
+    exactly the kind of row-shape inference correction-9 retires: the row
+    above being all text is not one of the narrow mechanisms (an explicit
+    label tied to this value, a page marker, a validated date, or an actual
+    non-money column) that may still prove a digit-bearing money-column
+    cell is not money. The figure must now survive as unresolved evidence.
 
     Reproduced synthetically from a corpus document (spec section 9): a real
     loss run ends its money grid with exactly this notice.
@@ -489,10 +501,16 @@ def test_a_paragraph_ending_in_a_money_grid_is_not_evidence(tmp_path):
         headers=money_headers,
     )
     result = run_pipeline(path, use_vision=False)
-    assert "last 30 days." not in _texts(result.document), (
-        f"the tail of a paragraph became monetary evidence: "
+    assert "last 30 days." in _texts(result.document), (
+        f"a whole-unit value vanished to zero trace: "
         f"{[(r.page, r.row, r.ambiguous_values) for r in result.document.unplaced_rows]}"
     )
+    assert "last 30 days." not in _descriptions(result.document), (
+        f"the tail of a paragraph was folded into a claim description "
+        f"instead: {result.document.claims}"
+    )
+    assert _r23(result), "no R-23 finding was raised for a live, unowned figure"
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_lone_refused_figure_does_not_lend_its_line_to_the_next(tmp_path):
