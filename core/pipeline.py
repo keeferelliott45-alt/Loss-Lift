@@ -1764,10 +1764,35 @@ def run_pipeline(
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
-    processed_pages = set(extraction.page_texts)
+    # A page carrying a rasterised loss run under a one-line heading answers
+    # the only question classification asks -- how many characters came off it
+    # -- with the heading. It clears the scanned-page threshold, takes the
+    # digital path, and is recorded as processed because text was extracted
+    # from it, while the table inside the picture is never read by anything.
+    #
+    # The picture is not evidence that claims are there and not evidence that
+    # they are not. It is unread source content, so the page stays unresolved
+    # and R-22 asks for it to be looked at. A page whose table was read is
+    # accounted for whatever is printed behind it, which is what keeps a
+    # watermark or a letterhead from raising anything.
+    read_table_pages = {
+        table.page for table in tables if table.rows or table.total_rows
+    }
+    unread_image_pages = {
+        page.page
+        for page in classification.pages
+        if not page.is_scanned and page.carries_unread_image
+    } - read_table_pages
+    processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
-    unresolved_pages: set[int] = set()
+    unresolved_pages: set[int] = set(unread_image_pages)
+    if unread_image_pages:
+        joined = ", ".join(str(page) for page in sorted(unread_image_pages))
+        warnings.append(
+            f"Page(s) {joined} are mostly picture and nothing read what the "
+            f"picture holds. Whether they carry claims is unknown."
+        )
 
     scanned_pages = classification.scanned_pages
     vision_tables: list[RawTable] = []
