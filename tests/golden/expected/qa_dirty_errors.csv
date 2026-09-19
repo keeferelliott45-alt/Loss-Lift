@@ -1,0 +1,2 @@
+claim_number,date_of_loss,claim_status,paid_total,reserve_total,incurred_total
+ERR-001,2021-11-15,CLOSED,50000.00,10000.00,55000.00

@@ -1,0 +1,100 @@
+{
+  "ALLIANZ GLOBAL": {
+    "money": 1.0,
+    "money_fields": 3,
+    "other": 1.0,
+    "other_fields": 3,
+    "rows": 1
+  },
+  "ATLANTIC STATES INS CO": {
+    "money": 1.0,
+    "money_fields": 42,
+    "other": 1.0,
+    "other_fields": 24,
+    "rows": 6
+  },
+  "Continental Benefit Mutual": {
+    "money": 1.0,
+    "money_fields": 316,
+    "other": 1.0,
+    "other_fields": 230,
+    "rows": 44
+  },
+  "Cornerstone Specialty Insurance": {
+    "money": 1.0,
+    "money_fields": 18,
+    "other": 1.0,
+    "other_fields": 36,
+    "rows": 6
+  },
+  "Fairmount Underwriters": {
+    "money": 1.0,
+    "money_fields": 11,
+    "other": 1.0,
+    "other_fields": 24,
+    "rows": 4
+  },
+  "Great Basin Indemnity": {
+    "money": 1.0,
+    "money_fields": 17,
+    "other": 1.0,
+    "other_fields": 36,
+    "rows": 6
+  },
+  "Keystone Regional Insurance": {
+    "money": 1.0,
+    "money_fields": 11,
+    "other": 1.0,
+    "other_fields": 24,
+    "rows": 4
+  },
+  "Meridian Casualty Company": {
+    "money": 1.0,
+    "money_fields": 18,
+    "other": 1.0,
+    "other_fields": 36,
+    "rows": 6
+  },
+  "Northgate Fire & Marine": {
+    "money": 1.0,
+    "money_fields": 40,
+    "other": 1.0,
+    "other_fields": 84,
+    "rows": 14
+  },
+  "Rheinland Allgemeine Versicherung AG": {
+    "money": 1.0,
+    "money_fields": 18,
+    "other": 1.0,
+    "other_fields": 36,
+    "rows": 6
+  },
+  "STATE AUTO": {
+    "money": 1.0,
+    "money_fields": 6,
+    "other": 1.0,
+    "other_fields": 6,
+    "rows": 2
+  },
+  "Statewide Mutual Insurance": {
+    "money": 1.0,
+    "money_fields": 46,
+    "other": 1.0,
+    "other_fields": 30,
+    "rows": 6
+  },
+  "TEST CARRIER": {
+    "money": 1.0,
+    "money_fields": 3,
+    "other": 1.0,
+    "other_fields": 3,
+    "rows": 1
+  },
+  "TRAVELERS INSURANCE": {
+    "money": 1.0,
+    "money_fields": 5,
+    "other": 1.0,
+    "other_fields": 6,
+    "rows": 2
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "stress_obscure_headers_eu_credit",
+  "description": "5 of 9 column labels the vocabulary cannot place (claim number, both dates, claimant, net loss), EUR amounts, dd/mm/yyyy dates, recoveries printed as credits, and three pages -- the mapping screen, EU parsing, the credit-sign inference and repeated headers all have to work together at once",
+  "carrier": "Nordic Assurance Partners",
+  "named_insured": "Baltic Cold Chain Logistics",
+  "policy_number": "NAP/2024/03318",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "EUR",
+  "locale_hint": "eu",
+  "claim_count": 9,
+  "printed_claim_count": 9,
+  "printed_totals": {
+    "paid_total": "17196.75",
+    "reserve_total": "31365.00",
+    "recovery_total": "1080.00",
+    "incurred_total": "47481.75"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

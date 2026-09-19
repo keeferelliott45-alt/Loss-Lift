@@ -1,0 +1,2779 @@
+"""Stage orchestration — ingest through reconcile.
+
+``app.py`` calls this and nothing else, so every stage stays runnable and
+testable without Streamlit.  Nothing here talks to the UI, and nothing in the
+UI does any of this work.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field, field as dataclass_field
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Sequence
+
+from core import extract_digital
+from core.classify import DocumentClassification, classify_pdf
+from core.extract_digital import (
+    _COUNT_PATTERNS,
+    document_claim_count,
+    counted_claim_evidence,
+    _first_match,
+    CLAIM_COUNT_LABEL,
+    COUNTED_TOTAL_LABEL,
+    DocumentMetadata,
+)
+from core.ingest import IngestedFile, ingest_path
+from core.normalize import (
+    DateOrderInference,
+    LocaleInference,
+    RecoverySignInference,
+    clean_text,
+    infer_date_order,
+    infer_locale,
+    infer_recovery_sign,
+    parse_bool,
+    parse_date,
+    parse_int,
+    parse_money,
+    _strip_currency,
+    CURRENCY_CODES,
+    CURRENCY_SYMBOLS,
+    parse_status,
+    normalize_label,
+    parse_text,
+)
+from core.profiles import (
+    guess_document_field,
+    CarrierProfile,
+    fingerprint,
+    load_profile,
+    page_top_text,
+    resolve_columns,
+)
+from core.records import (
+    consensus_shapes,
+    is_identifier_candidate,
+    leading_identifier,
+)
+from core.reconcile import ReconcileConfig, reconcile
+from core.review import (
+    LOCAL_REVIEWER,
+    ReviewAction,
+    resolution_for,
+    summarise_review,
+)
+from core.schema import (
+    DATE_FIELDS,
+    Finding,
+    FindingScope,
+    MONEY_FIELDS,
+    Claim,
+    ClaimStatus,
+    LineOfBusiness,
+    LossRunDocument,
+    ColumnMappingRecord,
+    MappingState,
+    NullReason,
+    PrintedSection,
+    RawRow,
+    RawTable,
+    ReconciliationResult,
+    UnplacedRow,
+    Resolution,
+    SourceMethod,
+)
+
+
+#: Labels that mark the one total covering every claim, not a section subtotal.
+GRAND_TOTAL_PATTERN = re.compile(
+    r"\b(?:grand|report|overall|final)\s+totals?\b", re.IGNORECASE
+)
+
+
+@dataclass
+class ColumnMapping:
+    """Which canonical field each printed column carries."""
+
+    headers: list[str]
+    fields: dict[int, str | None]
+    source: str = "heuristic"  # profile | heuristic | llm | manual
+    fingerprint: str = ""
+    #: Per column, what was decided and why. Carries the columns that lost a
+    #: contest, which `fields` cannot represent: it only has room for a None.
+    decisions: list[ColumnMappingRecord] = field(default_factory=list)
+
+    @property
+    def mapped_fields(self) -> set[str]:
+        return {name for name in self.fields.values() if name}
+
+    @property
+    def unmapped_columns(self) -> list[int]:
+        return [index for index, name in self.fields.items() if not name]
+
+    def index_of(self, field_name: str) -> int | None:
+        for index, name in self.fields.items():
+            if name == field_name:
+                return index
+        return None
+
+    def is_usable(self) -> bool:
+        """A mapping is usable once it can identify a claim and an amount."""
+        return "claim_number" in self.mapped_fields and bool(
+            self.mapped_fields & set(MONEY_FIELDS)
+        )
+
+
+@dataclass
+class ExtractionResult:
+    """Everything the review screen needs about one document."""
+
+    document: LossRunDocument
+    reconciliation: ReconciliationResult
+    mapping: ColumnMapping
+    classification: DocumentClassification
+    locale: LocaleInference
+    date_order: DateOrderInference
+    recovery_sign: RecoverySignInference = field(
+        default_factory=RecoverySignInference
+    )
+    tables: list[RawTable] = field(default_factory=list)
+    profile: CarrierProfile | None = None
+    warnings: list[str] = field(default_factory=list)
+    #: The staged upload, while it is still on disk. Evidence is shown from the
+    #: document itself, so the review screen needs a way back to it. Session
+    #: state, not part of the canonical model: the file is deleted after export
+    #: (spec section 9) and this becomes None, without taking the page numbers,
+    #: regions and cell text with it.
+    source_path: Path | None = None
+
+    @property
+    def needs_mapping(self) -> bool:
+        return not self.mapping.is_usable()
+
+
+# --------------------------------------------------------------------------
+# Column mapping
+# --------------------------------------------------------------------------
+
+
+def build_mapping(
+    headers: Sequence[str],
+    profile: CarrierProfile | None = None,
+    fingerprint_value: str = "",
+    *,
+    samples: Sequence[Sequence[str]] = (),
+    use_llm: bool = False,
+    llm_client: Any | None = None,
+) -> ColumnMapping:
+    """Resolve headers to fields: saved profile, then vocabulary, then the LLM.
+
+    A matching profile means zero LLM calls — the compounding moat in spec
+    section 2. The LLM is consulted only for headers the vocabulary could not
+    place, and only when the caller asks for it.
+    """
+    guesses, source = resolve_columns(
+        headers,
+        samples,
+        profile=profile,
+        fingerprint_value=fingerprint_value,
+        use_llm=use_llm,
+        client=llm_client,
+    )
+    states = {
+        "profile": MappingState.PROFILE_MATCH,
+        "llm": MappingState.MODEL_MAPPED,
+        "contested": MappingState.AMBIGUOUS,
+        "unmapped": MappingState.UNMAPPED,
+    }
+    decisions = [
+        ColumnMappingRecord(
+            source_index=index,
+            source_header_raw=headers[index] if index < len(headers) else "",
+            source_header_normalized=normalize_label(
+                headers[index] if index < len(headers) else ""
+            ),
+            canonical_field=guess.field,
+            state=states.get(guess.source, MappingState.DETERMINISTIC),
+            contested_field=guess.contested_field,
+        )
+        for index, guess in sorted(guesses.items())
+    ]
+    if source == "profile_mismatch":
+        decisions.append(
+            ColumnMappingRecord(
+                source_index=-1,
+                source_header_raw="Saved profile",
+                source_header_normalized="saved profile",
+                state=MappingState.AMBIGUOUS,
+                mapping_issue=(
+                    "The saved profile's source-column structure does not "
+                    "uniquely match this document. The profile was not applied; "
+                    "normal mapping was used and the result requires review."
+                ),
+            )
+        )
+    return ColumnMapping(
+        headers=list(headers),
+        fields={index: guess.field for index, guess in guesses.items()},
+        source=source,
+        fingerprint=fingerprint_value,
+        decisions=decisions,
+    )
+
+
+# --------------------------------------------------------------------------
+# Stage 4 — normalise rows into claims
+# --------------------------------------------------------------------------
+
+
+def _row_values(row: RawRow, mapping: ColumnMapping) -> dict[str, str]:
+    """The row's cells keyed by canonical field."""
+    values: dict[str, str] = {}
+    for index, field_name in mapping.fields.items():
+        if field_name:
+            values[field_name] = row.cell(index).strip()
+    return values
+
+
+def build_claim(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+    date_order: str | None,
+    *,
+    dash_means_zero: bool = False,
+    source_method: SourceMethod = SourceMethod.DIGITAL,
+    confidence_cap: float = 1.0,
+) -> Claim | None:
+    """Turn one raw row into a claim, recording why any field is null."""
+    values = _row_values(row, mapping)
+    claim_number = clean_text(values.get("claim_number", ""))
+    if not claim_number:
+        return None
+
+    issues: dict[str, NullReason] = {}
+    confidence: dict[str, float] = {}
+    raw_cells: dict[str, str] = {}
+    fields: dict[str, Any] = {}
+    currencies: set[str] = set()
+
+    for field_name, raw in values.items():
+        if field_name == "claim_number":
+            continue
+        raw_cells[field_name] = raw
+
+        if field_name in MONEY_FIELDS:
+            parsed = parse_money(raw, locale, dash_means_zero=dash_means_zero)
+            fields[field_name] = parsed.value
+            if parsed.value is None and parsed.reason:
+                issues[field_name] = parsed.reason
+            if parsed.currency:
+                currencies.add(parsed.currency)
+            confidence[field_name] = min(
+                confidence_cap, 1.0 if parsed.value is not None else 0.0
+            )
+        elif field_name in DATE_FIELDS:
+            parsed_date = parse_date(raw, date_order)
+            fields[field_name] = parsed_date.value
+            if parsed_date.value is None and parsed_date.reason:
+                issues[field_name] = parsed_date.reason
+            confidence[field_name] = min(
+                confidence_cap, 1.0 if parsed_date.value is not None else 0.0
+            )
+        elif field_name == "claim_status":
+            status = parse_status(raw)
+            fields["claim_status"] = status
+            confidence["claim_status"] = min(
+                confidence_cap, 1.0 if status is not ClaimStatus.UNKNOWN else 0.0
+            )
+        elif field_name in ("litigation_flag", "medical_only_flag"):
+            fields[field_name] = parse_bool(raw)
+            confidence[field_name] = confidence_cap
+        else:
+            fields[field_name] = parse_text(raw)
+            confidence[field_name] = confidence_cap
+
+    raw_cells["claim_number"] = values.get("claim_number", "")
+    confidence["claim_number"] = confidence_cap
+
+    return Claim(
+        claim_number=claim_number,
+        source_page=row.page,
+        source_row=row.line_index,
+        source_bbox=row.bbox,
+        source_lines=list(row.source_lines),
+        source_method=source_method,
+        field_issues=issues,
+        field_confidence=confidence,
+        raw_cells=raw_cells,
+        currency=sorted(currencies)[0] if len(currencies) == 1 else None,
+        **fields,
+    )
+
+
+#: "Page 3 of 8" and friends. A footer often shares its line with a strapline,
+#: and the page number is the one part that changes, so it has to come out
+#: before two pages' footers can be compared.
+_PAGE_MARKER = re.compile(r"\bpage\s+\d+\s*(?:of\s*\d+)?\b", re.IGNORECASE)
+
+
+def _normalised(row: RawRow) -> str:
+    text = " ".join(row.text().lower().split())
+    return " ".join(_PAGE_MARKER.sub(" ", text).split())
+
+
+def page_furniture(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping | None = None,
+    locale: str | None = None,
+) -> set[str]:
+    """Row text that repeats across pages: a running header, footer or strapline.
+
+    A claim appears once. A line printed on most pages of the document is the
+    carrier's letterhead, its tagline or a column caption, and treating those as
+    skipped claim data buries the warnings that matter under one entry per page.
+    Needs at least two pages: on a single page a repeated line cannot be told
+    apart from data.
+
+    Repetition alone is not enough where the row carries figures. A spreadsheet
+    paginated by column repeats the same amounts on every page it spans, and a
+    whole-unit amount repeated three times is three unplaced figures, not one
+    strapline seen three times. A row carrying numeric evidence is therefore
+    never pooled here, however often it appears.
+
+    What comes back is the repeated *text*, which is the evidence that a line
+    repeats -- not a verdict on any particular line. Each occurrence is judged
+    again where the pool is consulted, because a line can be a running footer
+    on one page and a figure on another, and the occurrence that looks like
+    furniture must not reach across the document and delete the one that does
+    not.
+    """
+    pages = {table.page for table in tables}
+    if len(pages) < 2:
+        return set()
+
+    seen: dict[str, set[int]] = {}
+    for table in tables:
+        table_mapping = mapping_for(table, mapping) if mapping is not None else None
+        for row in list(table.rows) + list(table.total_rows):
+            carries = table_mapping is not None and _carries_numeric_evidence(
+                row, table_mapping, locale
+            )
+            if carries:
+                continue
+            text = _normalised(row)
+            if text:
+                seen.setdefault(text, set()).add(table.page)
+    threshold = max(2, len(pages) // 2)
+    return {text for text, on in seen.items() if len(on) >= threshold}
+
+
+def _continuation_text(row: RawRow, mapping: ColumnMapping) -> str | None:
+    """Text from a wrapped row that belongs to the claim above it."""
+    values = _row_values(row, mapping)
+
+    # A wrapped description runs the width of the row, so its words land in
+    # whichever columns they cross, money and date columns included. What marks
+    # a row as data is whether those cells parse: "WHEEL" under a date column
+    # is prose, and rejecting the row for it drops the description entirely.
+    for index, name in mapping.fields.items():
+        if name not in MONEY_FIELDS:
+            continue
+        if (
+            parse_money(values.get(name, ""), None).value is not None
+            and not _is_same_row_narrative(row, mapping, index)
+        ):
+            return None
+    for name in DATE_FIELDS:
+        if parse_date(values.get(name, ""), None).value is not None:
+            return None
+
+    # Reading only the text-typed columns truncated the description at the
+    # first column boundary, so take the whole line.
+    return clean_text(" ".join(row.cells)) or None
+
+
+#: How a printed amount is customarily written. Used only as *corroboration*
+#: on a table already established as carrying claims -- never on its own. As a
+#: gate it was wrong in both directions: it threw away a whole-unit "9400" and
+#: every "0.00", and it admitted "2024.00" and "45292.00" because a year and an
+#: Excel date serial carry a decimal point like anything else.
+_FINANCIAL_NOTATION = re.compile(
+    r"[.,()]|[$€£¥₤₹₽]|^[+-]|[+-]$|\b(?:CR|DR)\b", re.IGNORECASE
+)
+
+#: A row that says outright what its number is. This is the row's own words --
+#: source evidence, the same kind ``is_structural_row`` already reads -- and it
+#: is consulted only where nothing else has established the row as claim data.
+#: It cannot be exhaustive and is not meant to be: a label it does not know
+#: leaves the value *unresolved*, which is reported, rather than money, which
+#: would be invented.
+_NAMES_A_NON_MONEY_VALUE = re.compile(
+    r"\b(?:software\s+)?version\b"
+    r"|\b(?:policy|calendar|fiscal|accident|loss)\s+year\b"
+    r"|\bexcel(?:\s+serial)?(?:\s+date)?\b|\bdate\s+serial\b"
+    r"|\b(?:print|printed|report|reported|valuation|as\s+of)\s+date\b"
+    r"|\b(?:policy|claim|claimant|file|account)\s*(?:identifier|id|ref|reference|no)\b"
+    r"|\b(?:page|row|column|line)\s*(?:index|number|no|count)\b",
+    re.IGNORECASE,
+)
+
+#: A trailing credit or debit marker is a word, not a second number, so it is
+#: stripped before anything asks whether the digits before it are one amount
+#: or two.
+_CREDIT_SUFFIX = re.compile(r"\s+(?:CR|DR)\s*$", re.IGNORECASE)
+
+#: One group of a space-grouped number: exactly three digits, or three digits
+#: carrying the one decimal fraction a final group may end in. Money is always
+#: grouped in threes counting from the right, whichever character does the
+#: grouping, so this is the same rule "1,234" and "1.234" already use --
+#: applied here to the group *after* a space rather than a comma or a period.
+_GROUP_CONTINUATION = re.compile(r"^\d{3}(?:[.,]\d+)?$")
+
+#: Every way a currency is marked on a cell: the symbols, longest first so
+#: "US$" is not read as a bare "$", and the ISO codes standing as whole words.
+_CURRENCY_MARK = re.compile(
+    "|".join(
+        [
+            *(re.escape(symbol) for symbol in sorted(CURRENCY_SYMBOLS, key=len, reverse=True)),
+            r"(?<![A-Za-z])(?:%s)(?![A-Za-z])" % "|".join(sorted(CURRENCY_CODES)),
+        ]
+    ),
+    re.IGNORECASE,
+)
+
+
+def _reads_as_money(text: str, locale: str | None) -> bool:
+    """Whether this cell yields one confident amount."""
+    return not _is_smeared(text) and parse_money(text, locale).value is not None
+
+
+_FINANCIAL_DIRECTION = re.compile(
+    r"^\s*[+-]|[+-]\s*$|\b(?:CR|DR)\b", re.IGNORECASE
+)
+_DATE_TOKEN = re.compile(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b")
+_DATE_CONTEXT = re.compile(
+    r"\b(?:as\s+of|date|dated|from|on|period|term|through|to)\b",
+    re.IGNORECASE,
+)
+_NUMBER_TOKEN = re.compile(r"\d+(?:[.,']\d+)*")
+
+
+def _has_explicit_financial_marker(text: str) -> bool:
+    """Whether the source explicitly presents this cell as financial."""
+    return bool(_CURRENCY_MARK.search(text) or _FINANCIAL_DIRECTION.search(text))
+
+
+def _contiguous_span(row: RawRow, index: int) -> tuple[int, int]:
+    """Non-blank cells joined to ``index``; a blank column breaks the run."""
+    first = index
+    while first and row.cell(first - 1).strip():
+        first -= 1
+    last = index
+    while last + 1 < len(row.cells) and row.cell(last + 1).strip():
+        last += 1
+    return first, last
+
+
+def _is_same_row_narrative(row: RawRow, mapping: ColumnMapping, index: int) -> bool:
+    """Whether this exact numeric cell has a proven non-money role in prose.
+
+    Words on both sides are not enough: ``deductible is | 500 | per claim``
+    is grammatical and still carries unresolved financial evidence. Only two
+    things are accepted as proof that a digit-bearing cell in a mapped money
+    column is not money: the cell is entirely a page marker, or it is a date
+    in date/term grammar. These are candidate-local relationships; a reading
+    elsewhere on the row cannot excuse a different amount, and no previous
+    row gets to decide what this one means.
+
+    Explicit currency or debit/credit/sign notation always wins.  Where the
+    row permits both readings, the function returns false so R-23 preserves
+    the uncertainty rather than folding it into another claim.
+
+    Duration and count grammar -- "held for | 500 | days", "500 days" in one
+    cell, "number of | 9400 | claims" -- was tried twice and retired both
+    times: reading it across cells could not tell a genuine duration from a
+    disguised amount for any label outside a short denylist, and reading it
+    from one cell instead could not tell either, because the cell boundary
+    itself is not evidence of what the carrier printed together.
+    ``assign_to_columns`` in the extraction layer buckets a stray word into a
+    money column whenever its midpoint drifts within slack its own docstring
+    calls "most of a column" wide, and ``split_words`` groups words into one
+    cell on a bare position gap with no notion of which field a word belongs
+    to -- this codebase already has a test proving a single reported cell can
+    carry text smeared in from a neighbouring column
+    (``test_an_identifier_smeared_with_a_neighbouring_column_is_kept``).
+
+    List markers were the third exemption and are retired for the identical
+    reason. ``(500)``, ``500.``, and ``9400)`` match a leading list-marker
+    pattern exactly as well as a genuine ``(4)`` does -- the pattern is
+    purely syntactic, parentheses are also valid accounting-negative
+    notation, and a row reaching ten or more words proves only that the row
+    is long, not that this cell's number is an index rather than an amount.
+    A disclaimer paragraph and a disguised amount look identical from here.
+    No replacement heuristic is used: not a higher or different word-count
+    threshold, not a magnitude limit on the number, not a phrase list, and
+    not a check for a genuine sibling sequence ("(1) ... (2) ... (3)")
+    elsewhere in the document -- each would only relocate which shape of
+    adjacent text gets trusted, the same mistake duration and count grammar
+    already made twice. A cell boundary records how two geometric heuristics
+    clustered words on one page, not what the source meant, so nothing about
+    a cell's own text -- its printed form, its neighbours, or how long the
+    row around it runs -- is read as proof of a non-money role any more. A
+    genuine duration, count, or list-numbered column is a column-mapping
+    question (:func:`_labelled_values`, or an actual non-money field), not a
+    per-cell guess.
+    """
+    text = row.cell(index).strip()
+    if not text or _has_explicit_financial_marker(text):
+        return False
+    if not _PAGE_MARKER.sub("", text).strip():
+        return True
+    digits = [position for position, character in enumerate(text) if character.isdigit()]
+    if not digits:
+        return False
+
+    first, last = _contiguous_span(row, index)
+    before = " ".join(
+        [*(row.cell(position).strip() for position in range(first, index)),
+         text[: digits[0]]]
+    )
+    after = " ".join(
+        [text[digits[-1] + 1 :],
+         *(row.cell(position).strip() for position in range(index + 1, last + 1))]
+    )
+
+    # A date is exempt only when its own shape already does the proving: an
+    # unambiguous date token that goes on to parse, with nothing else in the
+    # cell -- a count fused to a date at a column boundary, "4 5/23/2023", is
+    # refused because the cell is not one value. Surrounding words only
+    # narrow this reading further; they are never asked to supply, by
+    # themselves, the one fact a bare integer has no shape of its own to
+    # offer, which is exactly why no equivalent exemption exists above for
+    # duration, count, or list-marker grammar.
+    date_token = _DATE_TOKEN.search(text)
+    if date_token:
+        remainder = text[: date_token.start()] + text[date_token.end() :]
+        if (
+            not any(character.isdigit() for character in remainder)
+            and parse_date(date_token.group(), None).value is not None
+            and _DATE_CONTEXT.search(f"{before} {after}")
+        ):
+            return True
+
+    return False
+
+
+def _numeric_cells(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+) -> tuple[dict[str, tuple[str, Decimal]], dict[str, str]]:
+    """Money-column cells, split into what parsed and what could not be read.
+
+    The second half is what this thread exists for: a cell refused as a value
+    is still a printed figure nobody placed. Keeping it is the default, and
+    discarding it needs a positive reason.
+
+    That is the correction. An earlier rule required a *reason to keep*: the
+    cell's column had to out-poll its own failures, counting readable cells
+    against unreadable ones. Absence of corroboration was read as proof of
+    prose, which made the rule non-monotonic -- one merged cell on a page of
+    claims survived, and a second one sank both, because the second failure
+    changed the poll that protected the first. No rule that preserves evidence
+    may lose more of it as more arrives.
+
+    So the question is inverted. A cell in a mapped money column carrying a
+    digit is a figure nobody placed unless the row says otherwise, and the row
+    can say so in exactly two ways, both of them positive: it establishes
+    itself as claim data (a date and a status are what a claim line carries
+    and a wrapped sentence does not, so a claim line whose identifier went
+    missing is the one row most likely to be holding an amount nobody else
+    will report -- and neither of the checks below applies to it); or the
+    exact cell has a proven non-money role in the row's own words, decided by
+    :func:`_is_same_row_narrative` on that cell alone. No row above or below
+    this one is consulted for either question: cross-row reasoning was tried
+    and removed, because a row of unresolved figures above this one has the
+    same shape -- "several populated cells, none of them money" -- as a row
+    of genuine prose, and letting it license discarding the row after it
+    turned one row of refused evidence into an excuse to discard a second.
+
+    A cell classified as narrative is refused *both* channels, not merely
+    demoted from parsed to unreadable: the classifier's whole claim is that
+    the figure is not a figure at all -- a page marker or a date -- and
+    reporting it as unresolved evidence would put a proven non-issue on the
+    exceptions list. That claim has to be earned; see
+    :func:`_is_same_row_narrative` for what it takes to prove it, and note
+    that a cell which merely *parses* as money is never on that account alone
+    treated as proven narrative -- a confident amount reaches this function's
+    output in one channel or the other, never neither.
+
+    The digit requirement stays: it is not a count of the cell's numbers but
+    the precondition for there being numeric evidence at all. "LEFT SHOULDER"
+    is an injury that reached a money column, and there is no figure in it to
+    lose.
+    """
+    values = _row_values(row, mapping)
+    parsed: dict[str, tuple[str, Decimal]] = {}
+    unreadable: dict[str, str] = {}
+    established = _row_establishes_claim_data(values)
+    for index, name in sorted(mapping.fields.items()):
+        if name not in MONEY_FIELDS:
+            continue
+        text = (values.get(name) or "").strip()
+        if not text:
+            continue
+        narrative = not established and _is_same_row_narrative(row, mapping, index)
+        if _reads_as_money(text, locale):
+            if not narrative:
+                value = parse_money(text, locale).value
+                if value is not None:
+                    parsed[name] = (text, value)
+        elif any(character.isdigit() for character in text) and not narrative:
+            unreadable[name] = text
+    return parsed, unreadable
+
+
+def _marks_two_amounts(text: str) -> bool:
+    """Whether a currency marker sits *between* this cell's digits.
+
+    Carriers put the marker at one end of an amount or the other: "$1,234.56",
+    "5.700,50 €", "$ 1 234,56", and even "$1,234.56 USD" keep every marker
+    outside the digits. No convention writes one between the groups of a
+    single number, so a marker with digits on both sides of it is a second
+    amount's marker, and the cell holds two amounts.
+
+    Position rather than a count of markers, because the count is wrong in
+    both directions: "$1,234.56 USD" carries two and is one amount, and a cell
+    could hold two amounts of which only the second is marked.
+    """
+    for mark in _CURRENCY_MARK.finditer(text):
+        before, after = text[: mark.start()], text[mark.end() :]
+        if any(ch.isdigit() for ch in before) and any(ch.isdigit() for ch in after):
+            return True
+    return False
+
+
+def _is_smeared(text: str) -> bool:
+    """Whether the space in this cell glues two unrelated numbers together.
+
+    A carrier's own space-grouped thousands -- "1 234,56", the French and
+    non-breaking-space convention section 4 lists -- puts exactly three digits
+    in every group after the first. "4 .00" and "36571 44694" do not: a
+    fragment with no digits before its punctuation, or a second run that is
+    not three digits, is not a continuation of the number before it. It is a
+    second, unrelated figure a column boundary ran together with the first --
+    "4" is a section marker, "30,000.00" is the amount beside it, and reading
+    the pair as one number invents a figure nobody printed.
+
+    Only the space is in question here. A comma or a period inside one token
+    already tells its own story and is left to :func:`parse_money`; this asks
+    only whether the *whitespace* is doing a printer's job or an accident's.
+
+    A currency symbol is not one of the number's groups. "5.700,50 €" is one
+    amount printed the way half of Europe prints it, and counting the euro sign
+    as a second group condemned the whole cell -- which on a totals row means
+    the carrier's own printed figure is thrown away, and on an unplaced row
+    means real money goes unreported. It is removed before the question is
+    asked, along with the credit marker, for the same reason.
+
+    Removing the markers first is also how a cell holding *two* marked amounts
+    came to read as one: "$1 $234" left "1 234", which is a perfectly good
+    space-grouped twelve hundred and thirty-four, and nothing on the page says
+    that. So the markers are asked where they sit before they are taken away.
+    """
+    if _marks_two_amounts(text):
+        return True
+    tokens = _strip_currency(_CREDIT_SUFFIX.sub("", text))[0].split()
+    if len(tokens) < 2:
+        return False
+    return not all(_GROUP_CONTINUATION.match(token) for token in tokens[1:])
+
+
+@dataclass(frozen=True)
+class UnplacedEvidence:
+    """What a row nothing could place was carrying, split by how sure we are.
+
+    ``amounts`` are values the row or its table established as money.
+    ``ambiguous`` are values read under a money column that nothing
+    established either way. Keeping them apart is the whole point: only the
+    first may be called an amount, and both must be reported.
+    """
+
+    amounts: dict[str, tuple[str, Decimal]]
+    ambiguous: dict[str, tuple[str, Decimal]]
+    #: Cells refused as values because a column boundary ran two numbers
+    #: together. Text only: there is deliberately no number here, since any
+    #: number would be one the page never printed.
+    unreadable: dict[str, str] = dataclass_field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.amounts or self.ambiguous or self.unreadable)
+
+
+def _row_establishes_claim_data(values: dict[str, str]) -> bool:
+    """Whether the row itself reads as a claim whose number was not caught.
+
+    A parsed status or a parsed date in a mapped column is the row saying it
+    is claim data, independently of anything numeric on it. That is evidence
+    about this row, not about the shape of its digits.
+    """
+    if parse_status(values.get("claim_status", "")) is not ClaimStatus.UNKNOWN:
+        return True
+    return any(
+        parse_date(values.get(field, ""), None).value is not None
+        for field in DATE_FIELDS
+    )
+
+
+#: A number as a label writes one, so "Policy year 2024" can be compared with
+#: the "2024.00" beside it. Used only for that comparison -- never to decide
+#: what a cell is, only whether two cells state the same figure.
+_NUMBER_IN_A_LABEL = re.compile(r"\d[\d,.']*")
+
+#: A label saying it has nothing to state. "Version unknown" matches the same
+#: base vocabulary as "Policy year" or "Software version" and, carrying no
+#: digit of its own, would otherwise be trusted to name whatever cell comes
+#: next -- but "unknown" is not a naming of that cell, it is the row admitting
+#: there is nothing here to name. Narrow and used only to stop this one
+#: mechanism trusting a label that has just disclaimed having a value; it does
+#: not decide what anything else on the row is.
+_STATES_NO_VALUE = re.compile(
+    r"\bunknown\b|\bn\s*(?:[./]\s*)?a\.?(?=\W|$)|\bunavailable\b|"
+    r"\bmissing\b|\btbd\b|\bnone\b|"
+    r"\bnot\s+(?:applicable|available|known|provided|stated)\b",
+    re.IGNORECASE,
+)
+
+
+def _labelled_values(row: RawRow, mapping: ColumnMapping) -> set[str]:
+    """Mapped money fields whose values the row's own words explain.
+
+    "Policy year" printed beside "2024.00" is the row saying what its number
+    is. The label explains the value it introduces -- the next populated cell
+    along the line -- and nothing further. A row reading "Policy year | 2024.00
+    | $1 $234" has explained the year and has said nothing whatever about the
+    refused cell beyond it.
+
+    A label stating it has no value -- "Version unknown", "Status N/A" -- is
+    not naming anything: it carries no digit of its own by the same accident
+    that "Policy year" does, but "unknown" is a refusal, not a value. Trusting
+    it anyway consumes whatever cell happens to follow, on no better evidence
+    than that the label failed to state a number.
+
+    A label may also carry its own number, and then it has already named it.
+    "Software version 1.20" beside "$500.00" explains the 1.20 inside itself
+    and says nothing about the $500 -- so such a label reaches the cell beside
+    it only when that cell states the *same* number, which is the row printing
+    one fact twice ("Policy year 2024 | 2024.00"). The comparison is by
+    signed value. A parenthesized "(2024)" is the one narrow exception: a
+    labelled year is sometimes printed that way even though the money parser
+    reads parentheses as an accounting negative. Other currency or direction
+    notation contradicts the non-money label and remains evidence.
+
+    Every label is evaluated independently.  A first label saying ``unknown``
+    or failing to match its neighbour cannot prevent a later ``Print Date`` or
+    ``Claim identifier`` from explaining a different cell on the same row.
+    """
+    named: set[str] = set()
+    for index in range(len(row.cells)):
+        cell = row.cell(index).strip()
+        if not cell or not _NAMES_A_NON_MONEY_VALUE.search(clean_text(cell)):
+            continue
+        if _STATES_NO_VALUE.search(clean_text(cell)):
+            continue
+        after = index + 1
+        crossed_money_gap = False
+        while after < len(row.cells) and not row.cell(after).strip():
+            # A blank money column is meaningful: the label did not provide
+            # that value, so it cannot jump over the blank and explain a
+            # different financial field farther to the right. Blank identity,
+            # date, or status columns are merely layout space between a
+            # row-level label and the one value it prints.
+            if mapping.fields.get(after) in MONEY_FIELDS:
+                crossed_money_gap = True
+                break
+            after += 1
+        if crossed_money_gap or after >= len(row.cells):
+            continue
+        value = row.cell(after).strip()
+        name = mapping.fields.get(after)
+        if name not in MONEY_FIELDS:
+            continue
+        if _has_explicit_financial_marker(value):
+            continue
+        if (
+            "date" in normalize_label(cell).split()
+            and parse_date(value, None).value is not None
+        ):
+            named.add(name)
+            continue
+        if not any(character.isdigit() for character in value):
+            continue
+        if not any(character.isdigit() for character in cell):
+            # A label can name one value, not a collision of two source
+            # figures.  ``Policy year | 4 / 30,000.00`` remains unresolved.
+            if len(_NUMBER_TOKEN.findall(value)) == 1:
+                named.add(name)
+            continue
+
+        printed = parse_money(value, None).value
+        spoken = [
+            parse_money(token, None).value
+            for token in _NUMBER_IN_A_LABEL.findall(cell)
+        ]
+        if printed is None:
+            continue
+        if printed in spoken:
+            named.add(name)
+            continue
+        stripped = value.strip()
+        if stripped.startswith("(") and stripped.endswith(")") and any(
+            number is not None and printed == -number for number in spoken
+        ):
+            named.add(name)
+    return named
+
+
+def _labelled_value(row: RawRow, mapping: ColumnMapping) -> str | None:
+    """Backward-compatible singular view of :func:`_labelled_values`."""
+    named = _labelled_values(row, mapping)
+    return next(
+        (field for _index, field in sorted(mapping.fields.items()) if field in named),
+        None,
+    )
+
+
+def table_money_context(
+    table: RawTable, mapping: ColumnMapping, shapes: set[str]
+) -> str:
+    """What the table as a whole establishes about its numeric columns.
+
+    ``monetary-only`` -- every column it maps is money, so a number under one
+    of them is an amount and needs no corroboration from its own punctuation.
+    ``claims`` -- the table holds identified claims, so its money columns are
+    genuinely money, but a stray row under them could be anything and the
+    notation is worth consulting. ``unknown`` -- neither, and nothing numeric
+    on it can be called money at all.
+    """
+    mapped = mapping.mapped_fields
+    populated_unmapped = any(
+        row.cell(index).strip()
+        for row in table.rows
+        for index in range(len(row.cells))
+        if mapping.fields.get(index) is None
+    )
+    # Every mapped field being money says what the mapper managed to place, not
+    # what the table holds. A populated column nobody mapped is precisely the
+    # state in which the mapping is least trustworthy, and concluding "every
+    # number here is money" from the columns that happened to map is circular.
+    if mapped and mapped <= set(MONEY_FIELDS) and not populated_unmapped:
+        return "monetary-only"
+    if any(
+        not is_structural_row(row, mapping)
+        and claim_identifier(row, mapping, shapes) is not None
+        for row in table.rows
+    ):
+        return "claims"
+    return "unknown"
+
+
+def unplaced_evidence(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+    *,
+    context: str = "unknown",
+) -> UnplacedEvidence:
+    """Numeric cells on a row nothing claimed, classified by context.
+
+    The counterpart of :func:`_continuation_text`, which asks the same question
+    for the opposite purpose: that one folds a row into the claim above when
+    nothing on it parses, this one reports what parsed when the row could not
+    be placed at all. Both read only cells the mapping says are money, so the
+    column is the first piece of evidence -- but it is not the last, and it was
+    once treated as though the *shape* of the text could finish the job.
+
+    It cannot. Demanding a separator or a symbol lost a whole-unit "9400" and
+    silenced every "0.00", so a document whose only unattached figure was one
+    of those went CLEAN with nothing recorded. Accepting anything that parses
+    made money of "2024.00" and "45292.00" -- a year and an Excel date serial,
+    printed under a money column by a spreadsheet that put them there.
+
+    So the row and its table are asked instead, in that order: a row that reads
+    as claim data carries money; a row that names its value as a version, a
+    year, a serial or an identifier does not; a table mapping nothing but money
+    columns makes its numbers money; a claims table corroborates with the
+    notation. Anything left is *unresolved*, kept as such, and reported in
+    those words. Zero is not excluded -- a printed 0.00 nobody could place is
+    exactly as unexplained as any other figure, and it was the quietest way for
+    a document to reach CLEAN with evidence outstanding.
+    """
+    values = _row_values(row, mapping)
+    # Text a column boundary ran together -- "4 30,000.00" -- is refused as a
+    # *value*, because parsing it invents 430,000. It is not refused as
+    # evidence: the page printed something under a money column and no claim
+    # took it, which is exactly what an unplaced row is for. It goes straight
+    # to the unresolved side, never to `amounts`, and never with a number.
+    parsed, merged = _numeric_cells(row, mapping, locale)
+    if not parsed and not merged:
+        return UnplacedEvidence({}, {})
+
+    unresolved: dict[str, tuple[str, Decimal]] = {}
+    if _row_establishes_claim_data(values):
+        return UnplacedEvidence(parsed, unresolved, merged)
+
+    named = _labelled_values(row, mapping)
+    if named:
+        # A label explains its own value and no other. The row has said what
+        # that number is, so nothing about it is unresolved and it is exempt
+        # from both channels -- an exceptions list carrying rows the document
+        # already explained is one nobody reads to the end.
+        #
+        # What the label may not do is speak for the rest of the row. Exempting
+        # every cell and re-admitting only those carrying a currency mark made
+        # "Software version 1.20" erase an ordinary 500.00 printed beside it,
+        # and made a refused "$1 $234" vanish for want of anything to re-admit
+        # it. Requiring a dollar sign before an unrelated amount may survive is
+        # the erasure this thread exists to stop, wearing an exemption's
+        # clothes. Only the value the label identifies is set aside; every
+        # other cell is classified as it would have been on any other row.
+        parsed = {name: entry for name, entry in parsed.items() if name not in named}
+        merged = {name: text for name, text in merged.items() if name not in named}
+        if not parsed and not merged:
+            return UnplacedEvidence({}, {})
+
+    if context == "monetary-only":
+        return UnplacedEvidence(parsed, unresolved, merged)
+    if context == "claims" and parsed and all(
+        _FINANCIAL_NOTATION.search(text) for text, _value in parsed.values()
+    ):
+        return UnplacedEvidence(parsed, unresolved, merged)
+    return UnplacedEvidence({}, parsed, merged)
+
+
+def unplaced_money(
+    row: RawRow, mapping: ColumnMapping, locale: str | None
+) -> dict[str, tuple[str, Decimal]]:
+    """Only the values whose own row establishes them as money.
+
+    Kept as the narrow question some callers want. :func:`build_claims` uses
+    :func:`unplaced_evidence`, which also weighs the table and preserves what
+    neither settles.
+    """
+    return unplaced_evidence(row, mapping, locale).amounts
+
+
+def accepted_identifier_shapes(
+    tables: Sequence[RawTable], mapping: ColumnMapping
+) -> set[str]:
+    """Which shapes this document uses for claim numbers.
+
+    Detail layouts print each claim as a stack of lines, and the lines under
+    the first one land in the claim-number column carrying a cause code, a
+    class code or an injury description. Those are not claims, and no rule
+    downstream can tell: they arrive with a plausible-looking identifier and
+    inflate the count, the sums and the duplicate checks alike.
+
+    A claim number is normally one token. Where a document has such cells they
+    define what an identifier looks like here, and anything shaped differently
+    is a continuation line. Where it has none — some carriers print the
+    insured's name into the same cell — the shape used most often stands in,
+    since a layout repeats itself even when it is not tidy.
+    """
+    candidates: list[str] = []
+    for table in tables:
+        index = mapping_for(table, mapping).index_of("claim_number")
+        if index is None:
+            continue
+        for row in table.rows:
+            cell = row.cell(index).strip()
+            if cell and is_identifier_candidate(cell):
+                candidates.append(cell)
+    return consensus_shapes(candidates)
+
+
+def claim_identifier(
+    row: RawRow, mapping: ColumnMapping, shapes: set[str]
+) -> str | None:
+    """The claim number this row opens, or None if it continues the one above.
+
+    A neighbouring column bleeds into the identifier cell on some pages and
+    not others, so the same claim series arrives clean here and as
+    "502-124958-001/8459543132US Acc/Ben: FL/" there. An identifier leads its
+    cell and the contamination trails it, which is what separates this from a
+    continuation line: the junk that detail layouts put in this column does
+    not begin with an identifier either. Where only the leading token matches,
+    the trailing text belongs to another column and is dropped from the
+    number rather than carried into it.
+    """
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return None
+    # No shape consensus means nothing to compare against; leading_identifier
+    # falls back to the basic tests rather than rejecting every row and
+    # reporting an empty document, which R-20 would then have to catch.
+    return leading_identifier(row.cell(index), shapes)
+
+
+def has_claim_identifier(
+    row: RawRow, mapping: ColumnMapping, shapes: set[str]
+) -> bool:
+    """Whether this row opens a claim, rather than continuing the one above."""
+    return claim_identifier(row, mapping, shapes) is not None
+
+
+def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
+    """True for section headings and page furniture, not claims.
+
+    Documents grouped by policy period interleave "Policy Period: …" headings
+    between claims, and page footers add lines like "Report: LossRunSummary".
+    Both land in the claim-number column carrying a label and its colon, and
+    how much of the value follows the colon depends on where the column
+    boundary happens to fall. A claim number contains no colon at all, so a
+    worded label ahead of one marks the row as printed furniture.
+    """
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return False
+    label, separator, _ = row.cell(index).strip().partition(":")
+    return bool(separator) and bool(label) and label.replace(" ", "").isalpha()
+
+
+def mapping_for(table: RawTable, mapping: ColumnMapping) -> ColumnMapping:
+    """The column mapping that fits this page.
+
+    Column detection is per page, and pages of one document do not always agree
+    — a label that fits on one line here wraps into two columns there. Reading a
+    page through another page's mapping puts every value after the extra column
+    one field to the left.
+    """
+    if table.headers and table.headers != mapping.headers:
+        return build_mapping(table.headers, None, mapping.fingerprint)
+    return mapping
+
+
+def build_claims(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    date_order: str | None,
+    *,
+    dash_means_zero: bool = False,
+    source_method: SourceMethod = SourceMethod.DIGITAL,
+    confidence_cap: float = 1.0,
+) -> tuple[list[Claim], list[str], list[UnplacedRow]]:
+    """Normalise every row of every page, folding wrapped lines into their claim.
+
+    Rows that carry money and cannot be attached to a claim come back
+    separately from the warnings. A warning is a note to the reader; an amount
+    the app parsed and could not place is a hole in the reading, and only the
+    rules can say so.
+    """
+    claims: list[Claim] = []
+    warnings: list[str] = []
+    unplaced: list[UnplacedRow] = []
+    furniture = page_furniture(tables, mapping, locale)
+    shapes = accepted_identifier_shapes(tables, mapping)
+
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        context = table_money_context(table, table_mapping, shapes)
+
+        for row in table.rows:
+            if row.kind == "meta" or is_structural_row(row, table_mapping):
+                # ``meta`` is the extractor's own finding that this line
+                # belongs to the document and not to any claim. It is trusted
+                # here rather than re-derived: the extractor saw the line whole
+                # and in the company of the lines around it, while by now the
+                # column boundaries have been redrawn and the label may no
+                # longer sit in the cell ``is_structural_row`` reads.
+                continue
+            text = _normalised(row)
+            if not text:
+                continue
+            if text in furniture and not _carries_numeric_evidence(
+                row, table_mapping, locale
+            ):
+                # Furniture is decided on text pooled across pages, but applied
+                # to *this* occurrence. A line that repeats is usually a running
+                # header -- and where one occurrence of it carries evidence and
+                # another does not, the unprotected one must not reach back and
+                # delete the protected one. Each occurrence answers for itself.
+                continue  # a running header, footer or page marker
+
+            # A row whose claim-number cell holds something that is not an
+            # identifier is the continuation of the claim above it, not a new
+            # one. Folding it in keeps its text; treating it as a claim
+            # multiplies the count by however many lines each claim occupies.
+            identifier = claim_identifier(row, table_mapping, shapes)
+            if identifier is None:
+                extra = clean_text(" ".join(row.cells))
+                # Numeric evidence is weighed before anything may absorb the
+                # row. A cell under a money column that carries digits and
+                # yields no value is unresolved evidence, and a continuation
+                # fold would bury it inside the previous claim's narrative --
+                # where no rule can see it and the description acquires a
+                # figure that is not part of the accident.
+                evidence = unplaced_evidence(
+                    row, table_mapping, locale,
+                    context=context,
+                )
+                # A continuation line carries prose. A row carrying money or a
+                # date is a claim whose number could not be identified, and
+                # folding that into the description above would bury real
+                # figures inside someone else's narrative.
+                if evidence:
+                    _record_discard(
+                        row, table_mapping, locale, warnings, unplaced, extra,
+                        context=context,
+                    )
+                elif extra and claims and _continuation_text(row, table_mapping):
+                    previous = claims[-1]
+                    previous.loss_description = clean_text(
+                        f"{previous.loss_description or ''} {extra}"
+                    )
+                elif extra:
+                    _record_discard(
+                        row, table_mapping, locale, warnings, unplaced, extra,
+                        context=context,
+                    )
+                continue
+
+            claim = build_claim(
+                row, table_mapping, locale, date_order,
+                dash_means_zero=dash_means_zero,
+                source_method=source_method,
+                confidence_cap=confidence_cap,
+            )
+            if claim is not None:
+                # The cell may have carried a neighbouring column's text; the
+                # claim is filed under the identifier, not under the smear.
+                if claim.claim_number != identifier:
+                    claim.claim_number = identifier
+                claims.append(claim)
+                continue
+
+            extra = _continuation_text(row, table_mapping)
+            if extra and claims:
+                previous = claims[-1]
+                previous.loss_description = clean_text(
+                    f"{previous.loss_description or ''} {extra}"
+                )
+            elif not row.is_blank():
+                preview = " ".join(cell for cell in row.cells if cell)
+                _record_discard(
+                    row, table_mapping, locale, warnings, unplaced, preview,
+                    context=context,
+                )
+    return claims, warnings, unplaced
+
+
+def _carries_numeric_evidence(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+) -> bool:
+    """Whether this row carries numeric evidence furniture must not delete.
+
+    The same split the classifier makes, asked here so the two cannot
+    disagree. Asking only whether a cell *parsed* protected exactly the wrong
+    half: an unreadable cell parses by definition never, so the evidence least
+    able to defend itself was the evidence furniture was free to remove -- and
+    a spreadsheet continuation repeating its figures on every page it spans
+    looks exactly like a running footer.
+    """
+    # Route the row through the complete evidence classifier, including
+    # row-local labels such as ``Print Date: | 5/23/2023``.  Calling only the
+    # numeric scanner here made furniture protection disagree with R-23: the
+    # latter correctly resolved the date while the former still treated it as
+    # unresolved numeric evidence.
+    return bool(unplaced_evidence(row, mapping, locale, context="unknown"))
+
+
+def _record_discard(
+    row: RawRow,
+    mapping: ColumnMapping,
+    locale: str | None,
+    warnings: list[str],
+    unplaced: list[UnplacedRow],
+    preview: str,
+    *,
+    context: str = "unknown",
+) -> None:
+    """Note a row nothing could take, and keep any numeric evidence on it.
+
+    A text-only row stays a warning: nothing measurable was lost, and raising
+    a finding for every stray line would bury the ones that matter. A row
+    carrying figures under money columns is recorded on the document instead,
+    where a rule can reach it -- and recorded as two separate facts, what the
+    row established as money and what it left unresolved, because presenting
+    the second as the first is how a number the carrier never printed as money
+    acquires a claim.
+    """
+    evidence = unplaced_evidence(row, mapping, locale, context=context)
+    if evidence:
+        unplaced.append(
+            UnplacedRow(
+                page=row.page,
+                row=row.line_index,
+                amounts={
+                    name: text for name, (text, _value) in evidence.amounts.items()
+                },
+                parsed_amounts={
+                    name: value for name, (_text, value) in evidence.amounts.items()
+                },
+                ambiguous_values={
+                    **{
+                        name: text
+                        for name, (text, _value) in evidence.ambiguous.items()
+                    },
+                    # Refused text belongs here too: it is unresolved evidence
+                    # of exactly the kind this field exists for, and the only
+                    # thing that must never happen to it is being given a
+                    # number.
+                    **evidence.unreadable,
+                },
+            )
+        )
+        return
+    warnings.append(
+        f"Page {row.page}: skipped a row with no claim number ({preview[:60]})."
+    )
+
+
+def stated_periods(
+    stated: dict[str, list[str]], date_order: str | None
+) -> list[tuple[date, date]]:
+    """Every policy term the document names in its own columns.
+
+    XL prints an inception and an expiry beside each claim and three different
+    policies across the page. One document-level term cannot describe that, and
+    picking the commonest would put two thirds of the claims outside the term
+    they are reported under. Each pairing that actually appears is kept, which
+    is what R-09 needs to judge a date of loss against the right one.
+    """
+    starts = stated.get("policy_period_start", [])
+    ends = stated.get("policy_period_end", [])
+    periods: list[tuple[date, date]] = []
+    for start_text, end_text in dict.fromkeys(zip(starts, ends)):
+        start = parse_date(start_text, date_order).value
+        end = parse_date(end_text, date_order).value
+        if start and end and start <= end:
+            periods.append((start, end))
+    return sorted(set(periods))
+
+
+def _reads_as_column_labels(candidate: str, headers: Sequence[str]) -> bool:
+    """Whether this "carrier name" is really the table's own column headings.
+
+    A loss run exported from a spreadsheet begins with its header row, so the
+    scan of the top of page one reads column labels and returns them as the
+    company. No carrier is called "Status Currency Indemnity", and every word
+    of it appears in the headings above the table.
+    """
+    words = {word for word in candidate.lower().split() if word.isalpha()}
+    printed = {
+        word
+        for label in headers
+        for word in label.lower().split()
+        if word.isalpha()
+    }
+    return bool(words) and words <= printed
+
+
+def read_document_columns(
+    tables: Sequence[RawTable],
+) -> dict[str, list[str]]:
+    """Document-level facts a carrier printed as columns instead of a heading.
+
+    A spreadsheet export repeats the company, the insured, the policy and its
+    term on every claim. Those are document facts, and the canonical schema
+    holds them once -- so they are read once here, and only where the rows
+    agree. A column that says three different things across the page is
+    describing three policies, not one document, and the disagreement is
+    reported rather than resolved by picking the first.
+    """
+    furniture = page_furniture(tables)
+    values: dict[str, list[str]] = {}
+    for table in tables:
+        columns = {
+            index: field
+            for index, label in enumerate(table.headers)
+            if (field := guess_document_field(label))
+        }
+        if not columns:
+            continue
+        for row in table.rows:
+            # A footer printed on every page occupies the same columns as the
+            # claims and says nothing about the policy. Two of them are enough
+            # to make eighty-four rows look as though they disagree.
+            if _normalised(row) in furniture:
+                continue
+            for index, field in columns.items():
+                text = clean_text(row.cell(index))
+                if text:
+                    values.setdefault(field, []).append(text)
+    return values
+
+
+def agreed(values: Sequence[str]) -> str | None:
+    """The one thing these rows say, or None if they do not agree."""
+    distinct = {value for value in values if value}
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
+def _covers(row_text: str, claim_count: int | None) -> int:
+    """Whether a totals row says it covers the claims that were extracted.
+
+    A total is only worth checking against claims it actually totals. Loss runs
+    arrive inside board packets holding several of them, and a row reading
+    "Totals: 10 ... 226,605.00" belongs to whichever run has ten claims in it,
+    not to the twenty-eight that were read. Comparing the two reports a
+    quarter-million-pound discrepancy that nobody made.
+
+    Returns 1 when the row names the same count, -1 when it names a different
+    one, and 0 when it names none and so says nothing either way.
+    """
+    if claim_count is None:
+        return 0
+    printed = _first_match(row_text, _COUNT_PATTERNS)
+    stated = parse_int(printed) if printed else None
+    if stated is None:
+        return 0
+    return 1 if stated == claim_count else -1
+
+
+def _is_the_claim_count(row: RawRow, index: int) -> bool:
+    """Whether this cell of a totals row holds its claim count, not an amount.
+
+    A subtotal that says how many claims it covers prints the label and the
+    number beside each other -- "Claim Count = 4" -- and where the label ends
+    on a column boundary the number lands one column to the right, under a
+    money heading. It is not that column's total; it is how many claims the
+    totals cover, and recording it as money reports a figure the carrier never
+    printed, on the one row a reviewer is most likely to trust.
+
+    Two things have to hold, because either alone is wrong. The cell to the
+    left must carry the label *without* its number, since a label that already
+    has its count beside it has been read and whatever follows is money. And
+    this cell must be a bare run of digits: no separator, no fraction, nothing
+    a printed amount would carry.
+    """
+    text = row.cell(index).strip()
+    if not text.isdigit():
+        return False
+    for before in range(index - 1, -1, -1):
+        previous = row.cell(before).strip()
+        if not previous:
+            continue
+        return bool(
+            CLAIM_COUNT_LABEL.search(previous)
+            and not COUNTED_TOTAL_LABEL.search(previous)
+        )
+    return False
+
+
+def collect_printed_totals(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    claim_count: int | None = None,
+) -> dict[str, Decimal | None]:
+    """Read the footer totals row — the numbers R-04 checks against."""
+    return _document_total(tables, mapping, locale, claim_count)[0]
+
+
+def _document_total(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    claim_count: int | None = None,
+) -> tuple[dict[str, Decimal | None], tuple[int, int] | None, dict[str, str]]:
+    """The document's printed total, which row it came from, and what it refused.
+
+    The row's identity matters as much as its figures: one printed row is
+    either the report's total or a section's subtotal, never both, and a row
+    counted twice is reported twice -- once by R-04 against the whole document
+    and again by R-25 as a subtotal covering claims it was never scoped to.
+    """
+    best: dict[str, Decimal | None] = {}
+    best_row: tuple[int, int] | None = None
+    best_unreadable: dict[str, str] = {}
+    best_rank = (-2, -2, -2, -2)
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        for row in table.total_rows:
+            totals: dict[str, Decimal | None] = {}
+            unreadable: dict[str, str] = {}
+            for index, field_name in table_mapping.fields.items():
+                if field_name not in MONEY_FIELDS:
+                    continue
+                cell = row.cell(index).strip()
+                if not cell or _is_the_claim_count(row, index):
+                    continue
+                if _is_smeared(cell):
+                    # Refusing it is right; losing it is not. The other columns
+                    # of this row tying says nothing about this one, and R-04
+                    # simply stops checking it.
+                    unreadable[field_name] = cell
+                    continue
+                parsed = parse_money(cell, locale)
+                if parsed.value is not None:
+                    totals[field_name] = parsed.value
+                else:
+                    unreadable[field_name] = cell
+            # Documents grouped by policy period print a subtotal per section
+            # and one grand total. Only the grand total covers every claim, so
+            # it outranks a subtotal no matter which was seen first. A row that
+            # names a different claim count outranks nothing: whatever it
+            # totals, it is not these claims.
+            # Which row is the document's total is a question about what the
+            # row says it is, and readability is not part of the answer. The
+            # wording comes first: a GRAND TOTAL covers the document and a
+            # policy subtotal covers one section, whichever of them the reader
+            # managed to parse. Only where the structure ties does it matter
+            # that one row could be read and the other could not -- so a
+            # subtotal never replaces an explicitly labelled grand total, and
+            # a readable row still beats an unreadable peer of equal standing.
+            #
+            # A row naming a different claim count outranks nothing: whatever
+            # it totals, it is not these claims.
+            covers = _covers(row.text(), claim_count)
+            if covers < 0:
+                # It names a claim count that is not the count extracted, so
+                # whatever it totals, it is not these claims. Board packets
+                # bind several loss runs together and checking against the
+                # wrong one reports a discrepancy nobody made. Not this
+                # document's total, whether or not it could be read.
+                continue
+            rank = (
+                covers,
+                1 if GRAND_TOTAL_PATTERN.search(row.text()) else 0,
+                1 if totals else 0,
+                len(totals),
+            )
+            if (totals or unreadable) and rank > best_rank:
+                # A totals row every one of whose cells was refused parses
+                # nothing, and was once dropped whole -- taking with it the
+                # fact that this document has a printed total at all. It is
+                # still the total row: R-04 is now checking nothing against it,
+                # which is precisely what has to be said, and about this row.
+                best, best_rank = totals, rank
+                best_row = (row.page, row.line_index)
+                best_unreadable = unreadable
+    return best, best_row, best_unreadable
+
+
+#: The claim count printed inside a subtotal row, e.g. "# Claims: 6" or
+#: "Claim Count = 4". The word "count" and an equals sign are both forms
+#: carriers use for the same statement, and a subtotal that says how many
+#: claims it covers is the only thing that lets that subtotal be checked
+#: against the right rows.
+_SECTION_COUNT = re.compile(
+    r"#?\s*claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)", re.IGNORECASE
+)
+#: The date a subtotal row leads with, naming the term it totals.
+_SECTION_DATE = re.compile(r"\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}")
+
+
+def collect_printed_sections(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale: str | None,
+    date_order: str | None,
+    document_row: tuple[int, int] | None = None,
+) -> list[PrintedSection]:
+    """Read each per-term subtotal the document prints.
+
+    These are the only other numbers besides the grand total that the carrier
+    committed to, so they let each policy term be checked on its own rather
+    than only the document as a whole.
+
+    ``document_row`` is the printed row the document total was taken from,
+    which is not a section. Excluding it by identity rather than by wording
+    matters: a footer labelled plainly "TOTALS" is the report's total on a
+    one-section document and would otherwise be collected twice, reported
+    once by R-04 against every claim and again by R-25 as a subtotal whose
+    scope nothing established.
+    """
+    sections: list[PrintedSection] = []
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        for row in table.total_rows:
+            if GRAND_TOTAL_PATTERN.search(row.text()):
+                continue  # the report total, already held on the document
+            if document_row is not None and (row.page, row.line_index) == document_row:
+                continue  # the same, recognised by which row it is
+
+            totals: dict[str, Decimal | None] = {}
+            unreadable: dict[str, str] = {}
+            for index, field_name in table_mapping.fields.items():
+                if field_name not in MONEY_FIELDS:
+                    continue
+                cell = row.cell(index).strip()
+                if not cell or _is_the_claim_count(row, index):
+                    continue
+                if _is_smeared(cell):
+                    # Refusing the cell is right; losing it is not. The column
+                    # stops being checked either way, and only the printed text
+                    # can tell a reviewer what was given up.
+                    unreadable[field_name] = cell
+                    continue
+                parsed = parse_money(cell, locale)
+                if parsed.value is not None:
+                    totals[field_name] = parsed.value
+                else:
+                    unreadable[field_name] = cell
+            if not totals and not unreadable:
+                continue
+
+            text = row.text()
+            count = _SECTION_COUNT.search(text)
+            start = _SECTION_DATE.search(row.cell(0))
+            sections.append(
+                PrintedSection(
+                    label=clean_text(row.cell(0)) or clean_text(text)[:40],
+                    period_start=(
+                        parse_date(start.group(0), date_order).value if start else None
+                    ),
+                    printed_totals=totals,
+                    printed_claim_count=parse_int(count.group(1)) if count else None,
+                    unreadable_totals=unreadable,
+                    page=row.page,
+                    line_index=row.line_index,
+                )
+            )
+    return sections
+
+
+def vision_claim_evidence(
+    tables: Sequence[RawTable],
+) -> list[dict[str, int]]:
+    """Claim counts reported off scanned pages, with the page each came from.
+
+    Evidence, and only evidence. The digital path can tell a section's count
+    from the report's because it reads the words around the number -- "Report
+    Totals:" over "# Claims: 50". The vision schema returns the number alone,
+    so nothing in what comes back distinguishes a policy subtotal from the
+    document's own count, and none of these may become
+    ``printed_claim_count``.
+
+    Repetition does not rescue it. Three sections of three claims each agree at
+    three while the document holds nine, so agreement across pages is the same
+    coincidence the digital path already refuses to read as scope.
+
+    Extending the vision schema to carry that wording is the real fix and is
+    deliberately not attempted here. Until it exists the honest answer is that
+    the document's count is unresolved, which is what R-27 reports from this.
+    """
+    return [
+        {"page": table.page, "count": table.printed_claim_count}
+        for table in tables
+        if table.printed_claim_count is not None
+    ]
+
+
+def scope_sections(
+    sections: Sequence[PrintedSection], claims: Sequence[Claim]
+) -> None:
+    """Record which claims each printed subtotal covers, where the page says so.
+
+    A subtotal is worth nothing to a reviewer until something is compared
+    against it, and comparing needs a set of claims the *document* says the
+    figures cover. Two independent things have to agree before that set is
+    written down, because either alone will hand a subtotal the wrong rows.
+
+    **Where the row sits.** A total totals what is printed above it. A subtotal
+    on line 2 with two claims on lines 5 and 6 totals neither of them,
+    whatever its count says, and a page carrying two subtotals gives each of
+    them only the rows between it and the one before -- otherwise both take
+    the whole page and the second is checked against claims the first already
+    accounted for. Position is the structural boundary the printed page
+    actually provides.
+
+    **What the carrier counted.** The claim count then has to match that span.
+    A count matching the *page* proves nothing on its own: a section spanning
+    two pages, or one whose other claims sit elsewhere, will agree by
+    arithmetic accident.
+
+    Where the two do not agree the scope is not established and nothing is
+    recorded. A subtotal checked against the wrong claims is worse than one
+    reported as unchecked, because the first is a green tick over an
+    unexamined figure and the second is a question a reviewer can answer.
+
+    A count of zero is a scope like any other: the section covers no claims,
+    which is exactly what a "No Claims for Policy" page prints.
+    """
+    by_page: dict[int, list[Claim]] = {}
+    for claim in claims:
+        by_page.setdefault(claim.source_page, []).append(claim)
+    for page_claims in by_page.values():
+        page_claims.sort(key=lambda claim: (claim.source_row or 0))
+
+    # Each subtotal closes at its own line and opens where the previous one on
+    # that page closed, so no claim is inside two spans.
+    opens_at: dict[int, int] = {}
+    for section in sorted(sections, key=lambda s: (s.page, s.line_index)):
+        if section.printed_claim_count is None:
+            continue
+        lower = opens_at.get(section.page, -1)
+        span = [
+            claim
+            for claim in by_page.get(section.page, [])
+            if lower < (claim.source_row or 0) < section.line_index
+        ]
+        opens_at[section.page] = section.line_index
+        if len(span) != section.printed_claim_count:
+            continue
+        section.covers_rows = [claim.row_id for claim in span]
+        section.scope_known = True
+
+
+# --------------------------------------------------------------------------
+# Inference over the whole document
+# --------------------------------------------------------------------------
+
+
+def _money_tokens(tables: Sequence[RawTable], mapping: ColumnMapping) -> list[str]:
+    indexes = [i for i, name in mapping.fields.items() if name in MONEY_FIELDS]
+    tokens: list[str] = []
+    for table in tables:
+        for row in list(table.rows) + list(table.total_rows):
+            tokens.extend(row.cell(index) for index in indexes)
+    return [token for token in tokens if token.strip()]
+
+
+def _table_date_tokens(
+    tables: Sequence[RawTable], mapping: ColumnMapping
+) -> list[str]:
+    """Date cells from the claims table itself."""
+    indexes = [i for i, name in mapping.fields.items() if name in DATE_FIELDS]
+    tokens: list[str] = []
+    for table in tables:
+        for row in table.rows:
+            tokens.extend(row.cell(index) for index in indexes)
+    return [token for token in tokens if token.strip()]
+
+
+def _metadata_date_tokens(metadata: DocumentMetadata) -> list[str]:
+    """Dates from the header block, which is a separate format context."""
+    return [
+        text
+        for text in (
+            metadata.valuation_date_text,
+            metadata.policy_period_start_text,
+            metadata.policy_period_end_text,
+        )
+        if text and text.strip()
+    ]
+
+
+def resolve_date_order(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    metadata: DocumentMetadata,
+    locale: str | None,
+) -> tuple[DateOrderInference, DateOrderInference]:
+    """Settle the day/month order for the table, and for the header block.
+
+    The table and the header are resolved **independently** and never fall
+    back on each other. A European report can print
+    ``Valuation Date: 06/30/2024`` above dates written the other way round, so
+    letting the header settle the table would move every loss date — that is
+    the whole reason this function exists rather than one document-wide
+    inference. The same reasoning runs in the other direction, and matters
+    more than it looks: if a claims table is genuinely ambiguous throughout
+    (no row's day exceeds 12, and the numeric locale gives no evidence
+    either), the header's own resolved order must **not** be borrowed to
+    parse the table just because it happens to be available — a policy period
+    ending on the 31st proves the header's convention for the header, not for
+    a table that offers no evidence of its own. Borrowing it would parse
+    every ambiguous claim date silently, exactly the guess spec section 4
+    forbids. A table with no evidence of its own stays ``source="default"``,
+    so :attr:`DateOrderInference.for_parsing` returns ``None`` and every date
+    in it comes back null with ``AMBIGUOUS_DATE_ORDER`` — correct, if less
+    convenient.
+    """
+    table_order = infer_date_order(_table_date_tokens(tables, mapping), locale)
+    header_order = infer_date_order(_metadata_date_tokens(metadata), locale)
+    return table_order, header_order
+
+
+#: What carriers call a line of business when they do not use the abbreviation.
+_LOB_WORDS: tuple[tuple[str, LineOfBusiness], ...] = (
+    ("WORKERSCOMP", LineOfBusiness.WC),
+    ("WORKERSCOMPENSATION", LineOfBusiness.WC),
+    ("WORKMENSCOMP", LineOfBusiness.WC),
+    ("GENERALLIABILITY", LineOfBusiness.GL),
+    ("LIABILITY", LineOfBusiness.GL),
+    ("PUBLICLIABILITY", LineOfBusiness.GL),
+    ("AUTOMOBILE", LineOfBusiness.AUTO),
+    ("MOTOR", LineOfBusiness.AUTO),
+    ("COMMERCIALAUTO", LineOfBusiness.AUTO),
+    ("PROPERTY", LineOfBusiness.PROP),
+    ("UMBRELLA", LineOfBusiness.UMB),
+    ("EXCESS", LineOfBusiness.UMB),
+)
+
+
+def _line_of_business(text: str | None) -> LineOfBusiness | None:
+    if not text:
+        return None
+    token = clean_text(text).upper().replace(" ", "")
+    for member in LineOfBusiness:
+        if token.startswith(member.value):
+            return member
+    for word, member in _LOB_WORDS:
+        if word in token:
+            return member
+    return LineOfBusiness.OTHER
+
+
+# --------------------------------------------------------------------------
+# The pipeline
+# --------------------------------------------------------------------------
+
+
+def run_pipeline(
+    source: str | Path | IngestedFile,
+    *,
+    profile: CarrierProfile | None = None,
+    profiles_dir: Path | None = None,
+    mapping_override: ColumnMapping | None = None,
+    reconcile_config: ReconcileConfig | None = None,
+    use_vision: bool = True,
+    vision_extractor: Any | None = None,
+    use_llm: bool = False,
+    llm_client: Any | None = None,
+) -> ExtractionResult:
+    """Run stages 0 through 5 and return everything the UI needs."""
+    ingested = source if isinstance(source, IngestedFile) else ingest_path(source)
+    classification = classify_pdf(ingested.path)
+
+    digital_pages = classification.digital_pages
+    # `pages=None` means "extract every page" (spec: no filter). Passing the
+    # empty list through `or None` when a document is fully scanned would
+    # silently mean the opposite of what was intended -- pdfplumber would
+    # eagerly parse every heavy scanned page for a document that has nothing
+    # digital on it at all. An explicit empty list correctly extracts none.
+    extraction = extract_digital.extract_pdf(ingested.path, pages=digital_pages)
+    tables = list(extraction.tables)
+    metadata = extraction.metadata
+    warnings: list[str] = []
+    processed_pages = set(extraction.page_texts)
+    failed_pages: set[int] = set()
+    skipped_pages: set[int] = set()
+    unresolved_pages: set[int] = set()
+
+    scanned_pages = classification.scanned_pages
+    vision_tables: list[RawTable] = []
+    if scanned_pages and use_vision:
+        from core.extract_vision import (
+            VisionExtraction,
+            VisionUnavailable,
+            extract_scanned_pages,
+        )
+
+        extractor = vision_extractor or extract_scanned_pages
+        try:
+            vision_output = extractor(ingested.path, scanned_pages)
+            if isinstance(vision_output, VisionExtraction):
+                vision_tables = list(vision_output.tables)
+                for page, message in vision_output.failures.items():
+                    failed_pages.add(page)
+                    warnings.append(message)
+            else:
+                # Preserve compatibility with injected extractors that return
+                # tables directly. A requested page they do not return is not
+                # evidence of successful processing.
+                vision_tables = list(vision_output)
+
+            # A page counts as read only where the reader actually returned
+            # something off it. A well-formed answer carrying no rows is a
+            # model declining to find a table, which is not the same fact as a
+            # page having none -- and on a scan there is no second reader to
+            # settle which it was. Headers and page metadata do not decide it
+            # either: a shape is not a reading.
+            read_vision_pages = {
+                table.page for table in vision_tables
+                if table.rows or table.total_rows
+            }
+            empty_vision_pages = {
+                table.page for table in vision_tables
+            } - read_vision_pages
+            processed_pages.update(read_vision_pages)
+            unresolved_pages.update(empty_vision_pages - failed_pages)
+            if empty_vision_pages:
+                joined = ", ".join(str(page) for page in sorted(empty_vision_pages))
+                warnings.append(
+                    f"Vision extraction returned no rows for page(s) {joined}. "
+                    f"Whether they hold claims is unknown."
+                )
+            unreturned = (
+                set(scanned_pages)
+                - read_vision_pages
+                - empty_vision_pages
+                - failed_pages
+            )
+            if unreturned:
+                failed_pages.update(unreturned)
+                joined = ", ".join(str(page) for page in sorted(unreturned))
+                warnings.append(
+                    f"Vision extraction returned no result for page(s) {joined}."
+                )
+            tables.extend(vision_tables)
+        except VisionUnavailable as error:
+            failed_pages.update(scanned_pages)
+            warnings.append(str(error))
+    elif scanned_pages:
+        skipped_pages.update(scanned_pages)
+        warnings.append(
+            f"{len(scanned_pages)} page(s) are scans and were not read. "
+            f"Turn on vision extraction to include them."
+        )
+
+    # Fingerprint the letterhead plus the header labels.
+    # A scanned page prints its valuation date and claim count like any other,
+    # but there is no text layer to read them from, so the vision pass reports
+    # them and they are used only where the digital pass found nothing.
+    vision_counts = vision_claim_evidence(vision_tables)
+    for table in vision_tables:
+        if metadata.valuation_date_text is None and table.valuation_date_text:
+            metadata.valuation_date_text = table.valuation_date_text
+    if vision_counts:
+        # The digital decision was made before the scanned pages were read, on
+        # incomplete evidence. Re-taken with all of it: a lone digital count is
+        # only the document's while nothing else states a different one.
+        metadata.printed_claim_count = document_claim_count(
+            extraction.page_texts,
+            [entry["count"] for entry in vision_counts],
+        )
+
+    first_page_text = extraction.page_texts.get(
+        min(extraction.page_texts), ""
+    ) if extraction.page_texts else ""
+    headers = tables[0].headers if tables else []
+    fingerprint_value = fingerprint(
+        page_top_text(first_page_text), headers, metadata.carrier
+    )
+
+    if profile is None:
+        profile = load_profile(fingerprint_value, profiles_dir)
+
+    mapping = mapping_override or build_mapping(
+        headers,
+        profile,
+        fingerprint_value,
+        samples=sample_rows(tables),
+        use_llm=use_llm,
+        llm_client=llm_client,
+    )
+
+    # Number and date conventions, derived from the document itself.
+    locale_inference = infer_locale(_money_tokens(tables, mapping))
+    if profile and profile.number_locale:
+        locale_inference = LocaleInference(
+            profile.number_locale, True, "carrier profile"
+        )
+    date_inference, header_date_inference = resolve_date_order(
+        tables, mapping, metadata, locale_inference.for_parsing
+    )
+    if profile and profile.date_order:
+        date_inference = DateOrderInference(
+            profile.date_order, True, "carrier profile", source="evidence"
+        )
+        header_date_inference = date_inference
+
+    locale = locale_inference.for_parsing
+    date_order = date_inference.for_parsing
+    dash_means_zero = bool(profile and profile.dash_means_zero)
+
+    digital_tables = [table for table in tables if table.strategy != "vision"]
+
+    # Where the document states a fact in a column rather than a heading, that
+    # column is the better source: it is the document saying so directly, not
+    # a guess about which line of the letterhead names the carrier.
+    stated = read_document_columns(digital_tables)
+    claims, row_warnings, unplaced_rows = build_claims(
+        digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero
+    )
+    warnings.extend(row_warnings)
+
+    if vision_tables:
+        vision_claims, vision_warnings, vision_unplaced = build_claims(
+            vision_tables, mapping, locale, date_order,
+            dash_means_zero=dash_means_zero,
+            source_method=SourceMethod.VISION,
+            confidence_cap=0.85,
+        )
+        claims.extend(vision_claims)
+        warnings.extend(vision_warnings)
+        unplaced_rows.extend(vision_unplaced)
+        claims.sort(key=lambda claim: (claim.source_page, claim.source_row or 0))
+
+    # Document-level facts.
+    document_issues: dict[str, NullReason] = {}
+    header_order = header_date_inference.for_parsing or date_order
+    valuation = parse_date(metadata.valuation_date_text or "", header_order)
+    if valuation.value is None and metadata.valuation_date_text:
+        document_issues["valuation_date"] = valuation.reason or NullReason.UNPARSEABLE
+    period_start = parse_date(metadata.policy_period_start_text or "", header_order)
+    period_end = parse_date(metadata.policy_period_end_text or "", header_order)
+
+    # A loss run grouped by policy period lists several terms, and page 1 only
+    # declares the first. Judging every claim against that one term reports
+    # each later year as out of period, burying the real findings. The document
+    # covers the whole span, so widen the window to what it actually lists.
+    period_start_value, period_end_value = period_start.value, period_end.value
+    declared_periods = [
+        (start_value, end_value)
+        for start_text, end_text in metadata.policy_periods
+        if (start_value := parse_date(start_text, header_order).value) is not None
+        and (end_value := parse_date(end_text, header_order).value) is not None
+    ]
+    if len(declared_periods) > 1:
+        period_start_value = min(start for start, _ in declared_periods)
+        period_end_value = max(end for _, end in declared_periods)
+
+    rows_seen_per_page: dict[int, int] = {}
+    furniture = page_furniture(tables)
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        # Count rows that carry a claim number: those are the rows that ought
+        # to survive stitching. A row skipped for having no claim number is
+        # already reported on its own, and counting it here would make R-19
+        # repeat that warning as a phantom stitching loss.
+        index = table_mapping.index_of("claim_number")
+        rows_seen_per_page[table.page] = sum(
+            1
+            for row in table.rows
+            if index is not None
+            and row.cell(index).strip()
+            and not is_structural_row(row, table_mapping)
+            and (text := _normalised(row))
+            and text not in furniture
+        )
+
+    printed_totals, document_total_row, unreadable_totals = _document_total(
+        tables, mapping, locale, len(claims)
+    )
+
+    # Recoveries: settle the carrier's sign convention before anything is
+    # reconciled, and apply it to the printed totals too — otherwise R-04
+    # would compare a corrected column against an uncorrected footer.
+    recovery_sign = infer_recovery_sign(
+        (
+            claim.claim_number,
+            claim.paid_total,
+            claim.reserve_total,
+            claim.recovery_total,
+            claim.incurred_total,
+        )
+        for claim in claims
+    )
+    if profile and profile.recovery_convention:
+        recovery_sign = RecoverySignInference(
+            credit_convention=profile.recovery_convention == "credit",
+            confident=True,
+            evidence="carrier profile",
+        )
+    printed_sections = collect_printed_sections(
+        tables,
+        mapping,
+        locale_inference.locale,
+        date_inference.order,
+        document_row=document_total_row,
+    )
+    if recovery_sign.should_negate:
+        for claim in claims:
+            if claim.recovery_total is not None:
+                claim.recovery_total = -claim.recovery_total
+        printed_totals = {
+            name: (-value if name == "recovery_total" and value is not None else value)
+            for name, value in printed_totals.items()
+        }
+        # The same convention, applied to the same kind of figure. A subtotal's
+        # recovery column is printed exactly as the document total's is, so
+        # leaving it un-negated set every claim's flipped recovery against an
+        # unflipped subtotal and reported the difference twice over as an
+        # arithmetic error against the carrier.
+        for section in printed_sections:
+            value = section.printed_totals.get("recovery_total")
+            if value is not None:
+                section.printed_totals["recovery_total"] = -value
+
+    # Currency: what the rows actually show, not what the default assumes.
+    # Defaulting to USD and then comparing that default against a euro symbol
+    # is how R-16 accuses every European document of mixing currencies.
+    declared = (metadata.currency or "").strip().upper()[:3]
+    declared = declared if len(declared) == 3 and declared.isalpha() else ""
+    symbols = {claim.currency for claim in claims if claim.currency}
+    stated_currency = agreed(stated.get("currency", []))
+    if stated_currency and len(stated_currency) == 3 and stated_currency.isalpha():
+        # A currency column is the document naming its own currency, which
+        # beats a symbol scraped off the amounts.
+        currency = stated_currency.upper()
+    elif declared:
+        currency = declared
+    elif len(symbols) == 1:
+        currency = next(iter(symbols))
+    else:
+        currency = "USD"
+    currencies_seen = sorted(symbols | ({declared} if declared else set()))
+
+    column_carrier = agreed(stated.get("carrier", []))
+    column_insured = agreed(stated.get("named_insured", []))
+    column_policy = agreed(stated.get("policy_number", []))
+    column_lob = agreed(stated.get("line_of_business", []))
+    column_start = parse_date(agreed(stated.get("policy_period_start", [])) or "",
+                              date_order).value
+    column_end = parse_date(agreed(stated.get("policy_period_end", [])) or "",
+                            date_order).value
+    if not declared_periods:
+        declared_periods = stated_periods(stated, date_order)
+    letterhead_carrier = metadata.carrier
+    if letterhead_carrier and _reads_as_column_labels(letterhead_carrier, headers):
+        # The top of page one *is* the table's own heading here, so the scan
+        # returned three column labels as the company's name.
+        letterhead_carrier = None
+    if "carrier" in stated:
+        # A column naming the company settles it, including when it names two.
+        # The letterhead scan reads the top of page one, which on a sheet like
+        # this is the first claim -- so it would report one of the two carriers
+        # as the document's, and file a third of the book under the wrong one.
+        letterhead_carrier = None
+
+    document = LossRunDocument(
+        document_id=ingested.document_id,
+        source_filename=ingested.source_filename,
+        file_sha256=ingested.sha256,
+        carrier=column_carrier or letterhead_carrier,
+        named_insured=column_insured or metadata.named_insured,
+        policy_number=column_policy or metadata.policy_number,
+        policy_period_start=period_start_value or column_start,
+        policy_period_end=period_end_value or column_end,
+        line_of_business=_line_of_business(metadata.line_of_business)
+        or _line_of_business(column_lob),
+        valuation_date=valuation.value,
+        currency=currency,
+        locale_hint=locale_inference.locale,
+        locale_confident=locale_inference.confident,
+        date_order=date_inference.order,
+        date_order_confident=date_inference.confident,
+        page_count=classification.page_count,
+        extraction_method=classification.extraction_method,
+        scanned_pages=scanned_pages,
+        processed_pages=sorted(processed_pages),
+        failed_pages=sorted(failed_pages),
+        skipped_pages=sorted(skipped_pages),
+        unresolved_pages=sorted(unresolved_pages),
+        unplaced_rows=unplaced_rows,
+        column_split_pages=extraction.column_split_pages,
+        printed_totals=printed_totals,
+        printed_claim_count=metadata.printed_claim_count,
+        unreadable_totals=unreadable_totals,
+        unreadable_totals_page=(
+            document_total_row[0] if document_total_row else None
+        ),
+        unreadable_totals_row=(
+            document_total_row[1] if document_total_row else None
+        ),
+        # Both readers' counts, digital and scanned alike. A count the digital
+        # pages happened to supply is one candidate among several, not licence
+        # to ignore what the scanned pages said.
+        printed_count_evidence=(
+            counted_claim_evidence(extraction.page_texts) + vision_counts
+        ),
+        policy_periods=declared_periods,
+        rows_seen_per_page=rows_seen_per_page,
+        column_mapping=mapping.decisions,
+        printed_sections=printed_sections,
+        claims=claims,
+        currencies_seen=currencies_seen,
+        document_issues=document_issues,
+        profile_fingerprint=fingerprint_value,
+        profile_name=profile.profile_name if profile else None,
+        recovery_convention="credit" if recovery_sign.should_negate else None,
+    )
+    # Scoping needs the claims and the sections together, so it happens once
+    # the document holds both rather than inside either collector.
+    scope_sections(document.printed_sections, document.claims)
+
+    config = reconcile_config or _config_for(profile)
+    return ExtractionResult(
+        document=document,
+        reconciliation=reconcile(document, config),
+        mapping=mapping,
+        classification=classification,
+        source_path=ingested.path,
+        locale=locale_inference,
+        date_order=date_inference,
+        recovery_sign=recovery_sign,
+        tables=tables,
+        profile=profile,
+        warnings=warnings,
+    )
+
+
+def _config_for(profile: CarrierProfile | None) -> ReconcileConfig:
+    if profile is None:
+        return ReconcileConfig()
+    try:
+        tolerance = Decimal(str(profile.money_tolerance))
+    except Exception:  # pragma: no cover - a hand-edited profile
+        tolerance = Decimal("0.01")
+    return ReconcileConfig(money_tolerance=tolerance)
+
+
+def rerun_reconciliation(
+    document: LossRunDocument, config: ReconcileConfig | None = None
+) -> ReconciliationResult:
+    """Re-run the rules after a human edits a cell (spec section 11)."""
+    return reconcile(document, config or ReconcileConfig())
+
+
+def edit_claims(
+    result: ExtractionResult, records: Sequence[dict[str, Any]]
+) -> ExtractionResult:
+    """Commit a grid edit, reconciliation and audit chronology together."""
+    before = summarise_review(
+        result.reconciliation.findings, result.document.review_log
+    ).headline()
+    old_entries = len(result.document.review_log.entries)
+    document = apply_edits(result.document, records)
+    if len(document.review_log.entries) == old_entries:
+        # pandas/Arrow can change null/date representations without a reviewer
+        # changing a value. Do not publish or re-run for that round trip.
+        return result
+    reconciliation = rerun_reconciliation(document, _config_for(result.profile))
+    after = summarise_review(reconciliation.findings, document.review_log).headline()
+    for entry in document.review_log.entries[old_entries:]:
+        entry.status_before = before
+        entry.status_after = after
+    result.document = document
+    result.reconciliation = reconciliation
+    return result
+
+
+def resolve_finding(
+    result: ExtractionResult,
+    finding: Finding,
+    action: ReviewAction,
+    *,
+    note: str = "",
+    corrected_value: Any = None,
+    reviewer: str = LOCAL_REVIEWER,
+) -> ExtractionResult:
+    """Record what a reviewer decided about one finding, and act on it.
+
+    Confirming and dismissing change no data at all: they add a line to the
+    log saying somebody looked, and the rule engine is never told. Correcting
+    changes one cell and then runs *every* rule again over the result — not the
+    rules that look related, because working out which rules a value can reach
+    is exactly the kind of cleverness that quietly stops re-checking something.
+    The engine is cheap and correctness is not.
+
+    Either way the finding survives. If it still holds after a correction the
+    engine raises it again, and the log shows a reviewer tried; if it no longer
+    holds, the log shows what the value was before.
+    """
+    original_document = result.document
+    document = original_document.model_copy(deep=True)
+    reconciliation = result.reconciliation
+    before_headline = summarise_review(
+        result.reconciliation.findings, original_document.review_log
+    ).headline()
+    was = after = None
+    claim = claim_for(original_document, finding)
+
+    if action is ReviewAction.CORRECTED:
+        # Refused rather than recorded. A log line reading "corrected" against
+        # a finding that has no cell to correct describes a change nobody made,
+        # and an audit trail that says so about one decision cannot be trusted
+        # about the others.
+        if finding.scope is FindingScope.CLAIM_GROUP:
+            raise ValueError(
+                f"{finding.rule_id} concerns multiple physical rows. Select the "
+                "specific row in the claims table before correcting its number."
+            )
+        if not finding.claim_number:
+            raise ValueError(
+                f"{finding.rule_id} is about the whole document rather than one "
+                f"row, so there is no cell here to correct. Confirm or dismiss "
+                f"it, or change the value in the claims table."
+            )
+        if claim is None:
+            raise ValueError(
+                f"No claim {finding.claim_number!r} to correct — it may have been "
+                f"renamed or deleted since this finding was raised."
+            )
+        if not finding.field:
+            raise ValueError(
+                f"{finding.rule_id} is about claim {finding.claim_number} as a "
+                f"whole rather than one of its fields, so there is no single "
+                f"cell here to correct."
+            )
+        if finding.field not in Claim.model_fields:
+            # A rule may flag something the claim does not store -- a printed
+            # claim count, a column that was never mapped. Writing it into the
+            # row would be dropped on the way in and logged as a correction
+            # that happened, which is the one thing an audit trail may not do.
+            raise ValueError(
+                f"{finding.rule_id} is about {finding.field!r}, which is not a "
+                f"field of a claim, so there is nothing here to correct."
+            )
+        if finding.field not in REVIEW_COLUMNS:
+            raise ValueError(f"{finding.field!r} is not an editable claim value")
+        was = _audit_value(claim, finding.field)
+        records = to_records(original_document, review_columns(original_document))
+        # By identity, not by claim number: two rows can share a number, and
+        # the row this finding is about is not necessarily the first of them.
+        row = next(
+            record for record in records
+            if record.get(ROW_ID_COLUMN) == claim.row_id
+        )
+        row[finding.field] = corrected_value
+        # The edit and the re-run both complete before either is visible. A
+        # document whose claims have moved and whose findings have not is worse
+        # than an edit that failed: it reads as reconciled against figures that
+        # are no longer there, and nothing says so.
+        edited = apply_edits(original_document, records, audit=False)
+        corrected = next(c for c in edited.claims if c.row_id == claim.row_id)
+        after = _audit_value(corrected, finding.field)
+        if was == after:
+            raise ValueError("No value changed. Confirm or dismiss the finding instead.")
+        reconciliation = rerun_reconciliation(edited, _config_for(result.profile))
+        document = edited
+        claim = corrected
+    elif claim is not None:
+        claim = next(c for c in document.claims if c.row_id == claim.row_id)
+
+    entry = resolution_for(
+        finding,
+        action,
+        reviewer=reviewer,
+        note=note,
+        before=was,
+        after=after,
+        row_id=claim.row_id if claim else "",
+        where=claim.where() if claim else "",
+        status_before=before_headline,
+        status_after="",
+    )
+    document.review_log.record(entry)
+    # Filled in after the entry is in the log, because this decision is part of
+    # what the document now reads as: dismissing the last open flag is what
+    # moves "flags to review" to "flags reviewed", and a status computed a
+    # moment earlier would record every decision as having changed nothing.
+    # Only this entry is touched, and only before anyone has seen it.
+    entry.status_after = summarise_review(
+        reconciliation.findings, document.review_log
+    ).headline()
+    # Publish only after editing, reconciliation and audit writing all finish.
+    # Any failure above leaves the caller's previous valid pair untouched.
+    result.document = document
+    result.reconciliation = reconciliation
+    return result
+
+
+def claim_for(document: LossRunDocument, finding: Finding) -> Claim | None:
+    """The claim a finding is about, or None where it is about the document.
+
+    Findings about one physical row carry that row's identity. Group and
+    document findings deliberately return no claim: choosing the first row
+    sharing a number recreates the duplicate-number bug.
+    """
+    if finding.scope is FindingScope.CLAIM:
+        for claim in document.claims:
+            if claim.row_id == finding.subject:
+                return claim
+    return None
+
+
+def save_confirmed_mapping(
+    result: ExtractionResult,
+    mapping: ColumnMapping | None = None,
+    *,
+    profiles_dir: Path | None = None,
+    confirmed_by_human: bool = True,
+) -> CarrierProfile:
+    """Save the mapping screen's choices as a reusable carrier profile.
+
+    Everything saved is format structure. The whitelist in
+    :func:`core.profiles.sanitise_profile` refuses anything else, so a claimant
+    name cannot reach disk through this path.
+    """
+    from core.profiles import profile_from_mapping, save_profile
+
+    mapping = mapping or result.mapping
+    document = result.document
+    profile = profile_from_mapping(
+        document.profile_fingerprint or mapping.fingerprint,
+        mapping.headers,
+        dict(mapping.fields),
+        carrier=document.carrier,
+        date_order=result.date_order.order if result.date_order.confident else None,
+        number_locale=result.locale.locale if result.locale.confident else None,
+        recovery_convention=(
+            "credit" if result.recovery_sign.should_negate else None
+        ),
+        currency=document.currency,
+        line_of_business=(
+            document.line_of_business.value if document.line_of_business else None
+        ),
+        confirmed_by_human=confirmed_by_human,
+    )
+    profile.times_used = (result.profile.times_used + 1) if result.profile else 1
+    save_profile(profile, profiles_dir)
+    return profile
+
+
+def sample_rows(tables: Sequence[RawTable], count: int = 3) -> list[list[str]]:
+    """The first few data rows, for the mapping screen and the LLM prompt."""
+    rows: list[list[str]] = []
+    for table in tables:
+        for row in table.rows:
+            rows.append(list(row.cells))
+            if len(rows) >= count:
+                return rows
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Stage 6 — review adapters
+#
+# The review table is a presentation of the document, and turning one into the
+# other is logic, so it lives here rather than in the Streamlit layer.
+# --------------------------------------------------------------------------
+
+#: Provenance columns carried through the editor so an edited row can still be
+#: traced back to the page it came from. Shown read-only.
+PROVENANCE_COLUMNS = ("_page", "_row", "_method")
+
+#: The claim's durable identity, carried through the editable table and never
+#: shown in it. See :attr:`core.schema.Claim.row_id`.
+ROW_ID_COLUMN = "_id"
+
+REVIEW_COLUMNS: tuple[str, ...] = (
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "cause_of_loss",
+    "paid_indemnity",
+    "paid_medical",
+    "paid_expense",
+    "paid_total",
+    "reserve_indemnity",
+    "reserve_medical",
+    "reserve_expense",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total",
+    "litigation_flag",
+)
+
+
+def review_columns(document: LossRunDocument) -> list[str]:
+    """Show the columns this document actually has, plus the required ones."""
+    always = {"claim_number", "date_of_loss", "incurred_total"}
+    present = []
+    for name in REVIEW_COLUMNS:
+        if name in always:
+            present.append(name)
+            continue
+        if any(getattr(claim, name, None) is not None for claim in document.claims):
+            present.append(name)
+    return present
+
+
+def to_records(
+    document: LossRunDocument, columns: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """The claims as plain rows for the editable table."""
+    names = list(columns or review_columns(document))
+    records = []
+    for claim in document.claims:
+        row: dict[str, Any] = {}
+        for name in names:
+            value = getattr(claim, name, None)
+            if isinstance(value, Decimal):
+                # Keep the exact decimal spelling through the UI boundary.
+                # Streamlit numbers are binary floats and cannot preserve
+                # either arbitrary precision or the carrier's written scale.
+                row[name] = format(value, "f")
+            elif hasattr(value, "value"):
+                row[name] = value.value
+            else:
+                row[name] = value
+        row["_page"] = claim.source_page
+        row["_row"] = claim.source_row
+        row["_method"] = claim.source_method.value
+        # Which row this is, carried through the table so an edit can be put
+        # back on the claim it came from. Not displayed: it answers a question
+        # the reviewer is not asking, and every other column on the row is one
+        # they may change, the claim number included.
+        row[ROW_ID_COLUMN] = claim.row_id
+        records.append(row)
+    return records
+
+
+def _is_missing(value: Any) -> bool:
+    """True for every flavour of "no value" a table round trip can produce.
+
+    pandas, numpy and pyarrow each have their own null, and none of them is
+    ``None``. Any of them reaching ``Decimal`` becomes ``Decimal("NaN")``,
+    which the schema rejects — so they are all caught in one place.
+    """
+    if value is None:
+        return True
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    try:
+        # numpy.nan, pandas.NA and pyarrow nulls all answer this.
+        import pandas as pd
+
+        result = pd.isna(value)
+    except (ImportError, ValueError, TypeError):
+        return False
+    return bool(result) if isinstance(result, bool) or getattr(result, "ndim", 0) == 0 else False
+
+
+def _coerce(
+    field_name: str, value: Any, locale: str | None, date_order: str | None
+) -> tuple[Any, NullReason | None]:
+    """Turn one edited cell back into a canonical value."""
+    # Status has no null: an unset status is UNKNOWN, not a missing value.
+    if field_name == "claim_status":
+        return parse_status(value), None
+
+    # An empty numeric cell arrives as NaN once the table has been through
+    # pandas. NaN is a null, not a zero, and it must never reach a Decimal.
+    if _is_missing(value):
+        return None, NullReason.EMPTY
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, NullReason.EMPTY
+
+    if field_name in MONEY_FIELDS:
+        if isinstance(value, Decimal):
+            return (value, None) if value.is_finite() else (None, NullReason.EMPTY)
+        if isinstance(value, bool):
+            return None, NullReason.UNPARSEABLE
+        if isinstance(value, (int, float)):
+            # str() first: Decimal(0.1) is not Decimal("0.1").
+            amount = Decimal(str(value))
+            return (amount, None) if amount.is_finite() else (None, NullReason.EMPTY)
+        parsed = parse_money(str(value), locale)
+        return parsed.value, parsed.reason
+    if field_name in DATE_FIELDS:
+        if isinstance(value, date):
+            return value, None
+        parsed_date = parse_date(str(value), date_order)
+        return parsed_date.value, parsed_date.reason
+    if field_name == "litigation_flag":
+        return parse_bool(value), None
+    return parse_text(value), None
+
+
+def _as_text(value: Any) -> str:
+    """A value as the audit trail should keep it: readable, and never a float."""
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return f"{value:f}"
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
+def _audit_value(claim: Claim, field_name: str) -> str:
+    """A value and, when null, the reason needed to reconstruct its meaning."""
+    value = getattr(claim, field_name, None)
+    if value is not None:
+        return _as_text(value)
+    reason = claim.field_issues.get(field_name, NullReason.EMPTY)
+    return f"null ({reason.value})"
+
+
+def apply_edits(
+    document: LossRunDocument,
+    records: Sequence[dict[str, Any]],
+    *,
+    locale: str | None = None,
+    date_order: str | None = None,
+    audit: bool = True,
+) -> LossRunDocument:
+    """Rebuild the document from the edited table.
+
+    A cell the human changed becomes ``source_method="manual"`` with full
+    confidence and no outstanding issue — they are the authority, and the audit
+    trail records that they were.
+
+    Every change made here is written to the review log, because this table is
+    the main editing surface and not a side door: a carrier's figure replaced
+    in the grid is the same act as one corrected against a finding, and an
+    export that shows the second and not the first is not an audit trail. A
+    removed row is refused: a short audit summary cannot replace its complete
+    carrier evidence, and R-05 only notices when a printed count exists.
+
+    ``audit=False`` is for :func:`resolve_finding`, which records the same
+    change against the finding it was made about and would otherwise log it
+    twice.
+    """
+    locale = locale or (document.locale_hint if document.locale_confident else None)
+    date_order = date_order or (
+        document.date_order if document.date_order_confident else None
+    )
+    # The row a record came from, found by the one thing about it a reviewer
+    # cannot edit. Matching on the claim number instead loses the original
+    # whenever the number is what changed -- which is the ordinary remedy for
+    # a duplicate -- and with it the printed cell text, the region on the page
+    # and the reasons its nulls are null.
+    by_identity = {claim.row_id: claim for claim in document.claims if claim.row_id}
+    if any(ROW_ID_COLUMN in record for record in records):
+        returned_ids = {
+            str(record.get(ROW_ID_COLUMN) or "") for record in records
+            if record.get(ROW_ID_COLUMN)
+        }
+        removed = [claim for row_id, claim in by_identity.items() if row_id not in returned_ids]
+        if removed:
+            named = ", ".join(f"{claim.claim_number} ({claim.where()})" for claim in removed)
+            raise ValueError(
+                "Claim rows cannot be deleted because that would discard carrier "
+                f"evidence. Restore the row before continuing: {named}."
+            )
+    originals = {
+        (claim.source_page, claim.source_row, claim.claim_number): claim
+        for claim in document.claims
+    }
+    by_position = list(document.claims)
+
+    claims: list[Claim] = []
+    for index, record in enumerate(records):
+        claim_number = clean_text(record.get("claim_number", ""))
+        if not claim_number:
+            continue  # a row emptied out is a row deleted
+
+        original = by_identity.get(str(record.get(ROW_ID_COLUMN) or ""))
+        # Records built by hand -- a test, a caller predating the identity --
+        # still match the way they always did.
+        if original is None:
+            key = (record.get("_page"), record.get("_row"), claim_number)
+            original = originals.get(key)
+        if original is None and index < len(by_position):
+            candidate = by_position[index]
+            if candidate.claim_number == claim_number:
+                original = candidate
+
+        issues = dict(original.field_issues) if original else {}
+        confidence = dict(original.field_confidence) if original else {}
+        raw_cells = dict(original.raw_cells) if original else {}
+        edited = False
+        touched: list[str] = []
+        originals_read = dict(original.original_values) if original else {}
+        issues_read = dict(original.original_issues) if original else {}
+        fields: dict[str, Any] = original.model_dump(exclude={
+            "claim_number", "row_id", "source_page", "source_row", "source_bbox",
+            "source_lines", "edited_fields", "original_values", "original_issues",
+            "read_method", "source_method", "field_issues", "field_confidence",
+            "raw_cells", "currency",
+        }) if original else {}
+
+        for name, value in record.items():
+            if name in PROVENANCE_COLUMNS or name == "claim_number":
+                continue
+            if name not in REVIEW_COLUMNS:
+                continue
+            previous = getattr(original, name, None) if original else None
+            if (isinstance(previous, Decimal) and isinstance(value, str)
+                    and value == format(previous, "f")):
+                # Canonical text already on the screen is not fresh locale
+                # input. In an EU document, 1.234 may otherwise become 1234.
+                coerced, reason = previous, None
+            else:
+                coerced, reason = _coerce(name, value, locale, date_order)
+            # A figure the reviewer did not touch keeps the scale it was read
+            # at. The table round-trips money through float, so 8,400.00 comes
+            # back as 8400.0 -- the same amount, spelled with less of what the
+            # carrier printed, on a row nobody edited.
+            fields[name] = previous if coerced == previous else coerced
+            explicit_null_change = (
+                coerced is None and previous is None and reason is not None
+                and isinstance(value, str) and bool(value.strip())
+                and reason != issues.get(name, NullReason.EMPTY)
+            )
+            if coerced != previous or explicit_null_change:
+                edited = True
+                touched.append(name)
+                # What the extractor read, kept before the correction lands on
+                # top of it. Only the first correction records one: a second
+                # edit of the same cell is a person changing their own answer,
+                # not the document's.
+                if original is not None and name not in originals_read:
+                    originals_read[name] = _as_text(previous)
+                    # And why it was null, when it was. The reason is the
+                    # carrier's evidence about that cell just as much as the
+                    # text is, and popping it below would be the only copy.
+                    was_unreadable = original.field_issues.get(name)
+                    if was_unreadable is not None:
+                        issues_read[name] = was_unreadable
+                confidence[name] = 1.0
+                issues.pop(name, None)
+                if coerced is None and reason and reason is not NullReason.EMPTY:
+                    issues[name] = reason
+            elif original is not None and name in original.field_issues:
+                issues[name] = original.field_issues[name]
+
+        if original is not None and claim_number != original.claim_number:
+            # A renumbered claim is an edited field like any other, and the
+            # loop above skips it: the claim number is the row's label, so it
+            # is read before the fields rather than with them. Left out, the
+            # one change that alters what a row calls itself would be the one
+            # change nothing recorded.
+            edited = True
+            touched.append("claim_number")
+            originals_read.setdefault("claim_number", original.claim_number)
+
+        claims.append(
+            Claim(
+                claim_number=claim_number,
+                row_id=original.row_id if original else "",
+                source_page=int(record.get("_page") or (original.source_page if original else 1)),
+                source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
+                source_bbox=original.source_bbox if original else None,
+                source_lines=list(original.source_lines) if original else [],
+                edited_fields=sorted(
+                    set(touched) | set(original.edited_fields if original else [])
+                ),
+                original_values=originals_read,
+                original_issues=issues_read,
+                # How the row was read, kept beside how it now reads. Without
+                # it, correcting one cell would leave the other nine unable to
+                # say whether they came off a text layer or out of a scan.
+                read_method=(
+                    original.read_method or original.source_method
+                    if original is not None
+                    else None
+                ),
+                source_method=(
+                    SourceMethod.MANUAL
+                    if edited or original is None
+                    else original.source_method
+                ),
+                field_issues=issues,
+                field_confidence=confidence,
+                raw_cells=raw_cells,
+                currency=original.currency if original else None,
+                **fields,
+            )
+        )
+
+    retained_ids = {claim.row_id for claim in claims if claim.row_id}
+    if any(claim.row_id not in retained_ids for claim in document.claims):
+        raise ValueError(
+            "Claim rows cannot be deleted or have their claim number cleared; "
+            "restore the row so its carrier evidence remains available."
+        )
+    updated = document.model_copy(deep=True)
+    updated.claims = claims
+    if audit:
+        _record_edits(updated, document.claims, claims)
+    return updated
+
+
+def _record_edits(
+    document: LossRunDocument,
+    before: Sequence[Claim],
+    after: Sequence[Claim],
+) -> None:
+    """Write what the table changed into the review log.
+
+    Keyed on the row rather than on any finding: nobody raised these, so there
+    is nothing for a later run to re-raise or retire. They are here to answer
+    "who replaced this figure, and what was it before".
+    """
+    was = {claim.row_id: claim for claim in before if claim.row_id}
+    now = {claim.row_id: claim for claim in after if claim.row_id}
+
+    for row_id, gone in was.items():
+        if row_id in now:
+            continue
+        document.review_log.record(
+            Resolution(
+                key=f"deleted|{row_id}",
+                action=ReviewAction.DELETED,
+                row_id=row_id,
+                where=gone.where(),
+                claim_number=gone.claim_number,
+                message=(
+                    f"Claim {gone.claim_number} was removed on the review screen, "
+                    f"read from {gone.where()}."
+                ),
+                before=_deleted_summary(gone),
+                after=None,
+            )
+        )
+
+    for row_id, current in now.items():
+        previous = was.get(row_id)
+        if previous is None:
+            document.review_log.record(
+                Resolution(
+                    key=f"added|{row_id}",
+                    action=ReviewAction.EDITED,
+                    row_id=row_id,
+                    where=current.where(),
+                    claim_number=current.claim_number,
+                    message=(
+                        f"Claim {current.claim_number} was added on the review "
+                        f"screen. The document is not its source."
+                    ),
+                    before=None,
+                    after=current.claim_number,
+                )
+            )
+            continue
+        for field_name in current.edited_fields:
+            was_value = _audit_value(previous, field_name)
+            now_value = _audit_value(current, field_name)
+            if was_value == now_value:
+                continue
+            document.review_log.record(
+                Resolution(
+                    key=f"edited|{row_id}|{field_name}",
+                    action=ReviewAction.EDITED,
+                    row_id=row_id,
+                    where=current.where(),
+                    claim_number=current.claim_number,
+                    field=field_name,
+                    message=(
+                        f"{field_name.replace('_', ' ').capitalize()} was changed "
+                        f"in the claims table, on the row read from "
+                        f"{current.where()}."
+                    ),
+                    before=was_value,
+                    after=now_value,
+                )
+            )
+
+
+def _deleted_summary(claim: Claim) -> str:
+    """What a removed row held, in one line, so the loss is visible."""
+    parts = [f"claim {claim.claim_number}"]
+    if claim.date_of_loss:
+        parts.append(f"loss {claim.date_of_loss.isoformat()}")
+    for field_name in ("paid_total", "reserve_total", "incurred_total"):
+        value = getattr(claim, field_name, None)
+        if value is not None:
+            parts.append(f"{field_name.replace('_', ' ')} {value}")
+    return ", ".join(parts)

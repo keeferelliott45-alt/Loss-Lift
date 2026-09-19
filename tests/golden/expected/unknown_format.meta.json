@@ -1,0 +1,33 @@
+{
+  "name": "unknown_format",
+  "description": "Headers the built-in vocabulary cannot place \u2014 needs mapping",
+  "carrier": "Ardmore Speciality Lines Limited",
+  "named_insured": "Whitfield Engineering Ltd",
+  "policy_number": "ASL/2024/00918",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 6,
+  "printed_claim_count": 6,
+  "printed_totals": {
+    "paid_total": "50791.90",
+    "reserve_total": "107300.00",
+    "recovery_total": "1750.00",
+    "incurred_total": "156341.90"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}

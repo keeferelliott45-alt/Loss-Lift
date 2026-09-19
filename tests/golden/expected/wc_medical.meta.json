@@ -1,0 +1,43 @@
+{
+  "name": "wc_medical",
+  "description": "Workers comp with paid/reserve medical columns",
+  "carrier": "Statewide Mutual Insurance",
+  "named_insured": "Cascade Millwork Inc",
+  "policy_number": "WC-778312-24",
+  "policy_period_start": "2024-04-01",
+  "policy_period_end": "2025-03-31",
+  "valuation_date": "2025-03-31",
+  "line_of_business": "WC",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 6,
+  "printed_claim_count": 6,
+  "printed_totals": {
+    "paid_indemnity": "29950.00",
+    "paid_medical": "57056.75",
+    "paid_expense": "5525.00",
+    "paid_total": "92531.75",
+    "reserve_indemnity": "54000.00",
+    "reserve_medical": "85000.00",
+    "reserve_expense": "8700.00",
+    "reserve_total": "147700.00",
+    "incurred_total": "240231.75"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "paid_indemnity",
+    "paid_medical",
+    "paid_expense",
+    "paid_total",
+    "reserve_indemnity",
+    "reserve_medical",
+    "reserve_expense",
+    "reserve_total",
+    "incurred_total"
+  ]
+}
