@@ -228,6 +228,23 @@ def test_r22_names_the_page_with_its_own_provenance(continuation):
     assert "2" in finding.message
 
 
+def test_r22_does_not_blame_a_vision_reader_that_never_ran(continuation):
+    """The page failed on the digital side, and the finding has to say so.
+
+    ``unresolved_pages`` used to mean one thing -- a vision reader answered
+    and returned nothing -- so R-22 described every page in it that way.
+    Putting a digital page in the same set made the finding state that a
+    model had declined to read a page no model was ever shown, with vision
+    switched off entirely. The page was right and the reason was false, which
+    sends a reviewer to turn on a reader that would not have helped.
+    """
+    result = run_pipeline(continuation, use_vision=False)
+    finding = _r22(result)[0]
+    said = f"{finding.message} {finding.actual}".lower()
+    assert "vision" not in said, said
+    assert "table" in said, said
+
+
 # --------------------------------------------------------------------------
 # 5-6, 9-10. Pages the extractor correctly found no table on
 # --------------------------------------------------------------------------
@@ -324,6 +341,9 @@ def test_vision_empty_result_behaviour_is_unchanged(tmp_path, monkeypatch):
     assert 1 in result.document.unresolved_pages
     assert 1 not in result.document.processed_pages
     assert [f.page for f in _r22(result)] == [1]
+    # The reader that gave up here really was the vision one, and the finding
+    # still says so: carrying a reason must not cost the original case its own.
+    assert "vision" in _r22(result)[0].message.lower()
 
 
 def test_a_vision_page_that_returned_rows_stays_processed(tmp_path):

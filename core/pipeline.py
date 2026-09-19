@@ -2086,6 +2086,12 @@ def run_pipeline(
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
+        unresolved_reasons={
+            page: (
+                "it is laid out as a table and no table could be read from it"
+            )
+            for page in sorted(unread_table_pages)
+        },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,
