@@ -1725,6 +1725,48 @@ def extract_metadata(page_text: str) -> DocumentMetadata:
     )
 
 
+#: Two cells is a label beside its value, which a masthead, an address block
+#: and a signature line all read as. A row of data starts at three.
+TABULAR_CELL_COUNT = 3
+#: One columnar line is a heading with a date set out to the right. A page has
+#: to keep doing it before its layout is evidence of anything.
+MIN_TABULAR_LINES = 2
+
+
+def presents_as_table(words: Sequence[Word]) -> bool:
+    """Whether this page's own geometry is that of a table.
+
+    Asked only of a page table extraction already returned nothing for, to
+    separate two outcomes that are otherwise recorded identically: a cover, a
+    covering letter or a divider sheet, which yielded no table because none
+    was printed, and a continuation sheet printed without its own header,
+    which had one and lost it. Both produce text. Only the second is data
+    that went unread, and only the second may be called unresolved -- calling
+    every page without a table unread would bury a reviewer in findings about
+    instruction sheets.
+
+    The evidence is the layout the extractor itself reads tables from:
+    whitespace gutters holding words apart into columns, line after line. Not
+    the words, not how many, and not whether any are figures -- a page of
+    prose about limits and deductibles carries more numerals than a
+    continuation sheet does and still has nothing standing in columns.
+    """
+    if not words:
+        return False
+    char_width = _median_char_width(words)
+    lines = cluster_lines(words)
+    if len(lines) < MIN_TABULAR_LINES:
+        return False
+    columnar = sum(
+        1
+        for line in lines
+        if len(split_cells(line, char_width, COLUMN_GUTTER_FACTOR)) >= TABULAR_CELL_COUNT
+    )
+    # A majority, not a single instance: a letter that sets a policy number
+    # out beside its label has one columnar line among twenty of prose.
+    return columnar * 2 > len(lines)
+
+
 # --------------------------------------------------------------------------
 # Whole-document entry point
 # --------------------------------------------------------------------------
@@ -1740,6 +1782,10 @@ class DigitalExtraction:
     #: table sliced by column -- see detect_column_split_pages. Structural
     #: evidence only; no claim or money field is read to produce this.
     column_split_pages: list[tuple[int, int]] = dataclass_field(default_factory=list)
+    #: Pages that yielded text and a table-shaped layout but no table -- see
+    #: presents_as_table. Text came off them; their contents did not. They are
+    #: not processed pages, and the distinction is the caller's to record.
+    unread_table_pages: list[int] = dataclass_field(default_factory=list)
 
     @property
     def all_rows(self) -> list[RawRow]:
@@ -1765,6 +1811,7 @@ def extract_pdf(
     tables: list[RawTable] = []
     page_texts: dict[int, str] = {}
     signatures: list[PageSignature] = []
+    unread_table_pages: list[int] = []
 
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
@@ -1774,13 +1821,16 @@ def extract_pdf(
             # to read as "no letter band here" for the pairing below to
             # correctly refuse to join across it, and it only reads that way
             # if it was looked at.
-            signatures.append(page_signature(index, page_words(page)))
+            words = page_words(page)
+            signatures.append(page_signature(index, words))
             if pages is not None and index not in pages:
                 continue
             page_texts[index] = page.extract_text() or ""
             table = extract_page_table(page, index)
             if table is not None:
                 tables.append(table)
+            elif presents_as_table(words):
+                unread_table_pages.append(index)
 
     column_split_pages = detect_column_split_pages(signatures)
 
@@ -1836,4 +1886,5 @@ def extract_pdf(
         page_texts=page_texts,
         page_count=page_count,
         column_split_pages=column_split_pages,
+        unread_table_pages=unread_table_pages,
     )

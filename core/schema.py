@@ -586,6 +586,12 @@ class LossRunDocument(BaseModel):
     #: deterministic reader can establish that; a model declining to find
     #: anything is not evidence that there was nothing to find.
     unresolved_pages: list[int] = Field(default_factory=list)
+    #: Why each unresolved page is unresolved, where the reader that gave up
+    #: was not the vision one. A page reaches this set from more than one
+    #: direction now, and a finding that names the wrong reader sends a
+    #: reviewer to turn on something that would not have helped. Absent means
+    #: the original case: a vision reader answered and returned nothing.
+    unresolved_reasons: dict[int, str] = Field(default_factory=dict)
     #: Source pages deliberately not attempted, such as scans with vision off.
     skipped_pages: list[int] = Field(default_factory=list)
     #: Adjacent page pairs whose own printed geometry -- consecutive

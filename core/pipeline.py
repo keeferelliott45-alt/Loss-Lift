@@ -1764,10 +1764,25 @@ def run_pipeline(
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
-    processed_pages = set(extraction.page_texts)
+    # Text coming off a page is not the same fact as the page having been
+    # read. A continuation sheet printed without its own header yields words,
+    # no header line, and so no table at all -- and seeding this set from the
+    # pages text was extracted from reported it as successfully processed
+    # while every row on it disappeared. R-22 is the rule for exactly that and
+    # could not see it, because a page in `processed` is a page accounted for.
+    # The vision path below already draws the distinction it needs; this is
+    # the same distinction on the digital side.
+    unread_table_pages = set(extraction.unread_table_pages)
+    processed_pages = set(extraction.page_texts) - unread_table_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
-    unresolved_pages: set[int] = set()
+    unresolved_pages: set[int] = set(unread_table_pages)
+    if unread_table_pages:
+        joined = ", ".join(str(page) for page in sorted(unread_table_pages))
+        warnings.append(
+            f"Page(s) {joined} are laid out as tables but no table could be "
+            f"read from them. Whether they hold claims is unknown."
+        )
 
     scanned_pages = classification.scanned_pages
     vision_tables: list[RawTable] = []
@@ -2071,6 +2086,12 @@ def run_pipeline(
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
+        unresolved_reasons={
+            page: (
+                "it is laid out as a table and no table could be read from it"
+            )
+            for page in sorted(unread_table_pages)
+        },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,
