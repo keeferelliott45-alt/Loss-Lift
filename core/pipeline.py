@@ -1772,17 +1772,20 @@ def run_pipeline(
     #
     # The picture is not evidence that claims are there and not evidence that
     # they are not. It is unread source content, so the page stays unresolved
-    # and R-22 asks for it to be looked at. A page whose table was read is
-    # accounted for whatever is printed behind it, which is what keeps a
-    # watermark or a letterhead from raising anything.
-    read_table_pages = {
-        table.page for table in tables if table.rows or table.total_rows
-    }
+    # and R-22 asks for it to be looked at.
+    #
+    # A table read off the page does not answer for the page. A carrier that
+    # prints a short summary above a pasted appendix puts both on one sheet,
+    # and excusing the sheet because half of it read is how the other half
+    # goes missing quietly -- worse, the rows it did yield stop anything else
+    # looking twice. What keeps a watermark or a letterhead from raising
+    # anything is that a table printed over a picture puts its own words on
+    # that picture, which is what carries_unread_image already asks.
     unread_image_pages = {
         page.page
         for page in classification.pages
         if not page.is_scanned and page.carries_unread_image
-    } - read_table_pages
+    }
     processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
@@ -2096,6 +2099,13 @@ def run_pipeline(
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
+        unresolved_reasons={
+            page: (
+                "most of it is a picture and nothing read what the picture "
+                "holds"
+            )
+            for page in sorted(unread_image_pages)
+        },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,

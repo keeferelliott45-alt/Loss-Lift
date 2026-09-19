@@ -181,6 +181,49 @@ def test_r22_names_the_raster_page_with_its_provenance(raster_loss_run):
     assert any("2" in warning for warning in result.warnings)
 
 
+def test_a_read_table_does_not_account_for_a_picture_beside_it(tmp_path):
+    """One page, a table that was read and a picture that was not.
+
+    Subtracting every page a table came off treated the table as answering
+    for the whole page. A carrier that prints a short summary table above a
+    pasted appendix puts both on one sheet: the summary reads, the appendix
+    is never looked at, and the page was called processed on the strength of
+    the half that worked. The claim it yields makes it worse, not better --
+    the document has rows, so nothing else looks twice at it.
+    """
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _text(page, ("MERIDIAN MUTUAL ASSURANCE", "Valuation Date: 12/31/2024"))
+    _table(page, 95.0, rows=ROWS[:1])
+    # Words all sit above y=150; the picture starts below them.
+    _image(page, pymupdf.Rect(40, 250, 572, 780))
+    path = _save(document, tmp_path / "mixed.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert len(result.document.claims) == 1, "the readable table must still read"
+    assert 1 not in result.document.processed_pages
+    assert 1 in result.document.unresolved_pages
+    assert [f.page for f in _r22(result)] == [1]
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_r22_does_not_blame_a_vision_reader_that_never_ran(raster_loss_run):
+    """The picture was never submitted to vision, so vision cannot have failed.
+
+    ``unresolved_pages`` meant one thing when R-22 was written -- a vision
+    reader answered and returned nothing -- so the rule described every page
+    in it that way. These pages are excluded from ``scanned_pages`` and are
+    never shown to any reader, including when vision is off entirely. The
+    page was right and the reason was false, which points a reviewer at a
+    switch that would not have helped.
+    """
+    result = run_pipeline(raster_loss_run, use_vision=False)
+    finding = _r22(result)[0]
+    said = f"{finding.message} {finding.actual}".lower()
+    assert "vision" not in said, said
+    assert "picture" in said, said
+
+
 def test_the_claims_on_the_readable_page_are_untouched(raster_loss_run):
     """Stated for the record: this unit reads nothing out of the picture."""
     result = run_pipeline(raster_loss_run, use_vision=False)
