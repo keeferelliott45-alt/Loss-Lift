@@ -22,10 +22,9 @@ SCANNED_CHAR_THRESHOLD = 50
 #: Below this share of the page, pictures are decoration -- a logo, a seal, a
 #: signature block -- and whatever they hold is not the page.
 IMAGE_DOMINANT_FRACTION = 0.5
-#: Above this share of a page's words standing inside its pictures, the words
-#: are the pictures' own text layer: a scan saved as searchable, whose text is
-#: the reading of the image. Below it they sit beside the picture, which makes
-#: them a caption and leaves the picture unread.
+#: Above this share of a page's text transcribing its pictures, the page is a
+#: scan saved as searchable and its text is the reading of the image. Below
+#: it, nothing on the page claims to have read the picture.
 TEXT_ON_IMAGE_FRACTION = 0.5
 
 
@@ -37,32 +36,45 @@ class PageClassification:
     has_images: bool = False
     #: Share of the page covered by pictures, overlaps counted once.
     image_fraction: float = 0.0
-    #: Share of this page's words standing inside one of those pictures.
+    #: Share of this page's text that transcribes one of those pictures --
+    #: an OCR layer written invisibly over a scan, not a label printed on it.
     text_on_image: float = 0.0
+    #: Where those pictures sit, so a caller holding the extraction can ask
+    #: whether anything it read actually came off one of them.
+    image_boxes: tuple[tuple[float, float, float, float], ...] = ()
 
     @property
     def carries_unread_image(self) -> bool:
-        """Pictures cover the page and its text is not their transcription.
+        """Pictures cover the page and nothing on it transcribes them.
 
         Two pages look alike by area and are opposites in fact. A scan saved
-        with a text layer is one full-page picture, and every word extracted
-        from it stands *on* that picture because the words are its reading --
-        that page has been read. A screenshot pasted under a heading also
-        covers the page, and its words sit outside the picture because they
-        are a caption -- that page has not.
+        as searchable is one full-page picture carrying the characters a
+        scanner recognised in it; a raster appendix under a stamped label is
+        one full-page picture carrying words about it. Both put text inside
+        the picture, so where the words sit settles nothing -- measured on
+        real documents, the sparsest genuine scan carries less text over its
+        image than a page of labels does, by every geometric measure tried.
 
-        Area alone cannot tell them apart, and on the documents this was
-        measured against it would have called 67 pages of one searchable scan
-        unread. Overlap separates them: those pages carry every word on the
-        picture, and a pasted loss run carries none.
+        What separates them is that an OCR layer is written invisibly,
+        because the picture already shows it. See :func:`_transcribed_fraction`.
 
         This says only that something on the page went unread. It does not say
         the picture holds claims, and it must not be read as saying it holds
-        none.
+        none. A caller that knows more -- that the extractor read rows off the
+        picture itself -- can say so; this cannot.
         """
         return (
             self.image_fraction > IMAGE_DOMINANT_FRACTION
             and self.text_on_image <= TEXT_ON_IMAGE_FRACTION
+        )
+
+    def contains(self, box: tuple[float, float, float, float]) -> bool:
+        """Whether something read at ``box`` came off one of the pictures."""
+        x = (box[0] + box[2]) / 2
+        y = (box[1] + box[3]) / 2
+        return any(
+            left <= x <= right and top <= y <= bottom
+            for left, top, right, bottom in self.image_boxes
         )
 
 
@@ -140,40 +152,83 @@ def _image_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
 
 
 def _covered_fraction(rects: list[pymupdf.Rect], page: pymupdf.Page) -> float:
-    """Share of the page under at least one picture, overlaps counted once."""
+    """Share of the page under at least one picture, overlaps counted once.
+
+    Swept column by column rather than gridded. Compressing both axes and
+    asking every cell which pictures cover it is cubic: two hundred
+    placements give four hundred columns and four hundred rows, and each of
+    those hundred and sixty thousand cells is then asked about all two
+    hundred of them. Here each column asks only which pictures span it and
+    merges their vertical runs, which an image-heavy page can afford.
+    """
     total = page.rect.width * page.rect.height
     if not rects or total <= 0:
         return 0.0
-    # A union is never larger than the sum, so a page whose pictures do not
-    # add up to the threshold cannot reach it however they overlap. Answering
-    # from the sum keeps a page of a hundred small logos off the slow path.
-    summed = sum(rect.width * rect.height for rect in rects)
-    if summed / total <= IMAGE_DOMINANT_FRACTION:
-        return summed / total
     xs = sorted({rect.x0 for rect in rects} | {rect.x1 for rect in rects})
-    ys = sorted({rect.y0 for rect in rects} | {rect.y1 for rect in rects})
     covered = 0.0
     for left, right in zip(xs, xs[1:]):
-        for top, bottom in zip(ys, ys[1:]):
-            x = (left + right) / 2
-            y = (top + bottom) / 2
-            if any(r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1 for r in rects):
-                covered += (right - left) * (bottom - top)
+        width = right - left
+        if width <= 0:
+            continue
+        spans = sorted(
+            (rect.y0, rect.y1)
+            for rect in rects
+            if rect.x0 <= left and rect.x1 >= right
+        )
+        height = 0.0
+        top = bottom = None
+        for start, end in spans:
+            if bottom is None:
+                top, bottom = start, end
+            elif start > bottom:
+                height += bottom - top
+                top, bottom = start, end
+            elif end > bottom:
+                bottom = end
+        if bottom is not None:
+            height += bottom - top
+        covered += width * height
     return covered / total
 
 
-def _text_on_image(page: pymupdf.Page, rects: list[pymupdf.Rect]) -> float:
-    """Share of this page's words standing inside one of its pictures."""
-    words = page.get_text("words") or []
-    if not words or not rects:
+#: PDF text render mode 3 draws nothing. It is what a scanner writes when it
+#: saves a page as searchable: the characters it recognised, placed over the
+#: picture and left invisible because the picture already shows them.
+_INVISIBLE_RENDER_MODE = 3
+
+
+def _transcribed_fraction(page: pymupdf.Page, rects: list[pymupdf.Rect]) -> float:
+    """Share of this page's text that transcribes one of its pictures.
+
+    Where the words sit cannot answer whether a picture was read. A scan
+    saved with an OCR layer and a raster appendix under a stamped label both
+    put words inside the picture, and measured on real documents the sparsest
+    genuine scan carries less text over its image -- by share of words, by
+    area covered, by height spanned -- than a page of overlaid labels does.
+    Every geometric line that could be drawn puts genuine scans on both sides
+    of it.
+
+    The file says which it is. An OCR layer is drawn in render mode 3,
+    invisible because the picture underneath already shows it; a label meant
+    for a reader is drawn to be seen. That is the producer's own statement
+    about what the text is for, and it is what this counts.
+
+    A page with no transcription over its pictures scores zero, which is the
+    honest answer: nothing on it claims to have read them.
+    """
+    spans = page.get_texttrace() or []
+    if not spans or not rects:
         return 0.0
-    inside = 0
-    for x0, top, x1, bottom, *_ in words:
+    transcribed = 0
+    for span in spans:
+        if span.get("type") != _INVISIBLE_RENDER_MODE:
+            continue
+        x0, top, x1, bottom = span.get("bbox", (0.0, 0.0, 0.0, 0.0))
         x = (x0 + x1) / 2
         y = (top + bottom) / 2
         if any(r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1 for r in rects):
-            inside += 1
-    return inside / len(words)
+            transcribed += 1
+    return transcribed / len(spans)
 
 
 def classify_pdf(
@@ -193,7 +248,8 @@ def classify_pdf(
                     is_scanned=char_count < threshold,
                     has_images=bool(rects),
                     image_fraction=_covered_fraction(rects, page),
-                    text_on_image=_text_on_image(page, rects),
+                    text_on_image=_transcribed_fraction(page, rects),
+                    image_boxes=tuple(tuple(rect) for rect in rects),
                 )
             )
     return DocumentClassification(pages=tuple(pages))

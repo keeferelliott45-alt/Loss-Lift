@@ -1778,14 +1778,28 @@ def run_pipeline(
     # prints a short summary above a pasted appendix puts both on one sheet,
     # and excusing the sheet because half of it read is how the other half
     # goes missing quietly -- worse, the rows it did yield stop anything else
-    # looking twice. What keeps a watermark or a letterhead from raising
-    # anything is that a table printed over a picture puts its own words on
-    # that picture, which is what carries_unread_image already asks.
+    # looking twice.
+    #
+    # So the question is asked of the picture, not the page: did anything the
+    # extractor read actually come off it? A table printed over a background
+    # read that background with it; a table printed beside a raster read
+    # nothing of the raster. Classification cannot answer this -- it never
+    # sees the extraction -- so it reports where the pictures are and this
+    # decides, row by row.
+    classified = {record.page: record for record in classification.pages}
+    read_off_the_picture = {
+        table.page
+        for table in tables
+        for row in list(table.rows) + list(table.total_rows)
+        if row.bbox
+        and (found := classified.get(table.page)) is not None
+        and found.contains(row.bbox)
+    }
     unread_image_pages = {
         page.page
         for page in classification.pages
         if not page.is_scanned and page.carries_unread_image
-    }
+    } - read_off_the_picture
     processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()

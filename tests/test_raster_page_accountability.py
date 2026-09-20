@@ -361,23 +361,31 @@ def test_a_table_read_over_a_background_image_stays_processed(tmp_path):
     assert _r22(result) == []
 
 
-def test_a_searchable_scan_page_is_not_called_unread(tmp_path):
-    """Requirement stated directly: image area cannot decide this.
+def test_visible_prose_over_a_picture_is_not_a_scan(tmp_path):
+    """This page used to pass for a searchable scan, and it is not one.
 
-    A full-page image whose words sit on it is a scan saved with a text
-    layer. It covers more of the page than the rasterised loss run does and
-    carries far more text and more figures, and it has been read.
+    It was written here as one: a full-page picture with words standing on
+    it, more of them and more numerate than the rasterised loss run carries,
+    asserted to be read. Every word of it is drawn to be seen, so it is prose
+    printed over a picture -- and whatever the picture holds, none of this
+    says. Reading it as a scan is the false negative Codex reported: enough
+    words inside the image to clear any overlap threshold, and no reading of
+    the image among them.
+
+    The genuine article is two tests below, and it differs in the only way
+    that matters: its text is written invisibly, because the picture already
+    shows it.
     """
     document = pymupdf.open()
     _digital_table_page(document)
     page = document.new_page(width=612, height=792)
     _image(page, pymupdf.Rect(0, 0, 612, 792))
     _text(page, NUMERIC_PROSE, y=120)
-    path = _save(document, tmp_path / "searchable.pdf")
+    path = _save(document, tmp_path / "visible_prose.pdf")
     result = run_pipeline(path, use_vision=False)
-    assert 2 in result.document.processed_pages
-    assert 2 not in result.document.unresolved_pages
-    assert _r22(result) == []
+    assert 2 in result.document.unresolved_pages
+    assert 2 not in result.document.processed_pages
+    assert [f.page for f in _r22(result)] == [2]
 
 
 def test_an_image_free_document_is_unchanged(tmp_path):
@@ -523,6 +531,166 @@ def test_both_placements_of_one_image_are_kept(tmp_path):
     )
     assert classified.image_fraction > 0.5, classified.image_fraction
     assert classified.carries_unread_image
+
+
+# --------------------------------------------------------------------------
+# Which text counts as having read a picture
+#
+# Geometry cannot answer this. A scan saved with an OCR layer and a raster
+# appendix under a stamped label both put words inside the picture, and the
+# sparsest genuine scan in the corpus available here carries less text over
+# its image than a page of overlaid labels does. Measured on real documents,
+# every candidate geometric threshold -- share of words, share of the
+# picture's area covered by text, share of its height carrying any -- puts
+# genuine scans on both sides of every line that separates the two.
+#
+# The PDF says which it is. An OCR layer is written in render mode 3, drawn
+# invisibly because the picture already shows it; a label a human is meant to
+# read is drawn visibly. That is the producer's own statement about what the
+# text is for, not an inference from where it sits.
+# --------------------------------------------------------------------------
+
+
+def _ocr_layer(page, lines, rect, size=9):
+    """Invisible text, as a scanner writes when it saves a searchable page."""
+    y = rect.y0 + 20
+    for line in lines:
+        page.insert_text((rect.x0 + 20, y), line, fontsize=size, render_mode=3)
+        y += LINE
+
+
+def test_visible_labels_over_a_picture_do_not_read_it(tmp_path):
+    """Codex's counterexample: enough words on the image, none of them it.
+
+    Every word here stands inside the picture, so overlap alone calls the
+    page read. They are a stamped label, drawn to be seen, and they say
+    nothing about the claims table underneath.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    _text(
+        page,
+        (
+            "CONFIDENTIAL - FOR UNDERWRITING USE ONLY",
+            "Issued 11 February 2024 under reference 4417-2024-08",
+            "This copy supersedes the copy issued 9 February 2024",
+            "Page 2 of 2. Figures stated in USD, gross of deductible.",
+            "Distribution limited to the named recipient. 25,000 limit.",
+            "Retain for 7 years in accordance with clause 12 of the RFP.",
+        ),
+        y=200,
+    )
+    path = _save(document, tmp_path / "labelled.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert 2 not in result.document.processed_pages
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def test_a_searchable_scan_with_an_ocr_layer_stays_processed(tmp_path):
+    """The control the rule above must not break.
+
+    Same geometry as the page before it -- one picture over the whole sheet,
+    words standing on it -- and the opposite fact, because the words are the
+    picture's own transcription.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    _ocr_layer(
+        page,
+        ("MERIDIAN MUTUAL ASSURANCE", "LOSS RUN REPORT", "CN-1004 10/02/2024 CLOSED"),
+        pymupdf.Rect(0, 0, 612, 792),
+    )
+    path = _save(document, tmp_path / "searchable.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.processed_pages
+    assert 2 not in result.document.unresolved_pages
+    assert _r22(result) == []
+
+
+def test_a_sparse_ocr_layer_still_reads_its_picture(tmp_path):
+    """A nearly blank scanned sheet is still a scanned sheet.
+
+    The sparsest genuine scan in the corpus available here carries two spans
+    over a full-page image. Any rule keyed on how *much* text lies over a
+    picture calls that page unread; the layer being a transcription is what
+    makes it read, not how much of it there is.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    # Two short lines: enough to stay on the digital path, far less than a
+    # page of transcription, and still the picture's own reading.
+    _ocr_layer(
+        page,
+        ("Continued overleaf. See attached schedule.", "Page 2 of 2"),
+        pymupdf.Rect(0, 0, 612, 792),
+    )
+    path = _save(document, tmp_path / "sparse_scan.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.processed_pages
+    assert _r22(result) == []
+
+
+def test_a_picture_with_nothing_over_it_stays_unresolved(tmp_path):
+    """Nothing claims to have read it, so nothing did."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(40, 150, 572, 740))
+    _text(
+        page,
+        (
+            "Appendix 2 - Loss Runs",
+            "Since Policy Year 2018",
+            "(Provided by the carrier)",
+        ),
+    )
+    path = _save(document, tmp_path / "bare.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def test_the_union_is_right_and_does_not_go_cubic(tmp_path):
+    """Hundreds of overlapping placements, measured correctly and quickly.
+
+    Compressing the coordinates into a grid and asking every cell which
+    rectangles cover it is cubic in the number of rectangles: two hundred
+    placements give four hundred columns and four hundred rows, and each of
+    those hundred and sixty thousand cells is then asked about all two
+    hundred. A sweep down the columns merges each one's spans instead.
+    """
+    import time
+
+    from core.classify import _covered_fraction
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+
+    # Tiled with overlap along one band: the union is exactly the span they
+    # cover, so the answer is known without measuring it.
+    band = [pymupdf.Rect(i * 2, 100, i * 2 + 4, 300) for i in range(300)]
+    expected = (598 + 4) * 200 / (612 * 792)
+    assert _covered_fraction(band, page) == pytest.approx(expected, rel=1e-9)
+
+    # Distinct in both directions, which is what makes the grid explode.
+    staircase = [pymupdf.Rect(i, i, i + 150, i + 150) for i in range(300)]
+    started = time.perf_counter()
+    covered = _covered_fraction(staircase, page)
+    elapsed = time.perf_counter() - started
+    assert 0.0 < covered < 1.0
+    assert elapsed < 5.0, f"union took {elapsed:.1f}s; the grid path is back"
 
 
 # --------------------------------------------------------------------------
