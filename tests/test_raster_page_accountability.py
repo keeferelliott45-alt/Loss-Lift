@@ -34,6 +34,7 @@ from __future__ import annotations
 import pymupdf
 import pytest
 
+from core.classify import SCANNED_CHAR_THRESHOLD
 from core.pipeline import run_pipeline
 from core.schema import DocumentStatus, RawRow, RawTable, Severity
 
@@ -110,6 +111,87 @@ def _digital_table_page(document):
 
 def _r22(result):
     return [f for f in result.reconciliation.findings if f.rule_id == "R-22"]
+
+
+# --------------------------------------------------------------------------
+# A PDF written by hand, because no library API produces an inline image.
+#
+# A picture can be drawn straight into the content stream between BI and EI
+# instead of being stored as an XObject and referenced. Nothing about the
+# page looks different; the picture is simply not in the page's resources,
+# so asking the resources what pictures a page carries answers "none".
+# --------------------------------------------------------------------------
+
+
+def _pdf(pages: list[bytes]) -> bytes:
+    """Assemble content streams into a PDF with a correct xref table."""
+    objects: list[bytes] = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids["
+        + b" ".join(b"%d 0 R" % (3 + index) for index in range(len(pages)))
+        + b"]/Count %d>>" % len(pages),
+    ]
+    font_number = 3 + 2 * len(pages)
+    for index, _ in enumerate(pages):
+        objects.append(
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources"
+            b"<</Font<</F1 %d 0 R>>>>/Contents %d 0 R>>"
+            % (font_number, 3 + len(pages) + index)
+        )
+    for content in pages:
+        objects.append(
+            b"<</Length %d>>stream\n" % len(content) + content + b"\nendstream"
+        )
+    objects.append(b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")
+
+    out = bytearray(b"%PDF-1.7\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj" % number + body + b"endobj\n"
+    start = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        start,
+    )
+    return bytes(out)
+
+
+def _lines(cells) -> bytes:
+    """Content-stream text. ``cells`` is (x, top-origin y, text)."""
+    return b"".join(
+        b"BT /F1 8.5 Tf %.1f %.1f Td (%s) Tj ET\n"
+        % (x, 792 - y, text.replace("(", r"\(").replace(")", r"\)").encode())
+        for x, y, text in cells
+    )
+
+
+#: A four-pixel grey square, hex-encoded so the stream stays printable. The
+#: pixels are irrelevant: nothing reads them, which is the whole point.
+_INLINE_IMAGE = (
+    b"q\n%.1f 0 0 %.1f %.1f %.1f cm\n"
+    b"BI /W 4 /H 4 /CS /G /BPC 8 /F /AHx ID\n" + b"80" * 16 + b">\nEI\nQ\n"
+)
+
+
+def _inline_raster(rect, cells) -> bytes:
+    left, top, right, bottom = rect
+    return _INLINE_IMAGE % (
+        right - left, bottom - top, left, 792 - bottom
+    ) + _lines(cells)
+
+
+def _append_inline_raster(document, rect, cells):
+    """Append a page whose picture is drawn into the content stream.
+
+    Built by hand and then read back in, so the rest of the document can be
+    made the ordinary way: only the picture needs the hand-written stream.
+    """
+    with pymupdf.open(stream=_pdf([_inline_raster(rect, cells)]), filetype="pdf") as source:
+        document.insert_pdf(source)
 
 
 @pytest.fixture()
@@ -305,6 +387,142 @@ def test_an_image_free_document_is_unchanged(tmp_path):
     result = run_pipeline(path, use_vision=False)
     assert result.document.unresolved_pages == []
     assert _r22(result) == []
+
+
+# --------------------------------------------------------------------------
+# Pictures the resources do not mention, and pictures mentioned twice
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def inline_raster(tmp_path):
+    """Page 1 a sound table; page 2 a caption over an inline-image loss run."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    _append_inline_raster(
+        document,
+        (40, 150, 572, 740),
+        [
+            (LEFT, 50, "Appendix 2 - Loss Runs"),
+            (LEFT, 64, "Since Policy Year 2018"),
+            (LEFT, 78, "(Provided by the carrier)"),
+        ],
+    )
+    return _save(document, tmp_path / "inline.pdf")
+
+
+def test_the_inline_fixture_is_invisible_to_the_resources(inline_raster):
+    """Precondition: the picture is real, dominant, and not in get_images()."""
+    document = pymupdf.open(inline_raster)
+    page = document[1]
+    assert page.get_images(full=True) == [], (
+        "the fixture no longer reproduces an inline image"
+    )
+    blocks = [b for b in page.get_text("dict")["blocks"] if b["type"] == 1]
+    assert len(blocks) == 1
+    left, top, right, bottom = blocks[0]["bbox"]
+    assert (right - left) * (bottom - top) / (612 * 792) > 0.5
+    assert len(page.get_text().strip()) >= SCANNED_CHAR_THRESHOLD, (
+        "the page must stay on the digital path"
+    )
+
+
+def test_an_inline_raster_page_is_not_processed(inline_raster):
+    result = run_pipeline(inline_raster, use_vision=False)
+    assert 2 not in result.document.processed_pages
+    assert 2 in result.document.unresolved_pages
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_an_inline_raster_page_keeps_its_identity_and_reason(inline_raster):
+    result = run_pipeline(inline_raster, use_vision=False)
+    raised = _r22(result)
+    assert [f.page for f in raised] == [2]
+    finding = raised[0]
+    assert finding.condition == "page-2"
+    assert finding.severity is Severity.ERROR
+    said = f"{finding.message} {finding.actual}".lower()
+    assert "vision" not in said, said
+    assert "picture" in said, said
+    assert {c.claim_number for c in result.document.claims} == {
+        "CN-1001", "CN-1002", "CN-1003"
+    }
+
+
+def test_caption_text_does_not_buy_an_inline_raster_page_off(tmp_path):
+    """More words beside the picture is not more of the picture read.
+
+    The caption here is longer than the table on page 1 and carries more
+    figures than the claims do. None of it is inside the picture, and none of
+    it says what the picture holds.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    _append_inline_raster(
+        document,
+        (40, 170, 572, 750),
+        [
+            (LEFT, 50, "Appendix 2 - Loss Runs, policy years 2018 through 2023"),
+            (LEFT, 64, "Provided by the carrier on 11 February 2024 under cover"),
+            (LEFT, 78, "of its letter of 9 February 2024, reference 4417-2024-08."),
+            (LEFT, 92, "Totals shown are gross of the 25,000 deductible and are"),
+            (LEFT, 106, "stated in USD. 12 claims are listed across 3 policy years."),
+        ],
+    )
+    path = _save(document, tmp_path / "wordy.pdf")
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def test_one_image_under_two_resource_names_is_measured_once(tmp_path):
+    """Two names for one picture are one picture, asked about once.
+
+    ``get_image_rects`` answers for an xref, not for the name it was reached
+    by, so every name repeats every placement. Two placements written by two
+    names produced four rectangles; two hundred would produce forty thousand,
+    and both geometry passes walk that list for every word on the page.
+    """
+    from core.classify import _image_rects
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(40, 40, 200, 120))
+    _image(page, pymupdf.Rect(40, 400, 200, 480))
+    path = _save(document, tmp_path / "twice.pdf")
+
+    reopened = pymupdf.open(path)
+    placed = reopened[0]
+    names = placed.get_images(full=True)
+    assert len(names) == 2 and len({image[0] for image in names}) == 1, (
+        "the fixture no longer reproduces one xref under two names"
+    )
+    assert len(_image_rects(placed)) == 2, (
+        "each placement must be counted once, and both must survive"
+    )
+
+
+def test_both_placements_of_one_image_are_kept(tmp_path):
+    """Dedup must not collapse a picture printed twice into one.
+
+    Two halves of one page, each covering a third of it, are together more of
+    the page than either is alone -- and if only one survived, a page that is
+    mostly picture would measure as a page that is not.
+    """
+    from core.classify import classify_pdf
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 300))
+    _image(page, pymupdf.Rect(0, 320, 612, 620))
+    _text(page, ("Appendix 2 - Loss Runs", "Since Policy Year 2018"), y=700)
+    path = _save(document, tmp_path / "halves.pdf")
+
+    classified = next(
+        p for p in classify_pdf(path).pages if p.page == 1
+    )
+    assert classified.image_fraction > 0.5, classified.image_fraction
+    assert classified.carries_unread_image
 
 
 # --------------------------------------------------------------------------

@@ -98,13 +98,44 @@ class DocumentClassification:
 
 
 def _image_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
-    """Every picture's placement on the page, clipped to the page itself."""
+    """Every picture's placement on the page, clipped to the page itself.
+
+    Two sources, because neither sees everything. The resources name the
+    pictures stored as objects and reused; the page's own blocks report what
+    was actually drawn, including a picture written straight into the content
+    stream, which is in no resource dictionary at all and which asking the
+    resources therefore answers "none" to.
+
+    Placements are kept apart and repeats are dropped. A picture printed
+    twice covers two parts of the page and both count; the same placement
+    reached twice is still one piece of page.
+    """
     rects: list[pymupdf.Rect] = []
-    for image in page.get_images(full=True):
-        for rect in page.get_image_rects(image[0]):
-            clipped = rect & page.rect
-            if clipped.width > 0 and clipped.height > 0:
-                rects.append(clipped)
+    seen: set[tuple[float, ...]] = set()
+
+    def keep(rect: pymupdf.Rect) -> None:
+        clipped = rect & page.rect
+        if clipped.width <= 0 or clipped.height <= 0:
+            return
+        # Rounded, because the two sources describe the same placement to
+        # different precision and a hair's difference is not a second picture.
+        key = tuple(round(value, 1) for value in tuple(clipped))
+        if key in seen:
+            return
+        seen.add(key)
+        rects.append(clipped)
+
+    # get_image_rects answers for an xref, not for the name it was reached
+    # by, so asking once per name repeats every placement: two names over two
+    # placements gave four rectangles, and two hundred would give forty
+    # thousand -- a list both passes below walk again for every word.
+    for xref in dict.fromkeys(image[0] for image in page.get_images(full=True)):
+        for rect in page.get_image_rects(xref):
+            keep(rect)
+
+    for block in page.get_text("dict").get("blocks", ()):
+        if block.get("type") == 1:
+            keep(pymupdf.Rect(block["bbox"]))
     return rects
 
 
