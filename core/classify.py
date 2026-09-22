@@ -9,12 +9,17 @@ digital loss run with a scanned continuation sheet stapled on the end.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
 
+from core.evidence import _to_page_space
 from core.schema import ExtractionMethod
+
+#: A rectangle on a page: left, top, right, bottom.
+Box = tuple[float, float, float, float]
 
 #: Below this many extractable characters, a page is a scan (spec section 5).
 SCANNED_CHAR_THRESHOLD = 50
@@ -22,10 +27,6 @@ SCANNED_CHAR_THRESHOLD = 50
 #: Below this share of the page, pictures are decoration -- a logo, a seal, a
 #: signature block -- and whatever they hold is not the page.
 IMAGE_DOMINANT_FRACTION = 0.5
-#: Above this share of a page's text transcribing its pictures, the page is a
-#: scan saved as searchable and its text is the reading of the image. Below
-#: it, nothing on the page claims to have read the picture.
-TEXT_ON_IMAGE_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -36,12 +37,36 @@ class PageClassification:
     has_images: bool = False
     #: Share of the page covered by pictures, overlaps counted once.
     image_fraction: float = 0.0
-    #: Share of this page's text that transcribes one of those pictures --
-    #: an OCR layer written invisibly over a scan, not a label printed on it.
-    text_on_image: float = 0.0
     #: Where those pictures sit, so a caller holding the extraction can ask
     #: whether anything it read actually came off one of them.
-    image_boxes: tuple[tuple[float, float, float, float], ...] = ()
+    image_boxes: tuple[Box, ...] = ()
+    #: Which of those pictures this page's own text transcribes -- an OCR
+    #: layer written invisibly over a scan, not a label printed on it. Named
+    #: one by one, never counted as a share of the page: a sheet can carry a
+    #: scan saved as searchable beside a pasted appendix, and reading the
+    #: first says nothing whatever about the second.
+    transcribed_boxes: tuple[Box, ...] = ()
+    #: The page's own area, so a caller can measure what share some of the
+    #: pictures cover without knowing how the page is laid out.
+    page_area: float = 0.0
+
+    def unread_fraction(self, accounted: Iterable[Box] = ()) -> float:
+        """Share of the page under pictures nothing has read.
+
+        A picture counts as read when this page transcribes it, or when a
+        caller that has seen the extraction says rows came off it. Everything
+        else is unread source content, and this is how much of the sheet it
+        covers.
+
+        Asked per picture, not per page. Reading a table off a letterhead
+        band is not a reason to call the appendix below it read.
+        """
+        read = {tuple(box) for box in self.transcribed_boxes}
+        read.update(tuple(box) for box in accounted)
+        return _covered_fraction(
+            [box for box in self.image_boxes if tuple(box) not in read],
+            self.page_area,
+        )
 
     @property
     def carries_unread_image(self) -> bool:
@@ -56,26 +81,49 @@ class PageClassification:
         image than a page of labels does, by every geometric measure tried.
 
         What separates them is that an OCR layer is written invisibly,
-        because the picture already shows it. See :func:`_transcribed_fraction`.
+        because the picture already shows it. See :func:`_transcribed_boxes`.
 
         This says only that something on the page went unread. It does not say
         the picture holds claims, and it must not be read as saying it holds
         none. A caller that knows more -- that the extractor read rows off the
-        picture itself -- can say so; this cannot.
+        picture itself -- can say so through :meth:`unread_after`; this, which
+        has not seen the extraction, cannot.
         """
-        return (
-            self.image_fraction > IMAGE_DOMINANT_FRACTION
-            and self.text_on_image <= TEXT_ON_IMAGE_FRACTION
+        return self.unread_fraction() > IMAGE_DOMINANT_FRACTION
+
+    def read_from(self, boxes: Iterable[Box], page: pymupdf.Page) -> tuple[Box, ...]:
+        """Which of this page's pictures something at ``boxes`` came off.
+
+        ``boxes`` are rectangles as the word extractor reports them, which is
+        not the space the pictures are placed in; :func:`to_page_space` puts
+        them in it first.
+        """
+        if not self.image_boxes:
+            return ()
+        placed = [to_page_space(page, box) for box in boxes]
+        if not placed:
+            return ()
+        return tuple(
+            image
+            for image in self.image_boxes
+            if any(_centre_in(image, box) for box in placed)
         )
 
-    def contains(self, box: tuple[float, float, float, float]) -> bool:
-        """Whether something read at ``box`` came off one of the pictures."""
-        x = (box[0] + box[2]) / 2
-        y = (box[1] + box[3]) / 2
-        return any(
-            left <= x <= right and top <= y <= bottom
-            for left, top, right, bottom in self.image_boxes
+    def unread_after(self, boxes: Iterable[Box], page: pymupdf.Page) -> bool:
+        """Whether pictures nothing read still cover most of this page.
+
+        ``boxes`` is where the extractor found rows. Pictures those rows stand
+        on were read off; the rest of the page's pictures were not, and the
+        question is whether what is left still dominates the sheet.
+        """
+        return (
+            self.unread_fraction(self.read_from(boxes, page))
+            > IMAGE_DOMINANT_FRACTION
         )
+
+    def contains(self, box: Box, page: pymupdf.Page) -> bool:
+        """Whether something read at ``box`` came off one of the pictures."""
+        return bool(self.read_from([box], page))
 
 
 @dataclass(frozen=True)
@@ -109,6 +157,21 @@ class DocumentClassification:
         return False
 
 
+def _page_box(page: pymupdf.Page) -> pymupdf.Rect:
+    """The page as the pictures are placed on it and the rows are mapped onto it.
+
+    ``page.rect`` is the page as *displayed*: on a sheet carrying ``/Rotate``
+    its width and height are swapped. Picture placements are reported
+    unturned and measured from the crop box, and :func:`to_page_space` puts
+    rows in that same space, so this is the box the two are compared inside.
+    Clipping against the displayed rect instead cuts a hundred and eighty
+    points off a picture that covers the whole sheet, and a page fully under
+    one picture then measures four fifths covered.
+    """
+    crop = page.cropbox
+    return pymupdf.Rect(0.0, 0.0, crop.width, crop.height)
+
+
 def _image_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
     """Every picture's placement on the page, clipped to the page itself.
 
@@ -124,9 +187,10 @@ def _image_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
     """
     rects: list[pymupdf.Rect] = []
     seen: set[tuple[float, ...]] = set()
+    box = _page_box(page)
 
     def keep(rect: pymupdf.Rect) -> None:
-        clipped = rect & page.rect
+        clipped = rect & box
         if clipped.width <= 0 or clipped.height <= 0:
             return
         # Rounded, because the two sources describe the same placement to
@@ -151,8 +215,11 @@ def _image_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
     return rects
 
 
-def _covered_fraction(rects: list[pymupdf.Rect], page: pymupdf.Page) -> float:
-    """Share of the page under at least one picture, overlaps counted once.
+def _covered_fraction(rects: Iterable[Box | pymupdf.Rect], total: float) -> float:
+    """Share of ``total`` under at least one picture, overlaps counted once.
+
+    Measured against an area rather than a page, so the same sweep answers
+    for all of a page's pictures and for the ones nothing has read.
 
     Swept column by column rather than gridded. Compressing both axes and
     asking every cell which pictures cover it is cubic: two hundred
@@ -161,9 +228,9 @@ def _covered_fraction(rects: list[pymupdf.Rect], page: pymupdf.Page) -> float:
     hundred of them. Here each column asks only which pictures span it and
     merges their vertical runs, which an image-heavy page can afford.
     """
-    total = page.rect.width * page.rect.height
     if not rects or total <= 0:
         return 0.0
+    rects = [pymupdf.Rect(*rect) for rect in rects]
     xs = sorted({rect.x0 for rect in rects} | {rect.x1 for rect in rects})
     covered = 0.0
     for left, right in zip(xs, xs[1:]):
@@ -191,14 +258,36 @@ def _covered_fraction(rects: list[pymupdf.Rect], page: pymupdf.Page) -> float:
     return covered / total
 
 
+def _centre_in(box, other) -> bool:
+    """Whether ``other``'s centre stands inside ``box``."""
+    left, top, right, bottom = tuple(box)
+    x0, y0, x1, y1 = tuple(other)
+    return left <= (x0 + x1) / 2 <= right and top <= (y0 + y1) / 2 <= bottom
+
+
+def to_page_space(page: pymupdf.Page, box) -> pymupdf.Rect:
+    """A word-extractor rectangle in the space the pictures are placed in.
+
+    The two libraries do not describe a page the same way: rows are measured
+    from the media box and pictures placed from the crop box, and a page
+    carrying /Rotate reports its words turned and its pictures not. Compared
+    raw, a row printed squarely on a picture lands outside it. This is the
+    same correction core/evidence.py makes before it draws a box around a
+    claim, and it is that function, not a second answer to the same question.
+    """
+    return _to_page_space(page, tuple(box))
+
+
 #: PDF text render mode 3 draws nothing. It is what a scanner writes when it
 #: saves a page as searchable: the characters it recognised, placed over the
 #: picture and left invisible because the picture already shows them.
 _INVISIBLE_RENDER_MODE = 3
 
 
-def _transcribed_fraction(page: pymupdf.Page, rects: list[pymupdf.Rect]) -> float:
-    """Share of this page's text that transcribes one of its pictures.
+def _transcribed_boxes(
+    page: pymupdf.Page, rects: list[pymupdf.Rect]
+) -> list[pymupdf.Rect]:
+    """Which of this page's pictures its own text transcribes.
 
     Where the words sit cannot answer whether a picture was read. A scan
     saved with an OCR layer and a raster appendix under a stamped label both
@@ -217,18 +306,26 @@ def _transcribed_fraction(page: pymupdf.Page, rects: list[pymupdf.Rect]) -> floa
     honest answer: nothing on it claims to have read them.
     """
     spans = page.get_texttrace() or []
-    if not spans or not rects:
-        return 0.0
-    transcribed = 0
-    for span in spans:
-        if span.get("type") != _INVISIBLE_RENDER_MODE:
+    if not rects:
+        return []
+    transcribed: list[pymupdf.Rect] = []
+    for rect in rects:
+        on_box = [
+            span
+            for span in spans
+            if _centre_in(rect, span.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+        ]
+        if not on_box:
             continue
-        x0, top, x1, bottom = span.get("bbox", (0.0, 0.0, 0.0, 0.0))
-        x = (x0 + x1) / 2
-        y = (top + bottom) / 2
-        if any(r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1 for r in rects):
-            transcribed += 1
-    return transcribed / len(spans)
+        # Asked of each picture in turn. One page can carry a scan saved as
+        # searchable beside a pasted appendix, and reading the first says
+        # nothing whatever about the second.
+        layer = sum(
+            1 for span in on_box if span.get("type") == _INVISIBLE_RENDER_MODE
+        )
+        if layer * 2 > len(on_box):
+            transcribed.append(rect)
+    return transcribed
 
 
 def classify_pdf(
@@ -241,15 +338,19 @@ def classify_pdf(
             text = page.get_text("text") or ""
             char_count = len(text.strip())
             rects = _image_rects(page)
+            area = _page_box(page).get_area()
             pages.append(
                 PageClassification(
                     page=index,
                     char_count=char_count,
                     is_scanned=char_count < threshold,
                     has_images=bool(rects),
-                    image_fraction=_covered_fraction(rects, page),
-                    text_on_image=_transcribed_fraction(page, rects),
+                    image_fraction=_covered_fraction(rects, area),
                     image_boxes=tuple(tuple(rect) for rect in rects),
+                    transcribed_boxes=tuple(
+                        tuple(rect) for rect in _transcribed_boxes(page, rects)
+                    ),
+                    page_area=area,
                 )
             )
     return DocumentClassification(pages=tuple(pages))

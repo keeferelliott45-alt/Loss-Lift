@@ -14,6 +14,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
 
+import pymupdf
+
 from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
 from core.extract_digital import (
@@ -1780,26 +1782,43 @@ def run_pipeline(
     # goes missing quietly -- worse, the rows it did yield stop anything else
     # looking twice.
     #
-    # So the question is asked of the picture, not the page: did anything the
-    # extractor read actually come off it? A table printed over a background
-    # read that background with it; a table printed beside a raster read
-    # nothing of the raster. Classification cannot answer this -- it never
-    # sees the extraction -- so it reports where the pictures are and this
-    # decides, row by row.
+    # So the question is asked of each picture, not of the page: did anything
+    # the extractor read actually come off *that* picture? A table printed
+    # over a background read that background with it; a table printed beside
+    # a raster read nothing of the raster, and a letterhead band read at the
+    # top of a sheet is no reason to call the appendix below it read. What is
+    # left after that is weighed again -- a page is excused only once the
+    # pictures nothing read have stopped covering it.
+    #
+    # Classification cannot answer this; it never sees the extraction. It
+    # reports where the pictures are and which of them the page's own text
+    # transcribes, and this decides the rest, row by row.
     classified = {record.page: record for record in classification.pages}
-    read_off_the_picture = {
-        table.page
-        for table in tables
-        for row in list(table.rows) + list(table.total_rows)
-        if row.bbox
-        and (found := classified.get(table.page)) is not None
-        and found.contains(row.bbox)
+    candidates = {
+        record.page
+        for record in classification.pages
+        if not record.is_scanned and record.carries_unread_image
     }
-    unread_image_pages = {
-        page.page
-        for page in classification.pages
-        if not page.is_scanned and page.carries_unread_image
-    } - read_off_the_picture
+    rows_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
+    for table in tables:
+        if table.page in candidates:
+            rows_by_page.setdefault(table.page, []).extend(
+                row.bbox
+                for row in list(table.rows) + list(table.total_rows)
+                if row.bbox
+            )
+    unread_image_pages: set[int] = set()
+    if candidates:
+        # Reopened once, for the few pages already in question. Rows are
+        # measured by the word extractor from the media box and pictures are
+        # placed from the crop box, and a page carrying /Rotate reports its
+        # words turned and its pictures not; comparing the two needs the page
+        # itself to correct for.
+        with pymupdf.open(ingested.path) as opened:
+            for number in sorted(candidates):
+                record = classified[number]
+                if record.unread_after(rows_by_page.get(number, ()), opened[number - 1]):
+                    unread_image_pages.add(number)
     processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()

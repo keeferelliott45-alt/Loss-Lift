@@ -681,13 +681,14 @@ def test_the_union_is_right_and_does_not_go_cubic(tmp_path):
     # Tiled with overlap along one band: the union is exactly the span they
     # cover, so the answer is known without measuring it.
     band = [pymupdf.Rect(i * 2, 100, i * 2 + 4, 300) for i in range(300)]
+    area = page.rect.get_area()
     expected = (598 + 4) * 200 / (612 * 792)
-    assert _covered_fraction(band, page) == pytest.approx(expected, rel=1e-9)
+    assert _covered_fraction(band, area) == pytest.approx(expected, rel=1e-9)
 
     # Distinct in both directions, which is what makes the grid explode.
     staircase = [pymupdf.Rect(i, i, i + 150, i + 150) for i in range(300)]
     started = time.perf_counter()
-    covered = _covered_fraction(staircase, page)
+    covered = _covered_fraction(staircase, area)
     elapsed = time.perf_counter() - started
     assert 0.0 < covered < 1.0
     assert elapsed < 5.0, f"union took {elapsed:.1f}s; the grid path is back"
@@ -771,3 +772,121 @@ def test_a_scanned_page_is_still_skipped_when_vision_is_off(tmp_path):
     assert 1 in result.document.skipped_pages
     assert 1 not in result.document.unresolved_pages
     assert [f.page for f in _r22(result)] == [1]
+
+
+# --------------------------------------------------------------------------
+# One picture read is not every picture read
+#
+# Accounting was kept per page: a row landing on any picture cleared the
+# whole sheet. A carrier that prints a letterhead band across the top and a
+# pasted appendix below it puts two pictures on one page, and reading a table
+# off the first said nothing whatever about the second.
+#
+# The comparison was also made across two coordinate systems. Rows are
+# measured by the word extractor from the media box; pictures are placed by
+# PyMuPDF from the crop box, and a page carrying /Rotate reports its words
+# turned and its text unturned. core/evidence.py already had to solve this to
+# draw a box around a claim, and its answer is reused here rather than a
+# second one invented.
+# --------------------------------------------------------------------------
+
+
+def _table_over(page, rect, rows=ROWS):
+    """A readable table printed inside ``rect``."""
+    y = rect.y0 + 14
+    for offset, label in zip(COLUMNS, HEADERS):
+        page.insert_text((rect.x0 + 10 + offset, y), label, fontsize=8.5)
+    y += LINE
+    for row in rows:
+        for offset, cell in zip(COLUMNS, row):
+            page.insert_text((rect.x0 + 10 + offset, y), cell, fontsize=8.5)
+        y += LINE
+
+
+def test_a_table_on_one_picture_does_not_clear_another(tmp_path):
+    """Two pictures, one read, one not. The unread one still counts.
+
+    The band across the top carries the table and is accounted for by it.
+    The appendix below covers most of the sheet and nothing read a word of
+    it, so the page cannot be called complete.
+    """
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _text(page, MASTHEAD[:3])
+    band = pymupdf.Rect(20, 96, 592, 200)
+    _image(page, band)
+    _table_over(page, band)
+    _image(page, pymupdf.Rect(20, 240, 592, 780))
+    path = _save(document, tmp_path / "two_pictures.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert len(result.document.claims) == 3, "the readable table must still read"
+    assert 1 in result.document.unresolved_pages
+    assert 1 not in result.document.processed_pages
+    raised = _r22(result)
+    assert [f.page for f in raised] == [1]
+    assert raised[0].condition == "page-1"
+    said = f"{raised[0].message} {raised[0].actual}".lower()
+    assert "vision" not in said and "picture" in said, said
+
+
+def _first_word_box(path):
+    """A real row-shaped rectangle, in the space the word extractor uses."""
+    import pdfplumber
+
+    with pdfplumber.open(path) as pdf:
+        word = (pdf.pages[0].extract_words() or [])[0]
+    return (word["x0"], word["top"], word["x1"], word["bottom"])
+
+
+@pytest.mark.parametrize("turn", [90, 180, 270])
+def test_a_rotated_page_compares_rows_and_pictures_in_one_space(tmp_path, turn):
+    """/Rotate turns the words and leaves the pictures where they were.
+
+    Compared raw, a row printed squarely on a full-page picture lands
+    outside it -- at 90 degrees the word this fixture produces reads x0=642
+    against a picture ending at 612 -- and a page that was read reads as
+    unread. Asserted on the decision rather than on claims, because table
+    detection does not survive rotation and that is a different subject.
+    """
+    from core.classify import classify_pdf
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    _text(page, MASTHEAD[:3], y=120)
+    page.set_rotation(turn)
+    path = _save(document, tmp_path / f"rotated_{turn}.pdf")
+
+    classified = next(p for p in classify_pdf(path).pages if p.page == 1)
+    box = _first_word_box(path)
+    with pymupdf.open(path) as reopened:
+        assert classified.contains(box, reopened[0]), (
+            f"a row printed on the picture reads as off it at {turn} degrees"
+        )
+
+
+def test_an_offset_crop_box_compares_rows_and_pictures_in_one_space(tmp_path):
+    """A crop box starting down the page moves every picture with it."""
+    from core.classify import classify_pdf
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    _text(page, MASTHEAD[:3], y=120)
+    path = tmp_path / "cropped.pdf"
+    document.save(path)
+    document.close()
+
+    reopened = pymupdf.open(path)
+    reopened[0].set_cropbox(pymupdf.Rect(0, 36, 612, 756))
+    shifted = tmp_path / "cropped_offset.pdf"
+    reopened.save(shifted)
+    reopened.close()
+
+    classified = next(p for p in classify_pdf(shifted).pages if p.page == 1)
+    box = _first_word_box(shifted)
+    with pymupdf.open(shifted) as opened:
+        assert classified.contains(box, opened[0]), (
+            "a row printed on the picture reads as off it under an offset crop box"
+        )
