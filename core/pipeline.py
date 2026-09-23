@@ -27,7 +27,7 @@ from core.extract_digital import (
     COUNTED_TOTAL_LABEL,
     DocumentMetadata,
 )
-from core.ingest import IngestedFile, borrow_path
+from core.ingest import IngestError, IngestedFile, discard, ingest_path, sha256_file
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -1753,11 +1753,70 @@ def run_pipeline(
     llm_client: Any | None = None,
 ) -> ExtractionResult:
     """Run stages 0 through 5 and return everything the UI needs."""
-    # An explicit IngestedFile is an upload staged and owned by its caller;
-    # the app keeps it for evidence and mapping reruns, then discards it after
-    # export.  A path is already durable caller-owned storage.  Borrow it in
-    # place rather than making a second, otherwise unowned temporary copy.
-    ingested = source if isinstance(source, IngestedFile) else borrow_path(source)
+    if isinstance(source, IngestedFile):
+        # The app owns explicit uploads: it needs the staged bytes for evidence
+        # and mapping reruns, and discards them after export.
+        return _run_pipeline(
+            source,
+            profile=profile,
+            profiles_dir=profiles_dir,
+            mapping_override=mapping_override,
+            reconcile_config=reconcile_config,
+            use_vision=use_vision,
+            vision_extractor=vision_extractor,
+            use_llm=use_llm,
+            llm_client=llm_client,
+        )
+
+    # A path belongs to the caller. Extract from one stable private snapshot,
+    # verify that the caller's file did not change while it was read, then
+    # remove the snapshot on every exit. The returned path remains useful for
+    # evidence without transferring ownership of the original to LossLift.
+    original = Path(source).resolve()
+    ingested = ingest_path(original)
+    try:
+        result = _run_pipeline(
+            ingested,
+            profile=profile,
+            profiles_dir=profiles_dir,
+            mapping_override=mapping_override,
+            reconcile_config=reconcile_config,
+            use_vision=use_vision,
+            vision_extractor=vision_extractor,
+            use_llm=use_llm,
+            llm_client=llm_client,
+        )
+        try:
+            unchanged = sha256_file(original) == ingested.sha256
+        except OSError as error:
+            raise IngestError(
+                f"{original.name} changed or disappeared while it was being read. "
+                "Run the extraction again."
+            ) from error
+        if not unchanged:
+            raise IngestError(
+                f"{original.name} changed while it was being read. "
+                "Run the extraction again."
+            )
+        result.source_path = original
+        return result
+    finally:
+        discard(ingested)
+
+
+def _run_pipeline(
+    ingested: IngestedFile,
+    *,
+    profile: CarrierProfile | None = None,
+    profiles_dir: Path | None = None,
+    mapping_override: ColumnMapping | None = None,
+    reconcile_config: ReconcileConfig | None = None,
+    use_vision: bool = True,
+    vision_extractor: Any | None = None,
+    use_llm: bool = False,
+    llm_client: Any | None = None,
+) -> ExtractionResult:
+    """Run extraction against a stable staged PDF."""
     classification = classify_pdf(ingested.path)
 
     digital_pages = classification.digital_pages

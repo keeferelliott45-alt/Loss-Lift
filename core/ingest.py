@@ -29,14 +29,13 @@ class IngestError(ValueError):
 
 @dataclass
 class IngestedFile:
-    """One validated document and whether LossLift owns its on-disk copy."""
+    """One uploaded document, on disk in a temporary directory."""
 
     document_id: str
     source_filename: str
     sha256: str
     path: Path
     size_bytes: int
-    temporary: bool = False
     ingested_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -116,7 +115,6 @@ def ingest(
         sha256=digest,
         path=target,
         size_bytes=len(data),
-        temporary=True,
     )
 
 
@@ -126,37 +124,8 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     return ingest(source.read_bytes(), source.name, workdir)
 
 
-def borrow_path(path: str | Path) -> IngestedFile:
-    """Validate an existing PDF without copying or taking ownership of it."""
-    source = Path(path).resolve()
-    size = source.stat().st_size
-    if size == 0:
-        raise IngestError(f"{source.name} is empty. Upload the PDF again.")
-    if size > MAX_UPLOAD_BYTES:
-        raise IngestError(
-            f"{source.name} is {size / 1e6:.0f} MB. The limit is "
-            f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
-        )
-    with source.open("rb") as handle:
-        magic = handle.read(len(PDF_MAGIC))
-    if magic != PDF_MAGIC:
-        raise IngestError(
-            f"{source.name} is not a PDF. Loss runs must be uploaded as PDF files."
-        )
-
-    return IngestedFile(
-        document_id=str(uuid4()),
-        source_filename=source.name,
-        sha256=sha256_file(source),
-        path=source,
-        size_bytes=size,
-    )
-
-
 def discard(ingested: IngestedFile, remove_directory: bool = True) -> None:
     """Delete the staged bytes.  Called after export (spec section 9)."""
-    if not ingested.temporary:
-        return
     try:
         if ingested.path.exists():
             ingested.path.unlink()

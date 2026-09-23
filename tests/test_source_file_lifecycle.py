@@ -9,13 +9,7 @@ import pytest
 
 from core import ingest as ingest_module
 from core import pipeline as pipeline_module
-from core.ingest import (
-    IngestError,
-    borrow_path,
-    discard,
-    ingest_path,
-    sha256_file,
-)
+from core.ingest import IngestError, discard, ingest_path
 from core.pipeline import run_pipeline
 
 
@@ -32,58 +26,28 @@ def _digital_pdf(path: Path) -> Path:
     return path
 
 
-def test_path_input_is_borrowed_without_creating_a_temporary_copy(
+def test_path_input_snapshot_is_removed_after_pipeline(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A caller-owned path must not be duplicated into ``losslift-*``."""
+    """A stable snapshot may be used, but must never be retained."""
     source = _digital_pdf(tmp_path / "source.pdf")
-    unexpected_stage = tmp_path / "losslift-unexpected"
+    stage = tmp_path / "losslift-stage"
     calls: list[str] = []
 
     def recording_mkdtemp(*, prefix: str) -> str:
         calls.append(prefix)
-        unexpected_stage.mkdir()
-        return str(unexpected_stage)
+        stage.mkdir()
+        return str(stage)
 
     monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
 
     result = run_pipeline(source, use_vision=False)
 
-    assert calls == []
-    assert not unexpected_stage.exists()
+    assert calls == ["losslift-"]
+    assert not stage.exists()
     assert result.source_path == source
     assert source.exists()
-
-
-def test_borrowed_file_cannot_be_deleted_through_discard(tmp_path: Path) -> None:
-    source = _digital_pdf(tmp_path / "caller-owned.pdf")
-    borrowed = borrow_path(source)
-
-    assert borrowed.path == source
-    assert borrowed.temporary is False
-    assert borrowed.size_bytes == source.stat().st_size
-    assert borrowed.sha256 == sha256_file(source)
-
-    discard(borrowed)
-
-    assert source.exists()
-
-
-@pytest.mark.parametrize(
-    ("content", "message"),
-    [(b"", "empty"), (b"not a PDF", "not a PDF")],
-)
-def test_borrowed_path_uses_upload_validation(
-    tmp_path: Path,
-    content: bytes,
-    message: str,
-) -> None:
-    source = tmp_path / "invalid.pdf"
-    source.write_bytes(content)
-
-    with pytest.raises(IngestError, match=message):
-        borrow_path(source)
 
 
 def test_explicit_staged_upload_remains_available_after_pipeline(
@@ -94,7 +58,6 @@ def test_explicit_staged_upload_remains_available_after_pipeline(
 
     result = run_pipeline(staged, use_vision=False)
 
-    assert staged.temporary is True
     assert staged.exists
     assert result.source_path == staged.path
     discard(staged, remove_directory=False)
@@ -120,16 +83,18 @@ def test_explicit_staged_upload_remains_caller_owned_when_pipeline_fails(
     discard(staged, remove_directory=False)
 
 
-def test_path_failure_neither_copies_nor_deletes_caller_file(
+def test_path_failure_removes_snapshot_without_deleting_caller_file(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     source = _digital_pdf(tmp_path / "caller-owned.pdf")
+    stage = tmp_path / "losslift-stage"
     calls: list[str] = []
 
     def recording_mkdtemp(*, prefix: str) -> str:
         calls.append(prefix)
-        return str(tmp_path / "unexpected-stage")
+        stage.mkdir()
+        return str(stage)
 
     def fail_classification(_path: Path):
         raise RuntimeError("synthetic classification failure")
@@ -140,5 +105,40 @@ def test_path_failure_neither_copies_nor_deletes_caller_file(
     with pytest.raises(RuntimeError, match="synthetic classification failure"):
         run_pipeline(source, use_vision=False)
 
-    assert calls == []
+    assert calls == ["losslift-"]
+    assert not stage.exists()
     assert source.exists()
+
+
+def test_path_change_during_extraction_is_rejected_and_snapshot_is_removed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _digital_pdf(tmp_path / "caller-owned.pdf")
+    original_bytes = source.read_bytes()
+    replacement = _digital_pdf(tmp_path / "replacement.pdf").read_bytes()
+    stage = tmp_path / "losslift-stage"
+    observed_snapshot: list[bytes] = []
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "losslift-"
+        stage.mkdir()
+        return str(stage)
+
+    real_pipeline = pipeline_module._run_pipeline
+
+    def replace_source(ingested, **kwargs):
+        observed_snapshot.append(ingested.path.read_bytes())
+        result = real_pipeline(ingested, **kwargs)
+        source.write_bytes(replacement)
+        return result
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(pipeline_module, "_run_pipeline", replace_source)
+
+    with pytest.raises(IngestError, match="changed while it was being read"):
+        run_pipeline(source, use_vision=False)
+
+    assert observed_snapshot == [original_bytes]
+    assert source.read_bytes() == replacement
+    assert not stage.exists()
