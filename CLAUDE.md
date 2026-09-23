@@ -413,6 +413,22 @@ refresh the baseline so the better number is the one being defended. A new
 carrier format has to be recorded before it can be defended, so adding a
 fixture means refreshing the file.
 
+**Real-corpus A/B gate.** Synthetic fixtures cannot show what a change does to
+documents nobody designed for. Before a change to extraction or reconciliation
+merges, run it against the locally held real corpus:
+
+```
+python -m tools.corpus_gate run --baseline <base commit> --candidate <head commit> \
+    --corpus <corpus directory> --manifest <manifest file>
+```
+
+Exit 0 is the only pass. Any change in claim count, status, page accounting,
+printed evidence or findings fails. A change is approved only by an explicit
+allowlist entry that names the document's hash, the field and both values.
+The corpus and its manifest live outside the repository. The gate's output
+carries ids, counts and keyed digests, never document text. See
+`docs/corpus-gate.md`.
+
 **Thresholds before charging anyone:**
 - Money fields: ≥ 99.5% on digital PDFs
 - Money fields: ≥ 97% on scanned PDFs
