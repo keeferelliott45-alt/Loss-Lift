@@ -27,7 +27,7 @@ from core.extract_digital import (
     COUNTED_TOTAL_LABEL,
     DocumentMetadata,
 )
-from core.ingest import IngestedFile, ingest_path
+from core.ingest import IngestedFile, borrow_path
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -1753,7 +1753,11 @@ def run_pipeline(
     llm_client: Any | None = None,
 ) -> ExtractionResult:
     """Run stages 0 through 5 and return everything the UI needs."""
-    ingested = source if isinstance(source, IngestedFile) else ingest_path(source)
+    # An explicit IngestedFile is an upload staged and owned by its caller;
+    # the app keeps it for evidence and mapping reruns, then discards it after
+    # export.  A path is already durable caller-owned storage.  Borrow it in
+    # place rather than making a second, otherwise unowned temporary copy.
+    ingested = source if isinstance(source, IngestedFile) else borrow_path(source)
     classification = classify_pdf(ingested.path)
 
     digital_pages = classification.digital_pages
