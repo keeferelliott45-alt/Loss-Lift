@@ -9,7 +9,14 @@ import pytest
 
 from core import ingest as ingest_module
 from core import pipeline as pipeline_module
-from core.ingest import MAX_UPLOAD_BYTES, IngestError, discard, ingest_path
+from core.ingest import (
+    MAX_UPLOAD_BYTES,
+    IngestError,
+    discard,
+    ingest,
+    ingest_path,
+    verify_source_unchanged,
+)
 from core.pipeline import run_pipeline
 
 
@@ -151,30 +158,49 @@ def test_atomic_replacement_during_final_verification_is_rejected(
     source = _digital_pdf(tmp_path / "caller-owned.pdf")
     replacement = _digital_pdf(tmp_path / "replacement.pdf")
     stage = tmp_path / "losslift-stage"
+    ingested = ingest_path(source, stage)
     real_stat = Path.stat
-    source_stats = 0
-
-    def recording_mkdtemp(*, prefix: str) -> str:
-        assert prefix == "losslift-"
-        stage.mkdir()
-        return str(stage)
+    swapped = False
 
     def replace_before_final_path_stat(path: Path, *args, **kwargs):
-        nonlocal source_stats
-        if path == source:
-            source_stats += 1
-            if source_stats == 2:
-                replacement.replace(source)
+        nonlocal swapped
+        if path == source and not swapped:
+            replacement.replace(source)
+            swapped = True
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
     monkeypatch.setattr(Path, "stat", replace_before_final_path_stat)
 
     with pytest.raises(IngestError, match="changed while it was being read"):
-        run_pipeline(source, use_vision=False)
+        verify_source_unchanged(ingested)
 
-    assert source_stats == 2
-    assert not stage.exists()
+    assert swapped
+    assert ingested.path.exists()
+    discard(ingested, remove_directory=False)
+
+
+def test_failed_upload_does_not_delete_an_earlier_staged_upload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workdir = tmp_path / "shared-stage"
+    data = b"%PDF-1.7 first upload remains owned"
+    first = ingest(data, "claims.pdf", workdir)
+    original = first.path.read_bytes()
+    real_open = Path.open
+
+    def fail_new_write(path: Path, mode: str = "r", *args, **kwargs):
+        if "w" in mode or "x" in mode:
+            raise OSError("synthetic file descriptor exhaustion")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_new_write)
+
+    with pytest.raises(OSError, match="descriptor exhaustion"):
+        ingest(data, "claims.pdf", workdir)
+
+    assert first.path.exists()
+    assert first.path.read_bytes() == original
 
 
 def test_oversized_path_is_rejected_before_snapshot_or_full_read(

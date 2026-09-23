@@ -145,11 +145,15 @@ def ingest(
 
     digest = sha256_bytes(data)
     safe_name = Path(filename).name or "upload.pdf"
-    target = directory / f"{digest[:12]}-{safe_name}"
+    target = directory / f".upload-{uuid4().hex}.pdf"
+    created = False
     try:
-        target.write_bytes(data)
+        with target.open("xb") as handle:
+            created = True
+            handle.write(data)
     except BaseException:
-        target.unlink(missing_ok=True)
+        if created:
+            target.unlink(missing_ok=True)
         if workdir is None:
             shutil.rmtree(directory, ignore_errors=True)
         raise
@@ -168,7 +172,6 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     source = Path(path).resolve()
     directory: Path | None = None
     temporary_target: Path | None = None
-    target: Path | None = None
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
@@ -191,7 +194,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             )
             directory.mkdir(parents=True, exist_ok=True)
             temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
-            with temporary_target.open("wb") as target_handle:
+            with temporary_target.open("xb") as target_handle:
                 digest = _copy_and_hash(source_handle, target_handle)
 
             after_copy = _identity(os.fstat(source_handle.fileno()))
@@ -208,8 +211,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                     "Run the extraction again."
                 )
 
-        target = directory / f"{digest[:12]}-{source.name}"
-        temporary_target.replace(target)
+        target = temporary_target
         temporary_target = None
         return IngestedFile(
             document_id=str(uuid4()),
