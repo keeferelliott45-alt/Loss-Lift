@@ -14,6 +14,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
 
+import pymupdf
+
 from core import extract_digital
 from core.classify import DocumentClassification, classify_pdf
 from core.extract_digital import (
@@ -1764,10 +1766,92 @@ def run_pipeline(
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
-    processed_pages = set(extraction.page_texts)
+    # A page carrying a rasterised loss run under a one-line heading answers
+    # the only question classification asks -- how many characters came off it
+    # -- with the heading. It clears the scanned-page threshold, takes the
+    # digital path, and is recorded as processed because text was extracted
+    # from it, while the table inside the picture is never read by anything.
+    #
+    # The picture is not evidence that claims are there and not evidence that
+    # they are not. It is unread source content, so the page stays unresolved
+    # and R-22 asks for it to be looked at.
+    #
+    # A table read off the page does not answer for the page. A carrier that
+    # prints a short summary above a pasted appendix puts both on one sheet,
+    # and excusing the sheet because half of it read is how the other half
+    # goes missing quietly -- worse, the rows it did yield stop anything else
+    # looking twice.
+    #
+    # So the question is asked of each picture, not of the page: did anything
+    # the extractor read actually come off *that* picture? A table printed
+    # over a background read that background with it; a table printed beside
+    # a raster read nothing of the raster, and a letterhead band read at the
+    # top of a sheet is no reason to call the appendix below it read. What is
+    # left after that is weighed again -- a page is excused only once the
+    # pictures nothing read have stopped covering it.
+    #
+    # Only printed rows answer for a picture. Rows read out of an invisible
+    # OCR layer are the picture being recognised, not something printed on
+    # it, and three recognised rows of a table say nothing about the rows
+    # after them. Whether a recognition counts as the picture's reading is
+    # decided once, by whether the page is the scan.
+    #
+    # Classification cannot answer this; it never sees the extraction. It
+    # reports where the pictures are and which of them the page's own text
+    # transcribes, and this decides the rest, row by row.
+    classified = {record.page: record for record in classification.pages}
+    candidates = {
+        record.page
+        for record in classification.pages
+        if not record.is_scanned and record.carries_unread_image
+    }
+    rows_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
+    for table in tables:
+        if table.page in candidates:
+            rows_by_page.setdefault(table.page, []).extend(
+                row.bbox
+                for row in list(table.rows) + list(table.total_rows)
+                if row.bbox
+            )
+    unread_image_pages: set[int] = set()
+    # Pages whose unread pictures had words recognised on them. "Nothing read
+    # what the picture holds" is false there -- claims may have come off the
+    # fragment -- and a reviewer is owed the difference.
+    partly_recognised: set[int] = set()
+    if candidates:
+        # Reopened once, for the few pages already in question. Rows are
+        # measured by the word extractor from the media box and pictures are
+        # placed from the crop box, and a page carrying /Rotate reports its
+        # words turned and its pictures not; comparing the two needs the page
+        # itself to correct for.
+        with pymupdf.open(ingested.path) as opened:
+            for number in sorted(candidates):
+                record = classified[number]
+                left = record.unread_after(
+                    rows_by_page.get(number, ()), opened[number - 1]
+                )
+                if left:
+                    unread_image_pages.add(number)
+                    if set(left) & set(record.fragment_boxes):
+                        partly_recognised.add(number)
+    processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
-    unresolved_pages: set[int] = set()
+    unresolved_pages: set[int] = set(unread_image_pages)
+    unrecognised = sorted(unread_image_pages - partly_recognised)
+    if unrecognised:
+        joined = ", ".join(str(page) for page in unrecognised)
+        warnings.append(
+            f"Page(s) {joined} are mostly picture and nothing read what the "
+            f"picture holds. Whether they carry claims is unknown."
+        )
+    if partly_recognised:
+        joined = ", ".join(str(page) for page in sorted(partly_recognised))
+        warnings.append(
+            f"Page(s) {joined} are mostly picture, and some text on the picture "
+            f"was recognised but nothing shows the rest of it was read. Whether "
+            f"it holds claims that were not read is unknown."
+        )
 
     scanned_pages = classification.scanned_pages
     vision_tables: list[RawTable] = []
@@ -2071,6 +2155,16 @@ def run_pipeline(
         failed_pages=sorted(failed_pages),
         skipped_pages=sorted(skipped_pages),
         unresolved_pages=sorted(unresolved_pages),
+        unresolved_reasons={
+            page: (
+                "most of it is a picture, and some text on it was recognised "
+                "but nothing shows the whole picture was read"
+                if page in partly_recognised
+                else "most of it is a picture and nothing read what the "
+                "picture holds"
+            )
+            for page in sorted(unread_image_pages)
+        },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,

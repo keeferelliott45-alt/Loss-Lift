@@ -973,9 +973,14 @@ def r22_incomplete_source_processing(
         elif page in skipped:
             outcome = "processing was skipped"
         elif page in unresolved:
-            outcome = (
+            # A page reaches this set from more than one direction, and each
+            # names a different reader. Saying the vision one gave up on a
+            # page it was never shown points the reviewer at a switch that
+            # would not have helped.
+            outcome = doc.unresolved_reasons.get(
+                page,
                 "the vision reader returned no rows for it, which is not "
-                "evidence that it holds none"
+                "evidence that it holds none",
             )
         else:
             outcome = "no processing outcome was recorded"
