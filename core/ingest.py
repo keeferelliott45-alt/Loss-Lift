@@ -56,6 +56,7 @@ class IngestedFile:
     sha256: str
     path: Path
     size_bytes: int
+    owns_directory: bool = False
     source_path: Path | None = None
     source_identity: FileIdentity | None = None
     ingested_at: datetime = field(
@@ -164,6 +165,7 @@ def ingest(
         sha256=digest,
         path=target,
         size_bytes=len(data),
+        owns_directory=workdir is None,
     )
 
 
@@ -172,6 +174,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     source = Path(path).resolve()
     directory: Path | None = None
     temporary_target: Path | None = None
+    temporary_target_created = False
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
@@ -195,6 +198,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             directory.mkdir(parents=True, exist_ok=True)
             temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
             with temporary_target.open("xb") as target_handle:
+                temporary_target_created = True
                 digest = _copy_and_hash(source_handle, target_handle)
 
             after_copy = _identity(os.fstat(source_handle.fileno()))
@@ -219,11 +223,12 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             sha256=digest,
             path=target,
             size_bytes=identity.size,
+            owns_directory=workdir is None,
             source_path=source,
             source_identity=identity,
         )
     except BaseException:
-        if temporary_target is not None:
+        if temporary_target is not None and temporary_target_created:
             temporary_target.unlink(missing_ok=True)
         if workdir is None and directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
@@ -263,7 +268,7 @@ def discard(ingested: IngestedFile, remove_directory: bool = True) -> None:
         if ingested.path.exists():
             ingested.path.unlink()
         parent = ingested.path.parent
-        if remove_directory and parent.name.startswith("losslift-"):
+        if remove_directory and ingested.owns_directory:
             shutil.rmtree(parent, ignore_errors=True)
     except OSError:  # pragma: no cover - best effort cleanup
         pass

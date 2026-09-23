@@ -203,6 +203,46 @@ def test_failed_upload_does_not_delete_an_earlier_staged_upload(
     assert first.path.read_bytes() == original
 
 
+def test_discard_does_not_remove_a_caller_owned_workdir(
+    tmp_path: Path,
+) -> None:
+    workdir = tmp_path / "losslift-caller-owned"
+    first = ingest(b"%PDF-1.7 first", "first.pdf", workdir)
+    second = ingest(b"%PDF-1.7 second", "second.pdf", workdir)
+
+    discard(first)
+
+    assert workdir.exists()
+    assert not first.path.exists()
+    assert second.path.exists()
+
+
+def test_snapshot_name_collision_preserves_the_existing_owner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _digital_pdf(tmp_path / "caller-owned.pdf")
+    workdir = tmp_path / "shared-stage"
+    workdir.mkdir()
+    existing = workdir / ".snapshot-collision.pdf"
+    original = b"%PDF-1.7 earlier owner"
+    existing.write_bytes(original)
+
+    class CollidingId:
+        hex = "collision"
+
+        def __str__(self) -> str:
+            return "collision"
+
+    monkeypatch.setattr(ingest_module, "uuid4", lambda: CollidingId())
+
+    with pytest.raises(FileExistsError):
+        ingest_path(source, workdir)
+
+    assert existing.exists()
+    assert existing.read_bytes() == original
+
+
 def test_oversized_path_is_rejected_before_snapshot_or_full_read(
     tmp_path: Path,
     monkeypatch,
