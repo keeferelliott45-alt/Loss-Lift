@@ -1220,3 +1220,294 @@ def test_a_partial_ocr_layer_on_a_bare_scan_stays_unresolved(tmp_path):
 
     result = run_pipeline(path, use_vision=False)
     assert 2 in result.document.unresolved_pages
+
+
+# --------------------------------------------------------------------------
+# Blank invisible spans are not a transcription
+#
+# PDF producers position text with spaces, and an invisible space is still an
+# invisible span. Counted as recognised words, a few of them outvote a
+# heading printed on the picture and the picture passes for a scan that was
+# read -- when nothing on it was recognised at all. Whether a span carries
+# text is already decided on this path by ``_carries_text``; the
+# transcription count now asks the same question of every span it counts.
+# --------------------------------------------------------------------------
+
+#: One visible line across the top of a full-page picture, long enough to
+#: keep the page on the digital path. It stands *on* the picture, so it is a
+#: label over it rather than text beside it.
+HEADING = "LOSS RUN REPORT - MERIDIAN MUTUAL ASSURANCE - VALUED 12/31/2024 - GL"
+
+#: Codes whose meaning is declared through /ToUnicode, the way a producer
+#: that writes whitespace into a text layer declares it.
+_DECLARED_BLANKS = (
+    (b"09", b"0009"),
+    (b"0A", b"000A"),
+    (b"0D", b"000D"),
+    (b"20", b"0020"),
+    (b"A0", b"00A0"),
+)
+
+
+def _declared_layer(strings) -> bytes:
+    """A one-page PDF of invisible text in a font that declares its blanks."""
+    pairs = b"\n".join(b"<%s> <%s>" % pair for pair in _DECLARED_BLANKS)
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        + b"%d beginbfchar\n" % len(_DECLARED_BLANKS)
+        + pairs
+        + b"\nendbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+    )
+    content = b"".join(
+        b"BT 3 Tr /F1 12 Tf 100 %d Td %s Tj ET\n" % (700 - 40 * index, string)
+        for index, string in enumerate(strings)
+    )
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>",
+        b"<</Length %d>>stream\n" % len(content) + content + b"\nendstream",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica/ToUnicode 6 0 R>>",
+        b"<</Length %d>>stream\n" % len(cmap) + cmap + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj" % number + body + b"endobj\n"
+    start = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        start,
+    )
+    return bytes(out)
+
+
+def _overlay(page, strings):
+    """Lay a declared invisible layer over the whole of ``page``."""
+    with pymupdf.open(stream=_declared_layer(strings), filetype="pdf") as layer:
+        page.show_pdf_page(page.rect, layer, 0)
+
+
+def _written_blanks(page, texts):
+    """Invisible Unicode spacing, written the way a text writer writes it.
+
+    One writer per text: a single writer merges consecutive blanks into one
+    span, and each is meant to stand as a span of its own.
+    """
+    for index, text in enumerate(texts):
+        writer = pymupdf.TextWriter(page.rect)
+        writer.append((100, 300 + 40 * index), text, font=pymupdf.Font("helv"), fontsize=12)
+        writer.write_text(page, render_mode=3)
+
+
+def _labelled_raster(document):
+    """A full-page picture with one visible heading printed across it."""
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    page.insert_text((LEFT, 60), HEADING, fontsize=9)
+    return page
+
+
+def _unread_by_blanks(result, page=2):
+    """Unresolved, raised by R-22, and described as unread -- not as partly read."""
+    assert page in result.document.unresolved_pages
+    assert page not in result.document.processed_pages
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    raised = _r22(result)
+    assert [f.page for f in raised] == [page]
+    assert raised[0].condition == f"page-{page}"
+    # Blank spans recognised nothing, so the page must not read as partly
+    # recognised either.
+    assert result.document.unresolved_reasons[page] == raised[0].actual
+    assert "nothing read" in raised[0].actual, raised[0].actual
+
+
+def test_invisible_spaces_do_not_read_a_raster_under_a_visible_heading(tmp_path):
+    """Codex's counterexample: one printed heading, invisible spaces beside it.
+
+    Every span on the picture was counted, so the spaces outnumbered the
+    heading and the picture read as transcribed -- a scan read end to end,
+    with not one character of it recognised.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = _labelled_raster(document)
+    for y in (200, 320, 440, 560):
+        page.insert_text((LEFT, y), " ", fontsize=12, render_mode=3)
+    path = _save(document, tmp_path / "spaces.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    _unread_by_blanks(result)
+
+
+@pytest.mark.parametrize(
+    "strings",
+    [
+        (rb"(\t\t)", rb"(\t)", rb"(\t\t\t)"),
+        (rb"(\n)", rb"(\n\n)", rb"(\n)"),
+        (rb"(\r)", rb"(\r\n)", rb"(\r\n\r\n)"),
+        (rb"(\240)", rb"(\240\240)", rb"(\240)"),
+        (rb"( \t\240\r\n )", rb"(\t \n)", rb"(\240 \r)"),
+    ],
+    ids=["tabs", "line-feeds", "carriage-returns", "non-breaking", "mixed"],
+)
+def test_declared_blanks_of_every_kind_do_not_read_a_raster(tmp_path, strings):
+    """Tabs, line breaks and non-breaking spaces, declared as such."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = _labelled_raster(document)
+    _overlay(page, strings)
+    path = _save(document, tmp_path / "declared_blanks.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    _unread_by_blanks(result)
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [
+        (" ", " ", " "),
+        (" ", "　", " "),
+    ],
+    ids=["unicode-line-breaks", "unicode-spaces"],
+)
+def test_unicode_spacing_does_not_read_a_raster(tmp_path, texts):
+    """Line and paragraph separators, and the wide spaces, written as Unicode."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = _labelled_raster(document)
+    _written_blanks(page, texts)
+    path = _save(document, tmp_path / "unicode_blanks.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    _unread_by_blanks(result)
+
+
+@pytest.mark.parametrize("strings", [(b"()", b"()"), (b"<>", b"<>")], ids=["literal", "hex"])
+def test_empty_invisible_strings_leave_a_raster_unread(tmp_path, strings):
+    """An empty string shows nothing, and must not become evidence of reading."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = _labelled_raster(document)
+    _overlay(page, strings)
+    path = _save(document, tmp_path / "empty_strings.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    _unread_by_blanks(result)
+
+
+class _Trace:
+    """A page reduced to the one question transcription asks of its text."""
+
+    def __init__(self, spans):
+        self._spans = spans
+
+    def get_texttrace(self):
+        return self._spans
+
+
+def _char(code):
+    return (code, 0, (0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
+
+
+@pytest.mark.parametrize(
+    "span",
+    [
+        {},
+        {"chars": []},
+        {"chars": [_char(0), _char(0)]},
+        {"chars": [_char(-1)]},
+        {"chars": [_char(0x110000)]},
+        {"chars": [_char(32), _char(9), _char(0xA0)]},
+    ],
+    ids=["no-chars", "empty-chars", "nul", "negative", "beyond-unicode", "blank-codes"],
+)
+def test_empty_or_malformed_span_text_is_not_a_transcription(span):
+    """Span data carrying no character must not count, however it got there."""
+    from core.classify import _transcription
+
+    picture = pymupdf.Rect(0, 0, 612, 792)
+    spans = [
+        {"type": 3, "bbox": (100.0, y, 200.0, y + 12.0), **span}
+        for y in (100.0, 200.0, 300.0)
+    ]
+    transcribed, fragments = _transcription(_Trace(spans), [picture])
+    assert transcribed == [] and fragments == [], "nothing was recognised"
+
+
+def test_blank_spans_cannot_tip_a_label_against_a_recognised_word():
+    """One printed label, one recognised word, and blanks to break the tie."""
+    from core.classify import _transcription
+
+    picture = pymupdf.Rect(0, 0, 612, 792)
+    label = {"type": 0, "bbox": (40.0, 50.0, 400.0, 62.0), "chars": [_char(ord(c)) for c in "HEADING"]}
+    word = {"type": 3, "bbox": (40.0, 150.0, 90.0, 162.0), "chars": [_char(ord(c)) for c in "CLAIM"]}
+    blanks = [
+        {"type": 3, "bbox": (100.0, y, 110.0, y + 12.0), "chars": [_char(32)]}
+        for y in (250.0, 350.0, 450.0)
+    ]
+    transcribed, fragments = _transcription(_Trace([label, word, *blanks]), [picture])
+    assert transcribed == [], "a label and a word are a tie, not a transcription"
+    assert fragments == [picture], "the recognised word is still a fragment"
+
+
+def test_recognised_words_among_blank_spans_still_read_a_scan(tmp_path):
+    """The control: real words keep counting when blanks sit between them.
+
+    OCR layers often write the space after each word as a span of its own.
+    Filtering the blanks must not lose the words.
+    """
+    from core.classify import classify_pdf
+
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    sheet = pymupdf.Rect(0, 0, 612, 792)
+    _image(page, sheet)
+    y = 60.0
+    for line in MASTHEAD:
+        x = LEFT
+        for word in line.split():
+            page.insert_text((x, y), word, fontsize=9, render_mode=3)
+            x += 6 * len(word)
+            page.insert_text((x, y), " ", fontsize=9, render_mode=3)
+            x += 6
+        y += LINE
+    path = _save(document, tmp_path / "words_and_blanks.pdf")
+
+    classified = next(p for p in classify_pdf(path).pages if p.page == 2)
+    assert classified.transcribed_boxes == classified.image_boxes
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.processed_pages
+    assert _r22(result) == []
+
+
+def test_blanks_on_one_picture_do_not_clear_it_beside_a_read_one(tmp_path):
+    """A genuine scan of the top of a sheet; blanks alone over the raster below.
+
+    The top picture is read by its words. The lower one carries only
+    invisible spacing, and that must leave it exactly as unread as if it
+    carried nothing -- per picture, as ever.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    top = pymupdf.Rect(0, 0, 612, 260)
+    _image(page, top)
+    _ocr_layer(page, MASTHEAD, top)
+    below = pymupdf.Rect(0, 280, 612, 792)
+    _image(page, below)
+    for y in (360, 480, 600, 720):
+        page.insert_text((LEFT, y), " ", fontsize=12, render_mode=3)
+    path = _save(document, tmp_path / "blanks_below_a_scan.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    _unread_by_blanks(result)

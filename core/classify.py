@@ -380,16 +380,17 @@ def _transcription(
     decided by volume would be deciding by that constant.
 
     Returns ``(transcribed, fragments)``. A picture in neither list has no
-    invisible words on it at all.
+    invisible words on it at all -- blank spans are not words.
     """
     if not rects:
         return [], []
-    spans = page.get_texttrace() or []
-    printed = [
-        span
-        for span in spans
-        if span.get("type") != _INVISIBLE_RENDER_MODE and _carries_text(span)
-    ]
+    # Only a span that carries a character is evidence, on either side of the
+    # count -- the rule read_from already applies to rows. Producers position
+    # text with blank spans, and an invisible space recognised nothing: counted,
+    # a few of them outvote a heading printed on the picture and pass it off as
+    # a scan that was read.
+    spans = [span for span in page.get_texttrace() or [] if _carries_text(span)]
+    printed = [span for span in spans if span.get("type") != _INVISIBLE_RENDER_MODE]
     transcribed: list[pymupdf.Rect] = []
     fragments: list[pymupdf.Rect] = []
     for rect in rects:
