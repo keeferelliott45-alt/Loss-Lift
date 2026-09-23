@@ -141,7 +141,12 @@ def ingest(
             f"{filename} is not a PDF. Loss runs must be uploaded as PDF files."
         )
 
-    directory = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="losslift-"))
+    owns_directory = not bool(workdir)
+    directory = (
+        Path(tempfile.mkdtemp(prefix="losslift-"))
+        if owns_directory
+        else Path(workdir)
+    )
     directory.mkdir(parents=True, exist_ok=True)
 
     digest = sha256_bytes(data)
@@ -165,7 +170,7 @@ def ingest(
         sha256=digest,
         path=target,
         size_bytes=len(data),
-        owns_directory=workdir is None,
+        owns_directory=owns_directory,
     )
 
 
@@ -190,10 +195,11 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                     f"{source.name} is not a PDF. Loss runs must be uploaded as PDF files."
                 )
 
+            owns_directory = not bool(workdir)
             directory = (
-                Path(workdir)
-                if workdir
-                else Path(tempfile.mkdtemp(prefix="losslift-"))
+                Path(tempfile.mkdtemp(prefix="losslift-"))
+                if owns_directory
+                else Path(workdir)
             )
             directory.mkdir(parents=True, exist_ok=True)
             temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
@@ -223,7 +229,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             sha256=digest,
             path=target,
             size_bytes=identity.size,
-            owns_directory=workdir is None,
+            owns_directory=owns_directory,
             source_path=source,
             source_identity=identity,
         )

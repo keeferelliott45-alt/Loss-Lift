@@ -243,6 +243,31 @@ def test_snapshot_name_collision_preserves_the_existing_owner(
     assert existing.read_bytes() == original
 
 
+@pytest.mark.parametrize("path_input", [False, True])
+def test_empty_workdir_uses_and_owns_a_private_directory(
+    tmp_path: Path,
+    monkeypatch,
+    path_input: bool,
+) -> None:
+    stage = tmp_path / f"losslift-private-{path_input}"
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "losslift-"
+        stage.mkdir()
+        return str(stage)
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    if path_input:
+        source = _digital_pdf(tmp_path / "caller-owned.pdf")
+        staged = ingest_path(source, "")
+    else:
+        staged = ingest(b"%PDF-1.7 upload", "upload.pdf", "")
+
+    assert staged.owns_directory
+    discard(staged)
+    assert not stage.exists()
+
+
 def test_oversized_path_is_rejected_before_snapshot_or_full_read(
     tmp_path: Path,
     monkeypatch,
