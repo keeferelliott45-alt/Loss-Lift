@@ -46,27 +46,35 @@ class PageClassification:
     #: scan saved as searchable beside a pasted appendix, and reading the
     #: first says nothing whatever about the second.
     transcribed_boxes: tuple[Box, ...] = ()
+    #: Pictures carrying recognised words that are *not* their reading: a
+    #: fragment of recognition over a picture on a page composed around it,
+    #: or invisible words outnumbered by the labels printed over them. Kept
+    #: so that an unresolved page can say something was recognised on it,
+    #: rather than that nothing was read.
+    fragment_boxes: tuple[Box, ...] = ()
     #: The page's own area, so a caller can measure what share some of the
     #: pictures cover without knowing how the page is laid out.
     page_area: float = 0.0
 
-    def unread_fraction(self, accounted: Iterable[Box] = ()) -> float:
-        """Share of the page under pictures nothing has read.
-
-        A picture counts as read when this page transcribes it, or when a
-        caller that has seen the extraction says rows came off it. Everything
-        else is unread source content, and this is how much of the sheet it
-        covers.
+    def unread_boxes(self, accounted: Iterable[Box] = ()) -> tuple[Box, ...]:
+        """Pictures neither transcribed by the page nor accounted for by a caller.
 
         Asked per picture, not per page. Reading a table off a letterhead
         band is not a reason to call the appendix below it read.
         """
         read = {tuple(box) for box in self.transcribed_boxes}
         read.update(tuple(box) for box in accounted)
-        return _covered_fraction(
-            [box for box in self.image_boxes if tuple(box) not in read],
-            self.page_area,
-        )
+        return tuple(box for box in self.image_boxes if tuple(box) not in read)
+
+    def unread_fraction(self, accounted: Iterable[Box] = ()) -> float:
+        """Share of the page under pictures nothing has read.
+
+        A picture counts as read when this page transcribes it, or when a
+        caller that has seen the extraction says printed rows stand on it.
+        Everything else is unread source content, and this is how much of the
+        sheet it covers.
+        """
+        return _covered_fraction(self.unread_boxes(accounted), self.page_area)
 
     @property
     def carries_unread_image(self) -> bool:
@@ -81,18 +89,28 @@ class PageClassification:
         image than a page of labels does, by every geometric measure tried.
 
         What separates them is that an OCR layer is written invisibly,
-        because the picture already shows it. See :func:`_transcribed_boxes`.
+        because the picture already shows it, and that it is the page's own
+        text only where the page is the scan. See :func:`_transcription`.
 
         This says only that something on the page went unread. It does not say
         the picture holds claims, and it must not be read as saying it holds
-        none. A caller that knows more -- that the extractor read rows off the
-        picture itself -- can say so through :meth:`unread_after`; this, which
-        has not seen the extraction, cannot.
+        none. A caller that knows more -- that the extractor read printed rows
+        off the picture itself -- can say so through :meth:`unread_after`;
+        this, which has not seen the extraction, cannot.
         """
         return self.unread_fraction() > IMAGE_DOMINANT_FRACTION
 
     def read_from(self, boxes: Iterable[Box], page: pymupdf.Page) -> tuple[Box, ...]:
-        """Which of this page's pictures something at ``boxes`` came off.
+        """Which of this page's pictures printed rows at ``boxes`` stand on.
+
+        A row whose words are printed over a picture is content set on a
+        background, and reading it reads the page's use of that picture. A
+        row whose words are invisible is part of a transcription -- it is the
+        picture being recognised, not something printed on it -- and it
+        cannot vouch for the picture it transcribes: three recognised rows of
+        a table say nothing about the rows after them. Whether a
+        transcription counts as the picture's reading is
+        :func:`_transcription`'s question, answered once for the page.
 
         ``boxes`` are rectangles as the word extractor reports them, which is
         not the space the pictures are placed in; :func:`to_page_space` puts
@@ -103,27 +121,39 @@ class PageClassification:
         placed = [to_page_space(page, box) for box in boxes]
         if not placed:
             return ()
+        spans = [span for span in page.get_texttrace() or [] if _carries_text(span)]
+        printed = [box for box in placed if _printed(box, spans)]
+        return self._under(printed)
+
+    def unread_after(self, boxes: Iterable[Box], page: pymupdf.Page) -> tuple[Box, ...]:
+        """The pictures still unread after the rows at ``boxes``, if they dominate.
+
+        ``boxes`` is where the extractor found rows. Pictures printed rows
+        stand on were read off; the rest of the page's pictures were not. When
+        what is left still covers most of the sheet, those pictures are
+        returned -- a caller telling a reviewer why can ask which of them had
+        anything recognised on them. Otherwise the answer is empty.
+        """
+        left = self.unread_boxes(self.read_from(boxes, page))
+        if _covered_fraction(left, self.page_area) > IMAGE_DOMINANT_FRACTION:
+            return left
+        return ()
+
+    def contains(self, box: Box, page: pymupdf.Page) -> bool:
+        """Whether something at ``box`` stands on one of the pictures.
+
+        Geometry only: this does not ask whether the words there are printed
+        or recognised. That is :meth:`read_from`'s question.
+        """
+        return bool(self._under([to_page_space(page, box)]))
+
+    def _under(self, placed: Iterable[pymupdf.Rect]) -> tuple[Box, ...]:
+        placed = list(placed)
         return tuple(
             image
             for image in self.image_boxes
             if any(_centre_in(image, box) for box in placed)
         )
-
-    def unread_after(self, boxes: Iterable[Box], page: pymupdf.Page) -> bool:
-        """Whether pictures nothing read still cover most of this page.
-
-        ``boxes`` is where the extractor found rows. Pictures those rows stand
-        on were read off; the rest of the page's pictures were not, and the
-        question is whether what is left still dominates the sheet.
-        """
-        return (
-            self.unread_fraction(self.read_from(boxes, page))
-            > IMAGE_DOMINANT_FRACTION
-        )
-
-    def contains(self, box: Box, page: pymupdf.Page) -> bool:
-        """Whether something read at ``box`` came off one of the pictures."""
-        return bool(self.read_from([box], page))
 
 
 @dataclass(frozen=True)
@@ -284,10 +314,34 @@ def to_page_space(page: pymupdf.Page, box) -> pymupdf.Rect:
 _INVISIBLE_RENDER_MODE = 3
 
 
-def _transcribed_boxes(
+def _carries_text(span: dict) -> bool:
+    """Whether a span draws anything but spacing."""
+    for char in span.get("chars", ()):
+        code = char[0]
+        if 0 < code < 0x110000 and not chr(code).isspace():
+            return True
+    return False
+
+
+def _bbox(span: dict) -> tuple[float, float, float, float]:
+    return span.get("bbox", (0.0, 0.0, 0.0, 0.0))
+
+
+def _printed(box: pymupdf.Rect, spans: list[dict]) -> bool:
+    """Whether the words at ``box`` are drawn to be seen.
+
+    A row with nothing found under it is not taken as printed: a row that
+    cannot be shown to be printed content does not vouch for a picture.
+    """
+    on_box = [span for span in spans if _centre_in(box, _bbox(span))]
+    visible = sum(1 for span in on_box if span.get("type") != _INVISIBLE_RENDER_MODE)
+    return visible * 2 > len(on_box)
+
+
+def _transcription(
     page: pymupdf.Page, rects: list[pymupdf.Rect]
-) -> list[pymupdf.Rect]:
-    """Which of this page's pictures its own text transcribes.
+) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect]]:
+    """Which pictures this page's text transcribes, and which carry a fragment.
 
     Where the words sit cannot answer whether a picture was read. A scan
     saved with an OCR layer and a raster appendix under a stamped label both
@@ -297,35 +351,63 @@ def _transcribed_boxes(
     Every geometric line that could be drawn puts genuine scans on both sides
     of it.
 
-    The file says which it is. An OCR layer is drawn in render mode 3,
-    invisible because the picture underneath already shows it; a label meant
-    for a reader is drawn to be seen. That is the producer's own statement
-    about what the text is for, and it is what this counts.
+    The file says which it is, twice over.
 
-    A page with no transcription over its pictures scores zero, which is the
-    honest answer: nothing on it claims to have read them.
+    An OCR layer is drawn in render mode 3, invisible because the picture
+    underneath already shows it; a label meant for a reader is drawn to be
+    seen. That is the producer's own statement about what the text is for.
+
+    And invisible words are a *reading* of a picture only where the picture
+    is the scan -- where the page prints no text of its own beside it, so
+    that the text standing on it is the transcription and nothing else. The
+    scanner read the whole sheet and wrote down what it found; that is the
+    same statement a digital page's text layer makes about itself, and it is
+    taken on the same terms. A page composed around a picture makes no such
+    statement. Its text is what it prints beside the picture, and invisible
+    words over the picture prove only that those words were recognised: one
+    span or a hundred, they are a fragment, and the rest of the picture is
+    as unread as it would be without them.
+
+    "Beside" is asked of each picture, not of the page. Captions printed over
+    a banner are inside *a* picture, and a page asked whether it prints
+    anything outside all of its pictures would answer no and pass for a
+    scan; asked of the raster below the banner, they are beside it.
+
+    How much was recognised is not asked, because it cannot be answered. Real
+    searchable scans run without a break from two recognised lines to
+    seventy-five, and every measure of coverage flips a different number of
+    genuine pages as its one constant moves, never settling. A rule that
+    decided by volume would be deciding by that constant.
+
+    Returns ``(transcribed, fragments)``. A picture in neither list has no
+    invisible words on it at all.
     """
-    spans = page.get_texttrace() or []
     if not rects:
-        return []
+        return [], []
+    spans = page.get_texttrace() or []
+    printed = [
+        span
+        for span in spans
+        if span.get("type") != _INVISIBLE_RENDER_MODE and _carries_text(span)
+    ]
     transcribed: list[pymupdf.Rect] = []
+    fragments: list[pymupdf.Rect] = []
     for rect in rects:
-        on_box = [
-            span
-            for span in spans
-            if _centre_in(rect, span.get("bbox", (0.0, 0.0, 0.0, 0.0)))
-        ]
-        if not on_box:
-            continue
+        on_box = [span for span in spans if _centre_in(rect, _bbox(span))]
         # Asked of each picture in turn. One page can carry a scan saved as
         # searchable beside a pasted appendix, and reading the first says
         # nothing whatever about the second.
         layer = sum(
             1 for span in on_box if span.get("type") == _INVISIBLE_RENDER_MODE
         )
-        if layer * 2 > len(on_box):
+        if not layer:
+            continue
+        beside = any(not _centre_in(rect, _bbox(span)) for span in printed)
+        if not beside and layer * 2 > len(on_box):
             transcribed.append(rect)
-    return transcribed
+        else:
+            fragments.append(rect)
+    return transcribed, fragments
 
 
 def classify_pdf(
@@ -339,6 +421,7 @@ def classify_pdf(
             char_count = len(text.strip())
             rects = _image_rects(page)
             area = _page_box(page).get_area()
+            transcribed, fragments = _transcription(page, rects)
             pages.append(
                 PageClassification(
                     page=index,
@@ -347,9 +430,8 @@ def classify_pdf(
                     has_images=bool(rects),
                     image_fraction=_covered_fraction(rects, area),
                     image_boxes=tuple(tuple(rect) for rect in rects),
-                    transcribed_boxes=tuple(
-                        tuple(rect) for rect in _transcribed_boxes(page, rects)
-                    ),
+                    transcribed_boxes=tuple(tuple(rect) for rect in transcribed),
+                    fragment_boxes=tuple(tuple(rect) for rect in fragments),
                     page_area=area,
                 )
             )

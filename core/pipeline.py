@@ -1790,6 +1790,12 @@ def run_pipeline(
     # left after that is weighed again -- a page is excused only once the
     # pictures nothing read have stopped covering it.
     #
+    # Only printed rows answer for a picture. Rows read out of an invisible
+    # OCR layer are the picture being recognised, not something printed on
+    # it, and three recognised rows of a table say nothing about the rows
+    # after them. Whether a recognition counts as the picture's reading is
+    # decided once, by whether the page is the scan.
+    #
     # Classification cannot answer this; it never sees the extraction. It
     # reports where the pictures are and which of them the page's own text
     # transcribes, and this decides the rest, row by row.
@@ -1808,6 +1814,10 @@ def run_pipeline(
                 if row.bbox
             )
     unread_image_pages: set[int] = set()
+    # Pages whose unread pictures had words recognised on them. "Nothing read
+    # what the picture holds" is false there -- claims may have come off the
+    # fragment -- and a reviewer is owed the difference.
+    partly_recognised: set[int] = set()
     if candidates:
         # Reopened once, for the few pages already in question. Rows are
         # measured by the word extractor from the media box and pictures are
@@ -1817,17 +1827,30 @@ def run_pipeline(
         with pymupdf.open(ingested.path) as opened:
             for number in sorted(candidates):
                 record = classified[number]
-                if record.unread_after(rows_by_page.get(number, ()), opened[number - 1]):
+                left = record.unread_after(
+                    rows_by_page.get(number, ()), opened[number - 1]
+                )
+                if left:
                     unread_image_pages.add(number)
+                    if set(left) & set(record.fragment_boxes):
+                        partly_recognised.add(number)
     processed_pages = set(extraction.page_texts) - unread_image_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
     unresolved_pages: set[int] = set(unread_image_pages)
-    if unread_image_pages:
-        joined = ", ".join(str(page) for page in sorted(unread_image_pages))
+    unrecognised = sorted(unread_image_pages - partly_recognised)
+    if unrecognised:
+        joined = ", ".join(str(page) for page in unrecognised)
         warnings.append(
             f"Page(s) {joined} are mostly picture and nothing read what the "
             f"picture holds. Whether they carry claims is unknown."
+        )
+    if partly_recognised:
+        joined = ", ".join(str(page) for page in sorted(partly_recognised))
+        warnings.append(
+            f"Page(s) {joined} are mostly picture, and some text on the picture "
+            f"was recognised but nothing shows the rest of it was read. Whether "
+            f"it holds claims that were not read is unknown."
         )
 
     scanned_pages = classification.scanned_pages
@@ -2134,8 +2157,11 @@ def run_pipeline(
         unresolved_pages=sorted(unresolved_pages),
         unresolved_reasons={
             page: (
-                "most of it is a picture and nothing read what the picture "
-                "holds"
+                "most of it is a picture, and some text on it was recognised "
+                "but nothing shows the whole picture was read"
+                if page in partly_recognised
+                else "most of it is a picture and nothing read what the "
+                "picture holds"
             )
             for page in sorted(unread_image_pages)
         },

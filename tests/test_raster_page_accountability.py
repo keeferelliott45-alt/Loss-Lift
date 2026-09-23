@@ -890,3 +890,333 @@ def test_an_offset_crop_box_compares_rows_and_pictures_in_one_space(tmp_path):
         assert classified.contains(box, opened[0]), (
             "a row printed on the picture reads as off it under an offset crop box"
         )
+
+
+# --------------------------------------------------------------------------
+# A recognised fragment is not a reading
+#
+# Invisible text proves that the words it carries were recognised. It says
+# nothing about the rest of the picture they sit on. Where the page is a scan
+# saved as searchable, the transcription *is* the page's text: the scanner
+# read the whole sheet and wrote down what it found, the same statement a
+# digital page's text layer makes about itself. A page composed around a
+# picture -- a heading, captions, a pasted appendix -- makes no such
+# statement. Its text is the text printed beside the picture, and any
+# invisible words over the picture are a fragment of recognition, however
+# many of them there are.
+#
+# How *much* was recognised cannot draw the line. Real searchable scans run
+# without a break from two recognised lines to seventy-five, and crediting
+# each recognised line with the space around it flips 34, 28, 20, 7 or 4 real
+# scanned pages as that space runs from half a line to eight: there is no
+# value at which the answer settles, so any value chosen would be the answer.
+# --------------------------------------------------------------------------
+
+#: The top of a claims table as a scanner recognised it. The rest of the
+#: table -- further rows, totals -- is in the picture and nowhere else.
+PARTIAL = (
+    ("CN-2001", "01/15/2024", "OPEN", "4,100.00", "900.00", "5,000.00"),
+    ("CN-2002", "02/20/2024", "CLOSED", "750.00", "0.00", "750.00"),
+    ("CN-2003", "04/02/2024", "OPEN", "2,000.00", "1,500.00", "3,500.00"),
+)
+#: A whole claims table, recognised end to end.
+WHOLE = tuple(
+    (f"CN-30{n:02d}", "06/0{0}/2024".format(1 + n % 9), "OPEN",
+     f"{100 * n:,}.00", "200.00", f"{100 * n + 200:,}.00")
+    for n in range(1, 13)
+)
+CAPTIONS = ("Appendix 2 - Loss Runs", "Since Policy Year 2018", "(Provided by the carrier)")
+RASTER = pymupdf.Rect(40, 150, 572, 740)
+
+
+def _recognised_table(page, rect, rows, title="MERIDIAN MUTUAL ASSURANCE - LOSS RUN"):
+    """An OCR layer over ``rect``: a title, the header, then ``rows``."""
+    x = rect.x0 + 20
+    y = rect.y0 + 20
+    page.insert_text((x, y), title, fontsize=9, render_mode=3)
+    y += LINE
+    for offset, label in zip(COLUMNS, HEADERS):
+        page.insert_text((x + offset, y), label, fontsize=8.5, render_mode=3)
+    y += LINE
+    for row in rows:
+        for offset, cell in zip(COLUMNS, row):
+            page.insert_text((x + offset, y), cell, fontsize=8.5, render_mode=3)
+        y += LINE
+    return y
+
+
+def _composed_page(document, recognise):
+    """A heading printed over a pasted raster, with ``recognise`` run over it."""
+    page = document.new_page(width=612, height=792)
+    _text(page, CAPTIONS)
+    _image(page, RASTER)
+    recognise(page)
+    return page
+
+
+@pytest.mark.parametrize(
+    "hidden",
+    ["LOSS RUN", "MERIDIAN MUTUAL ASSURANCE - LOSS RUN REPORT - VALUED 12/31/2024"],
+    ids=["short", "long"],
+)
+def test_one_hidden_span_does_not_read_a_raster_beside_its_captions(tmp_path, hidden):
+    """Codex's counterexample, exactly: one invisible span, captions outside.
+
+    Asked only of the text standing on the picture, the one span is all of it
+    and every word of it is invisible, so the picture read as transcribed.
+    The page's own text is the captions beside the picture; the span is a
+    fragment, and its length changes nothing.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    _composed_page(
+        document,
+        lambda page: page.insert_text(
+            (RASTER.x0 + 20, RASTER.y0 + 20), hidden, fontsize=9, render_mode=3
+        ),
+    )
+    path = _save(document, tmp_path / "one_hidden_span.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert 2 not in result.document.processed_pages
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def test_captions_on_a_banner_picture_still_sit_beside_the_raster(tmp_path):
+    """The page's own text need not be off every picture to be beside this one.
+
+    Here the captions are printed over a banner -- a small picture of its
+    own -- and the raster below carries one recognised span. Asked whether
+    the page prints anything outside *all* of its pictures, the answer is no,
+    and the page passes for a scan. Asked of the raster, the captions are
+    beside it, and the span on it is a fragment.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(30, 36, 582, 100))
+    _text(page, CAPTIONS)
+    _image(page, RASTER)
+    page.insert_text(
+        (RASTER.x0 + 20, RASTER.y0 + 20), "LOSS RUN", fontsize=9, render_mode=3
+    )
+    path = _save(document, tmp_path / "banner.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert [f.page for f in _r22(result)] == [2]
+
+
+@pytest.mark.parametrize("rows_read", [0, 3], ids=["header-only", "three-rows"])
+def test_a_partial_ocr_layer_over_a_rasterised_claims_table_stays_unresolved(
+    tmp_path, rows_read
+):
+    """The top of a pasted claims table recognised, the rest of it not.
+
+    Two paths cleared this page. The invisible words on the picture
+    outnumber the captions, so the page-wide share that once guarded it
+    would have been passed as well; and with rows recognised, the extractor
+    reads claims off them, and a row standing on a picture counted as that
+    picture having been read. Rows read from a transcription are the
+    transcription: they cannot vouch for it.
+
+    What was recognised is kept. The claims read off the fragment are real;
+    the page is unresolved because nothing shows they are all of them.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    _composed_page(
+        document, lambda page: _recognised_table(page, RASTER, PARTIAL[:rows_read])
+    )
+    path = _save(document, tmp_path / f"partial_{rows_read}.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    on_page = [c for c in result.document.claims if c.source_page == 2]
+    assert len(on_page) == rows_read, "what was recognised must still be read"
+    assert 2 in result.document.unresolved_pages
+    assert 2 not in result.document.processed_pages
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def test_a_recognised_fragment_keeps_its_identity_and_says_what_happened(tmp_path):
+    """The reason has to be true of this page, not of the plain raster one.
+
+    "Nothing read what the picture holds" is false here: three claims were
+    read off it. What is true is that some of it was recognised and nothing
+    shows the rest was.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    _composed_page(document, lambda page: _recognised_table(page, RASTER, PARTIAL))
+    path = _save(document, tmp_path / "fragment_reason.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    raised = _r22(result)
+    assert [f.page for f in raised] == [2]
+    finding = raised[0]
+    assert finding.rule_id == "R-22"
+    assert finding.severity is Severity.ERROR
+    assert finding.condition == "page-2"
+    assert result.document.unresolved_reasons[2] == finding.actual
+    said = f"{finding.message} {finding.actual}".lower()
+    assert "vision" not in said, said
+    assert "picture" in said and "recognised" in said, said
+    assert "nothing read" not in said, said
+    assert any("2" in warning for warning in result.warnings)
+
+
+def test_a_searchable_scan_of_a_claims_table_stays_processed(tmp_path):
+    """The control: the page is the picture and its text is the reading.
+
+    No text of its own, one picture over the sheet, and a transcription of
+    everything on it. Its rows come off the transcription, and they no
+    longer vouch for the picture by themselves -- the page being a scan
+    saved as searchable is what does.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    sheet = pymupdf.Rect(0, 0, 612, 792)
+    _image(page, sheet)
+    _ocr_layer(page, MASTHEAD, sheet)
+    y = _recognised_table(page, pymupdf.Rect(20, 110, 592, 780), WHOLE)
+    page.insert_text((40, y + 2 * LINE), "Page 2 of 2", fontsize=9, render_mode=3)
+    path = _save(document, tmp_path / "scanned_table.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    on_page = [c for c in result.document.claims if c.source_page == 2]
+    assert len(on_page) == len(WHOLE)
+    assert 2 in result.document.processed_pages
+    assert 2 not in result.document.unresolved_pages
+    assert _r22(result) == []
+
+
+def test_a_transcribed_picture_does_not_clear_a_separate_unread_one(tmp_path):
+    """Per picture still: a scan of the top of a sheet says nothing of a raster below it."""
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    top = pymupdf.Rect(0, 0, 612, 260)
+    _image(page, top)
+    _ocr_layer(page, MASTHEAD, top)
+    _image(page, pymupdf.Rect(0, 280, 612, 792))
+    path = _save(document, tmp_path / "scan_over_raster.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
+    assert [f.page for f in _r22(result)] == [2]
+
+
+def _told_apart(tmp_path, turn, crop):
+    import pdfplumber
+
+    from core.classify import classify_pdf, to_page_space
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    page.insert_text((LEFT, 120), "PRINTED SUMMARY LINE", fontsize=9)
+    page.insert_text((LEFT, 400), "RECOGNISED TRANSCRIPTION LINE", fontsize=9, render_mode=3)
+    page.set_rotation(turn)
+    path = _save(document, tmp_path / f"told_apart_{turn}.pdf")
+    if crop is not None:
+        reopened = pymupdf.open(path)
+        reopened[0].set_cropbox(pymupdf.Rect(*crop))
+        path = tmp_path / f"told_apart_{turn}_cropped.pdf"
+        reopened.save(path)
+        reopened.close()
+
+    classified = next(p for p in classify_pdf(path).pages if p.page == 1)
+    with pdfplumber.open(path) as pdf:
+        words = pdf.pages[0].extract_words() or []
+    boxes = [(w["x0"], w["top"], w["x1"], w["bottom"]) for w in words]
+    with pymupdf.open(path) as opened:
+        sheet = opened[0]
+        centres = [
+            (to_page_space(sheet, box).y0 + to_page_space(sheet, box).y1) / 2
+            for box in boxes
+        ]
+        middle = (min(centres) + max(centres)) / 2
+        printed = [box for box, y in zip(boxes, centres) if y < middle]
+        recognised = [box for box, y in zip(boxes, centres) if y > middle]
+        assert printed and recognised, "precondition: both lines extracted"
+
+        assert all(classified.contains(box, sheet) for box in printed + recognised)
+        assert classified.read_from(printed, sheet) == classified.image_boxes
+        assert classified.read_from(recognised, sheet) == ()
+
+
+@pytest.mark.parametrize(
+    "turn, crop",
+    [(0, None), (90, None), (180, None), (270, None), (0, (0, 36, 612, 756))],
+    ids=["upright", "turned-90", "turned-180", "turned-270", "cropped"],
+)
+def test_printed_and_recognised_rows_are_told_apart_in_one_space(tmp_path, turn, crop):
+    """A printed row reads its picture; a recognised one is part of the picture.
+
+    Both stand on the same picture, and geometry alone cannot tell them
+    apart. Which is which is asked of the text itself, in the space the
+    pictures are placed in -- so it has to hold when the page is turned and
+    when its crop box starts down the sheet.
+    """
+    _told_apart(tmp_path, turn, crop)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "intended correct behavior; not yet implemented: "
+        "core/evidence.py::_to_page_space derotates within the crop box while "
+        "the word extractor rotates within the media box, so on a page with "
+        "both /Rotate and an offset crop box a row lands a crop offset away "
+        "from its own words"
+    ),
+    strict=True,
+)
+def test_printed_rows_are_told_apart_on_a_turned_and_cropped_page(tmp_path):
+    """Turned *and* cropped: the one combination the shared mapping gets wrong.
+
+    Each correction alone is right and is tested above. Together, the third
+    line of this page maps to a height of about 33 points when its words sit
+    at about 105: the rotation is undone within the crop box's height, not
+    the media box's. Geometry alone hid it -- a picture over the whole sheet
+    contains the misplaced row anyway -- but asking whether the row's own
+    words are printed needs the row to land on them. It fails closed: the
+    row does not vouch for the picture, and the page is left for review.
+
+    core/evidence.py records this combination as unsettled and reads every
+    region back before showing it. No document in the corpus here has it.
+    """
+    _told_apart(tmp_path, 90, (18, 36, 594, 756))
+
+
+@pytest.mark.xfail(
+    reason=(
+        "intended correct behavior; not yet implemented: a scan saved as "
+        "searchable whose OCR layer covers only part of it is, in the file, "
+        "the same page as a nearly blank scanned sheet"
+    ),
+    strict=True,
+)
+def test_a_partial_ocr_layer_on_a_bare_scan_stays_unresolved(tmp_path):
+    """The limit of this rule, recorded rather than hidden.
+
+    The page has no text of its own, so its transcription is accepted as its
+    reading -- and here that transcription stops after three rows of a table
+    whose remaining rows are in the picture. Nothing in the file separates
+    this page from ``test_a_sparse_ocr_layer_still_reads_its_picture``: the
+    difference is in the pixels, which nothing reads. Closing it needs either
+    a coverage constant, which the corpus shows has no stable value, or
+    evidence from the image itself.
+    """
+    document = pymupdf.open()
+    _digital_table_page(document)
+    page = document.new_page(width=612, height=792)
+    _image(page, pymupdf.Rect(0, 0, 612, 792))
+    _recognised_table(page, pymupdf.Rect(20, 20, 592, 780), PARTIAL)
+    path = _save(document, tmp_path / "bare_partial.pdf")
+
+    result = run_pipeline(path, use_vision=False)
+    assert 2 in result.document.unresolved_pages
