@@ -268,6 +268,46 @@ def test_empty_workdir_uses_and_owns_a_private_directory(
     assert not stage.exists()
 
 
+@pytest.mark.parametrize("path_input", [False, True])
+def test_empty_workdir_failure_removes_its_private_directory(
+    tmp_path: Path,
+    monkeypatch,
+    path_input: bool,
+) -> None:
+    stage = tmp_path / f"losslift-failed-{path_input}"
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "losslift-"
+        stage.mkdir()
+        return str(stage)
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    if path_input:
+        source = _digital_pdf(tmp_path / "caller-owned.pdf")
+
+        def fail_copy(_source, target) -> str:
+            target.write(b"%PDF-partial private bytes")
+            raise OSError("synthetic snapshot failure")
+
+        monkeypatch.setattr(ingest_module, "_copy_and_hash", fail_copy)
+        operation = lambda: ingest_path(source, "")
+    else:
+        real_open = Path.open
+
+        def fail_upload_write(path: Path, mode: str = "r", *args, **kwargs):
+            if "x" in mode:
+                raise OSError("synthetic upload failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_upload_write)
+        operation = lambda: ingest(b"%PDF-1.7 upload", "upload.pdf", "")
+
+    with pytest.raises(OSError, match="synthetic"):
+        operation()
+
+    assert not stage.exists()
+
+
 def test_oversized_path_is_rejected_before_snapshot_or_full_read(
     tmp_path: Path,
     monkeypatch,

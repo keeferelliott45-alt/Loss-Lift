@@ -160,7 +160,7 @@ def ingest(
     except BaseException:
         if created:
             target.unlink(missing_ok=True)
-        if workdir is None:
+        if owns_directory:
             shutil.rmtree(directory, ignore_errors=True)
         raise
 
@@ -180,6 +180,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     directory: Path | None = None
     temporary_target: Path | None = None
     temporary_target_created = False
+    owns_directory = False
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
@@ -236,7 +237,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     except BaseException:
         if temporary_target is not None and temporary_target_created:
             temporary_target.unlink(missing_ok=True)
-        if workdir is None and directory is not None:
+        if owns_directory and directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
         raise
 
