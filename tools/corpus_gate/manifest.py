@@ -233,18 +233,23 @@ def snapshot(manifest: Manifest, corpus: Path, target: Path) -> dict[str, Path]:
     revisions read is exactly what was checked against the manifest. A
     document that no longer matches its entry -- replaced, edited or removed
     since it was verified -- stops the gate here, before anything runs.
-    Copies are named by id, never by file name, and made read-only.
+
+    Copies are named by their position in the manifest (``000001.pdf``),
+    never by id or file name, and made read-only. An id is a valid identity
+    and a poor file name: two ids differing only in case are one file on a
+    case-insensitive filesystem, and ``CON`` cannot be a file on Windows at
+    all. A position is unique, portable, and says nothing about the document.
     """
     target.mkdir(parents=True)
     copies: dict[str, Path] = {}
     changed: list[str] = []
-    for entry in manifest.entries:
+    for position, entry in enumerate(manifest.entries, start=1):
         try:
             source = locate(entry, corpus).open("rb")
         except OSError:
             changed.append(entry.id)
             continue
-        copy = target / f"{entry.id}.pdf"
+        copy = target / f"{position:06d}.pdf"
         digest = hashlib.sha256()
         size = 0
         with source, copy.open("xb") as sink:

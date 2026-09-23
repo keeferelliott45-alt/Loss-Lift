@@ -11,14 +11,18 @@ anywhere in the output fails the test.
 
 from __future__ import annotations
 
+import builtins
+import errno
+import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import textwrap
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -589,6 +593,152 @@ def test_a_corpus_inside_the_repository_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# The snapshot: private copies whose names work on every filesystem
+# --------------------------------------------------------------------------
+
+#: Names Windows keeps for devices, with or without an extension: ``CON.pdf`` is ``CON``.
+_WINDOWS_DEVICES = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"{port}{digit}" for port in ("com", "lpt") for digit in "0123456789\u00b9\u00b2\u00b3"}
+)
+#: What a snapshot file may be called: lower-case ASCII, so no case rule can merge two.
+_PORTABLE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\.pdf")
+
+
+def _reserved_on_windows(name):
+    stem = name.partition(".")[0].rstrip(" ").casefold()
+    return stem in _WINDOWS_DEVICES or name != name.rstrip(". ")
+
+
+@pytest.fixture()
+def windows_rules(monkeypatch):
+    """Create files under the registered roots as Windows would.
+
+    There, two names that differ only in case are one file, and a device name
+    such as ``CON.pdf`` is not a file at all. Linux allows both, so without
+    this a snapshot Windows cannot write would pass here. ``disk_full_at``
+    makes that numbered file creation fail as a full disk would.
+    """
+    state = SimpleNamespace(roots=[], created=[], disk_full_at=None)
+    real_open = io.open
+
+    def open_like_windows(file, mode="r", *args, **kwargs):
+        if isinstance(file, (str, bytes, os.PathLike)) and set(mode) & set("wxa+"):
+            path = Path(os.fsdecode(file)).resolve()
+            if any(path.is_relative_to(Path(root).resolve()) for root in state.roots):
+                state.created.append(path)
+                if state.disk_full_at == len(state.created):
+                    raise OSError(errno.ENOSPC, "injected: no space left on device")
+                if _reserved_on_windows(path.name):
+                    raise OSError(errno.EINVAL, "Windows keeps this name for a device")
+                if path.parent.is_dir() and any(
+                    other.name != path.name and other.name.casefold() == path.name.casefold()
+                    for other in path.parent.iterdir()
+                ):
+                    raise FileExistsError(errno.EEXIST, "the same file, ignoring case")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(io, "open", open_like_windows)
+    monkeypatch.setattr(builtins, "open", open_like_windows)
+    return state
+
+
+def _hand_manifest(tmp_path, documents):
+    """A manifest written by hand: ``documents`` lists ``(id, file name, bytes)``.
+
+    The corpus file names are portable. The ids are what a person might type,
+    and manifest validation accepts every one of them.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    listed = []
+    for doc_id, name, data in documents:
+        (corpus / name).parent.mkdir(parents=True, exist_ok=True)
+        (corpus / name).write_bytes(data)
+        listed.append(
+            {"id": doc_id, "path": name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+        )
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps({"version": 1, "digest_salt": SALT.hex(), "documents": listed}), encoding="utf-8"
+    )
+    return corpus, path, manifests.load(path)
+
+
+def _snapshot_like_windows(tmp_path, windows_rules, documents):
+    corpus, _, manifest = _hand_manifest(tmp_path, documents)
+    windows_rules.roots.append(tmp_path / "scratch")
+    copies = manifests.snapshot(manifest, corpus, tmp_path / "scratch" / "snapshot")
+    return manifest, corpus, copies
+
+
+def _assert_one_verified_copy_each(manifest, copies):
+    assert list(copies) == [entry.id for entry in manifest.entries]
+    names = [copy.name for copy in copies.values()]
+    assert len({name.casefold() for name in names}) == len(names), f"merged ignoring case: {names}"
+    for entry in manifest.entries:
+        assert manifests.file_sha256(copies[entry.id]) == entry.sha256, entry.id
+
+
+def test_ids_that_differ_only_in_case_get_distinct_snapshot_files(tmp_path, windows_rules):
+    manifest, _, copies = _snapshot_like_windows(
+        tmp_path,
+        windows_rules,
+        [
+            ("Doc-A", "first-loss-run.pdf", b"%PDF-1.4 first"),
+            ("doc-a", "second-loss-run.pdf", b"%PDF-1.4 second"),
+        ],
+    )
+    _assert_one_verified_copy_each(manifest, copies)
+
+
+def test_windows_device_names_cannot_break_the_snapshot(tmp_path, windows_rules):
+    devices = ("CON", "PRN", "AUX", "NUL", "COM1", "LPT1")
+    manifest, _, copies = _snapshot_like_windows(
+        tmp_path,
+        windows_rules,
+        [
+            (name, f"loss-run-{n}.pdf", f"%PDF-1.4 device {n}".encode())
+            for n, name in enumerate(devices, start=1)
+        ],
+    )
+    _assert_one_verified_copy_each(manifest, copies)
+    assert not any(_reserved_on_windows(copy.name) for copy in copies.values())
+
+
+@pytest.mark.parametrize(
+    "ids", [("twin", "twin-2"), ("Twin", "twin")], ids=["distinct-ids", "ids-differing-in-case"]
+)
+def test_identical_bytes_under_two_ids_get_two_snapshot_files(tmp_path, windows_rules, ids):
+    same = b"%PDF-1.4 the same bytes, listed twice"
+    manifest, _, copies = _snapshot_like_windows(
+        tmp_path,
+        windows_rules,
+        [(ids[0], "listed-once.pdf", same), (ids[1], "listed-twice.pdf", same)],
+    )
+    _assert_one_verified_copy_each(manifest, copies)
+    assert copies[ids[0]] != copies[ids[1]]
+
+
+def test_snapshot_file_names_say_nothing_about_the_document(tmp_path, windows_rules):
+    manifest, corpus, copies = _snapshot_like_windows(
+        tmp_path,
+        windows_rules,
+        [
+            ("sentinelle-jane", f"{FILE_STEM} 1.pdf", b"%PDF-1.4 one"),
+            ("doc-3f9a1c2b7e44", "claims/2024/renewal-packet.pdf", b"%PDF-1.4 two"),
+        ],
+    )
+    _assert_one_verified_copy_each(manifest, copies)
+    for entry in manifest.entries:
+        name = copies[entry.id].name
+        assert _PORTABLE_NAME.fullmatch(name) and not _reserved_on_windows(name), name
+        source = manifests.locate(entry, corpus)
+        for said in (entry.id, source.name, source.stem, *PurePosixPath(entry.path).parts):
+            assert said.casefold() not in name.casefold(), f"{name} says {said}"
+
+
+# --------------------------------------------------------------------------
 # The collector, on a real pipeline result
 # --------------------------------------------------------------------------
 
@@ -1045,13 +1195,15 @@ def collectors(monkeypatch):
     """Every collector the gate launches, and what it removed while one was unreaped.
 
     Faults can be injected: a launch that fails, a wait that raises, or a hook
-    run just before the first collector starts. Any collector still running
+    run just before the first collector starts. ``on_launch`` is shown every
+    collector's command line before it starts. Any collector still running
     afterwards is killed here, so a failing test leaves nothing behind either.
     """
     from tools.corpus_gate import runner
 
     state = SimpleNamespace(
-        launched=[], removed=[], fail_launch=None, fail_wait=None, before_launch=None
+        launched=[], removed=[], fail_launch=None, fail_wait=None, before_launch=None,
+        on_launch=None,
     )
     real_popen = subprocess.Popen
     real_remove_tree = runner._remove_tree
@@ -1068,6 +1220,8 @@ def collectors(monkeypatch):
         if state.before_launch is not None:
             hook, state.before_launch = state.before_launch, None
             hook()
+        if state.on_launch is not None:
+            state.on_launch(words)
         if state.fail_launch == len(state.launched):
             raise OSError("injected: the collector could not be started")
         process = real_popen(args, *rest, **kwargs)
@@ -1105,7 +1259,7 @@ def _own_corpus(world, tmp_path):
     return corpus
 
 
-def _in_process(world, baseline, candidate, corpus, out, **options):
+def _in_process(world, baseline, candidate, corpus, out, manifest=None, **options):
     from tools.corpus_gate import runner
 
     return runner.run_gate(
@@ -1113,7 +1267,7 @@ def _in_process(world, baseline, candidate, corpus, out, **options):
         baseline=world[baseline],
         candidate=world[candidate],
         corpus=corpus,
-        manifest_path=world["manifest"],
+        manifest_path=manifest or world["manifest"],
         out_dir=out,
         **options,
     )
@@ -1246,6 +1400,74 @@ def test_a_timed_out_run_leaves_no_collector_or_copy_behind(world, tmp_path, col
     assert "timed out" in outcome.report
     assert len(collectors.launched) == 2
     _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_every_id_is_given_its_own_verified_copy_under_windows_rules(
+    world, tmp_path, monkeypatch, collectors, gate_tmp, windows_rules
+):
+    same = b"%PDF-1.4 the same bytes, listed twice"
+    corpus, manifest_path, manifest = _hand_manifest(
+        tmp_path,
+        [
+            ("Doc-A", "first-loss-run.pdf", b"%PDF-1.4 first"),
+            ("doc-a", "second-loss-run.pdf", b"%PDF-1.4 second"),
+            ("CON", "third-loss-run.pdf", b"%PDF-1.4 third"),
+            ("nul", "fourth-loss-run.pdf", b"%PDF-1.4 fourth"),
+            ("Twin", "listed-once.pdf", same),
+            ("twin", "listed-twice.pdf", same),
+        ],
+    )
+    windows_rules.roots.append(gate_tmp)
+    reads = tmp_path / "reads"
+    reads.mkdir()
+    monkeypatch.setenv("GATE_TEST_READ_LOG", str(reads))
+    handed = []
+
+    def read_documents_json(words):
+        records = json.loads(Path(words[words.index("--documents") + 1]).read_text(encoding="utf-8"))
+        handed.append(
+            [(r["id"], Path(r["path"]), manifests.file_sha256(Path(r["path"]))) for r in records]
+        )
+
+    collectors.on_launch = read_documents_json
+    outcome = _in_process(world, "base", "same", corpus, tmp_path / "out", manifest=manifest_path)
+    assert outcome.exit_code == gate.EXIT_PASS, outcome.report
+
+    assert len(handed) == 2 and handed[0] == handed[1], "both revisions were given the same copies"
+    given = handed[0]
+    assert [doc_id for doc_id, _, _ in given] == [entry.id for entry in manifest.entries]
+    names = [path.name for _, path, _ in given]
+    assert len({name.casefold() for name in names}) == len(names), f"merged ignoring case: {names}"
+    for entry, (doc_id, path, sha) in zip(manifest.entries, given):
+        assert sha == entry.sha256, f"{doc_id} was given another document's bytes"
+        assert path.resolve().is_relative_to(gate_tmp.resolve()), f"{doc_id}: not a private copy"
+        assert _PORTABLE_NAME.fullmatch(path.name) and not _reserved_on_windows(path.name)
+        assert doc_id.casefold() not in path.name.casefold()
+    written = [path for path in windows_rules.created if path.suffix == ".pdf"]
+    assert len(written) == len(given), "every copy was written under Windows rules"
+
+    expected = sorted((str(path), sha) for _, path, sha in given)
+    for log in sorted(reads.iterdir()):
+        seen = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert sorted((read["path"], read["sha256"]) for read in seen) == expected
+    assert len(list(reads.iterdir())) == 2, "one read log per revision"
+    _assert_no_leak(world, outcome.report, json.dumps(outcome.result))
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_a_failure_while_copying_leaves_no_snapshot_behind(
+    world, tmp_path, collectors, gate_tmp, windows_rules
+):
+    windows_rules.roots.append(gate_tmp)
+    windows_rules.disk_full_at = 2
+    with pytest.raises(OSError):
+        _in_process(world, "base", "same", _own_corpus(world, tmp_path), tmp_path / "out")
+    assert [path.suffix for path in windows_rules.created] == [".pdf", ".pdf"], (
+        "the disk filled on the second copy"
+    )
+    assert collectors.launched == []
+    assert list(gate_tmp.iterdir()) == []
+    _assert_repository_untouched(world)
 
 
 def test_an_unexpected_error_is_an_execution_failure_named_by_type(tmp_path, monkeypatch, capsys):

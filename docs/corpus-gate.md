@@ -103,9 +103,13 @@ hashing the bytes as they are copied:
 * both commits read the snapshot and nothing else, so they measure the same
   bytes, exactly the bytes that were verified, whatever happens to the
   corpus meanwhile;
-* the copies are named by id, made read-only, and hashed again once both
-  commits have finished. A copy that changed during the run fails it
-  (exit 4), because the two commits may no longer have read the same thing.
+* the copies are named by their position in the manifest (`000001.pdf`),
+  never by id or file name, so ids that differ only in case, or that spell
+  a Windows device name such as `CON`, still get one copy each on every
+  filesystem;
+* the copies are made read-only, and hashed again once both commits have
+  finished. A copy that changed during the run fails it (exit 4), because
+  the two commits may no longer have read the same thing.
 
 However the run ends, whether finished, timed out, interrupted or stopped by
 an error, every collector the gate started is killed and reaped before any
@@ -143,7 +147,7 @@ output, even by accident:
   to. Each run's verified snapshot, and the pipeline's own temporary copies,
   live in a directory the gate creates per run and deletes afterwards,
   whatever happens, once every collector has been stopped. Snapshot copies
-  are named by id, never by file name.
+  are named by position, never by id or file name.
 * **Nothing textual is written.** Every value in the output is an integer, a
   boolean, null, a page number, a string matching the strict shape of an
   enumeration (`R-22`, `NEEDS_REVIEW`, `financial`), checked before it is
