@@ -9,7 +9,7 @@ import pytest
 
 from core import ingest as ingest_module
 from core import pipeline as pipeline_module
-from core.ingest import IngestError, discard, ingest_path
+from core.ingest import MAX_UPLOAD_BYTES, IngestError, discard, ingest_path
 from core.pipeline import run_pipeline
 
 
@@ -142,3 +142,88 @@ def test_path_change_during_extraction_is_rejected_and_snapshot_is_removed(
     assert observed_snapshot == [original_bytes]
     assert source.read_bytes() == replacement
     assert not stage.exists()
+
+
+def test_atomic_replacement_during_final_verification_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _digital_pdf(tmp_path / "caller-owned.pdf")
+    replacement = _digital_pdf(tmp_path / "replacement.pdf")
+    stage = tmp_path / "losslift-stage"
+    real_stat = Path.stat
+    source_stats = 0
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "losslift-"
+        stage.mkdir()
+        return str(stage)
+
+    def replace_before_final_path_stat(path: Path, *args, **kwargs):
+        nonlocal source_stats
+        if path == source:
+            source_stats += 1
+            if source_stats == 2:
+                replacement.replace(source)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(Path, "stat", replace_before_final_path_stat)
+
+    with pytest.raises(IngestError, match="changed while it was being read"):
+        run_pipeline(source, use_vision=False)
+
+    assert source_stats == 2
+    assert not stage.exists()
+
+
+def test_oversized_path_is_rejected_before_snapshot_or_full_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "oversized.pdf"
+    with source.open("wb") as handle:
+        handle.write(b"%PDF-")
+        handle.truncate(MAX_UPLOAD_BYTES + 1)
+    calls: list[str] = []
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        calls.append(prefix)
+        return str(tmp_path / "losslift-unexpected")
+
+    def forbid_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("oversized input was loaded into memory")
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+
+    with pytest.raises(IngestError, match="limit"):
+        run_pipeline(source, use_vision=False)
+
+    assert calls == []
+
+
+def test_failed_snapshot_write_removes_partial_document(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _digital_pdf(tmp_path / "caller-owned.pdf")
+    stage = tmp_path / "losslift-stage"
+
+    def recording_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "losslift-"
+        stage.mkdir()
+        return str(stage)
+
+    def fail_copy(_source, target) -> str:
+        target.write(b"%PDF-partial private bytes")
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(ingest_module.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(ingest_module, "_copy_and_hash", fail_copy)
+
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        run_pipeline(source, use_vision=False)
+
+    assert not stage.exists()
+    assert source.exists()

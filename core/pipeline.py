@@ -27,7 +27,7 @@ from core.extract_digital import (
     COUNTED_TOTAL_LABEL,
     DocumentMetadata,
 )
-from core.ingest import IngestError, IngestedFile, discard, ingest_path, sha256_file
+from core.ingest import IngestedFile, discard, ingest_path, verify_source_unchanged
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -1786,18 +1786,7 @@ def run_pipeline(
             use_llm=use_llm,
             llm_client=llm_client,
         )
-        try:
-            unchanged = sha256_file(original) == ingested.sha256
-        except OSError as error:
-            raise IngestError(
-                f"{original.name} changed or disappeared while it was being read. "
-                "Run the extraction again."
-            ) from error
-        if not unchanged:
-            raise IngestError(
-                f"{original.name} changed while it was being read. "
-                "Run the extraction again."
-            )
+        verify_source_unchanged(ingested)
         result.source_path = original
         return result
     finally:
