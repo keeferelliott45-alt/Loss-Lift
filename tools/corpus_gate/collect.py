@@ -9,7 +9,9 @@ It imports that worktree's ``core`` and nothing from the checkout it was
 started from; it proves so before measuring anything. It writes one JSON line
 per document, then a line saying it finished. A file without that last line is
 incomplete, and the gate treats it as a failure rather than as a shorter
-corpus.
+corpus. A document is measured completely or not at all: if any measurement
+raises, the document is recorded as unmeasured, which fails the gate like a
+crash does.
 
 Nothing written here may carry text from a document. Every value is one of:
 
@@ -173,6 +175,15 @@ def flag(value: Any) -> bool | None:
 def error_name(error: BaseException) -> str:
     name = type(error).__name__
     return name if ERROR_NAME.fullmatch(name) else "UnnamedError"
+
+
+class Unmeasured(Exception):
+    """A measurement group raised, so the document was not measured."""
+
+    def __init__(self, group: str, error_type: str) -> None:
+        super().__init__(group, error_type)
+        self.group = group
+        self.error_type = error_type
 
 
 # --------------------------------------------------------------------------
@@ -348,14 +359,16 @@ def _warnings(result: Any, digest: Digest) -> dict[str, Any] | None:
 def measure(result: Any, digest: Digest) -> dict[str, Any]:
     """Every privacy-safe measurement the gate compares, for one document.
 
-    Each group is measured on its own. A group the revision cannot produce --
-    an attribute an older revision lacks -- is recorded by the name of the
-    exception that stopped it, which the comparison then sees as a value like
-    any other.
+    Every group is measured, or the document is not: a group that raises stops
+    the measurement with :class:`Unmeasured`, naming the group and the type of
+    the exception. An exception is never recorded as a value, because two
+    revisions failing the same way have measured nothing, not the same thing.
+    Attributes an older revision may lack are read with a default and
+    recorded as absent; their absence does not raise.
     """
     document = getattr(result, "document", None)
     reconciliation = getattr(result, "reconciliation", None)
-    claims = list(getattr(document, "claims", None) or [])
+    claims: list[Any] = []
     groups: dict[str, Callable[[], Any]] = {
         "claim_count": lambda: len(claims),
         "status": lambda: token(getattr(reconciliation, "status"), UPPER_TOKEN, digest),
@@ -371,12 +384,16 @@ def measure(result: Any, digest: Digest) -> dict[str, Any]:
         "metadata": lambda: _metadata(document, digest),
         "warnings": lambda: _warnings(result, digest),
     }
+    try:
+        claims.extend(getattr(document, "claims", None) or [])
+    except Exception as error:  # noqa: BLE001 - the document is unmeasured
+        raise Unmeasured("claims", error_name(error)) from None
     out: dict[str, Any] = {}
     for name, measure_group in groups.items():
         try:
             out[name] = measure_group()
-        except Exception as error:  # noqa: BLE001 - recorded, never raised
-            out[name] = {"unmeasured": error_name(error)}
+        except Exception as error:  # noqa: BLE001 - the document is unmeasured
+            raise Unmeasured(name, error_name(error)) from None
     return out
 
 
@@ -437,7 +454,12 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as error:  # noqa: BLE001 - recorded as a failure
                 record.update(ok=False, error_type=error_name(error))
             else:
-                record.update(ok=True, metrics=measure(result, digest))
+                try:
+                    record.update(ok=True, metrics=measure(result, digest))
+                except Unmeasured as failure:
+                    record.update(
+                        ok=False, error_type=failure.error_type, unmeasured=failure.group
+                    )
             record["seconds"] = round(time.perf_counter() - started, 3)
             _write(handle, record)
         _write(handle, {"kind": "complete", "documents": len(documents)})

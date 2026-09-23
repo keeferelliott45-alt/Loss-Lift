@@ -7,10 +7,22 @@ with ``-P`` and ``PYTHONPATH`` set to that worktree alone, so ``import core``
 can only mean that revision's code -- and the collector checks it did before
 measuring anything.
 
+Neither revision reads the corpus. Once the corpus is verified, every listed
+document is copied into a private snapshot, hashed as it is copied, and both
+collectors are given the snapshot: the bytes each revision measures are the
+bytes that were checked, whatever happens to the corpus meanwhile. The copies
+are checked again after both collectors finish.
+
 Each collector also gets a private temporary directory of its own. The
 pipeline copies every document it ingests into the system temporary
 directory; pointing that at a directory the gate owns means every copy is
 deleted with it, whatever happens.
+
+Every collector the gate starts is tracked from the moment it exists. However
+the run ends -- finished, timed out, interrupted, or stopped by an error --
+every collector still running is killed and reaped before any worktree, copy
+or temporary file is removed, so nothing is deleted from under a live process
+and no process outlives the gate.
 
 Collector output streams are discarded, never shown and never stored: a
 traceback can quote the cell that caused it. What a revision did is read only
@@ -88,7 +100,14 @@ def _remove_tree(path: Path) -> None:
         shutil.rmtree(path, onerror=retry)
 
 
-def _launch(worktree: Path, documents: Path, out: Path, scratch: Path, salt: bytes):
+def _launch(
+    worktree: Path,
+    documents: Path,
+    out: Path,
+    scratch: Path,
+    salt: bytes,
+    collectors: list[subprocess.Popen],
+) -> subprocess.Popen:
     env = dict(os.environ)
     for key in ("PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT"):
         env.pop(key, None)
@@ -120,10 +139,38 @@ def _launch(worktree: Path, documents: Path, out: Path, scratch: Path, salt: byt
         stderr=subprocess.DEVNULL,
         text=True,
     )
+    collectors.append(process)  # tracked before anything else can fail
     assert process.stdin is not None
-    process.stdin.write(salt.hex() + "\n")
-    process.stdin.close()
+    with process.stdin as pipe:
+        pipe.write(salt.hex() + "\n")
     return process
+
+
+def _stop(collectors: list[subprocess.Popen]) -> None:
+    """Kill every collector still running, then reap them all.
+
+    Nothing a collector uses is removed before this returns: a collector left
+    running would go on reading from a directory being deleted under it, with
+    nobody left to notice.
+    """
+    for process in collectors:
+        if process.poll() is None:
+            process.kill()
+    for process in collectors:
+        process.wait()
+
+
+def _clean_up(root: Path, worktrees: list[Path], scratch: Path) -> None:
+    for tree in worktrees:
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", "--force", str(tree)],
+            capture_output=True,
+            check=False,
+        )
+    _remove_tree(scratch)
+    # After the directories are gone, so a worktree whose creation failed
+    # half-way is not left registered either.
+    subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False)
 
 
 def _default_out(manifest_path: Path, baseline: str, candidate: str) -> Path:
@@ -162,6 +209,13 @@ def _setup_failure(message: str, verification: manifests.Verification | None = N
     return GateRun(comparison.EXIT_SETUP, "\n".join(lines) + "\n", result, None)
 
 
+def _written(failed: GateRun, out_dir: Path | None) -> GateRun:
+    if out_dir is not None:
+        _write(out_dir, failed.result, failed.report)
+        failed.out_dir = out_dir
+    return failed
+
+
 def run_gate(
     *,
     repo: Path,
@@ -173,7 +227,7 @@ def run_gate(
     out_dir: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> GateRun:
-    """Verify the corpus, measure both revisions, compare, and write the result.
+    """Verify the corpus, snapshot it, measure both revisions, compare, and write the result.
 
     A setup failure writes its result too when ``out_dir`` was given. Without
     one there is nowhere trustworthy to write it: the default location sits
@@ -197,37 +251,43 @@ def run_gate(
     except SetupError as error:
         failed = _setup_failure(str(error))
     if failed is not None:
-        if out_dir is not None:
-            _write(out_dir, failed.result, failed.report)
-            failed.out_dir = out_dir
-        return failed
+        return _written(failed, out_dir)
 
     runs = {
         "baseline": comparison.RevisionRun("baseline", base_sha),
         "candidate": comparison.RevisionRun("candidate", cand_sha),
     }
-    scratch = Path(tempfile.mkdtemp(prefix="losslift-gate-"))
+    scratch = Path(tempfile.mkdtemp(prefix="losslift-gate-")).resolve()
+    collectors: list[subprocess.Popen] = []
     worktrees: list[Path] = []
     try:
+        try:
+            copies = manifests.snapshot(manifest, corpus, scratch / "snapshot")
+        except SetupError as error:
+            return _written(_setup_failure(f"{error}. Nothing was run."), out_dir)
         documents = scratch / "documents.json"
         documents.write_text(
-            json.dumps(
-                [
-                    {"id": entry.id, "path": str(manifests.locate(entry, corpus).resolve())}
-                    for entry in manifest.entries
-                ]
-            ),
+            json.dumps([{"id": entry.id, "path": str(copies[entry.id])} for entry in manifest.entries]),
             encoding="utf-8",
         )
-        processes = {}
+        # Every revision is checked out before any collector starts, so one
+        # that cannot be leaves nothing running.
         for label, run in runs.items():
-            tree = scratch / label
-            _git(root, "worktree", "add", "--detach", str(tree), run.commit)
-            worktrees.append(tree)
+            worktrees.append(scratch / label)
+            _git(root, "worktree", "add", "--detach", str(scratch / label), run.commit)
+        processes = {}
+        for label in runs:
             private = scratch / f"{label}-tmp"
             private.mkdir()
             processes[label] = (
-                _launch(tree, documents, scratch / f"{label}.jsonl", private, manifest.salt),
+                _launch(
+                    scratch / label,
+                    documents,
+                    scratch / f"{label}.jsonl",
+                    private,
+                    manifest.salt,
+                    collectors,
+                ),
                 time.monotonic(),
             )
 
@@ -249,17 +309,16 @@ def run_gate(
                 # A fatal record already says what stopped it; anything else
                 # died without saying, and the exit code is all there is.
                 run.process = f"exited with code {process.returncode}"
+        moved = manifests.changed_copies(manifest, copies)
     finally:
-        for tree in worktrees:
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "remove", "--force", str(tree)],
-                capture_output=True,
-                check=False,
-            )
-        subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False)
-        _remove_tree(scratch)
+        try:
+            _stop(collectors)
+        finally:
+            _clean_up(root, worktrees, scratch)
 
-    outcome = comparison.compare(manifest, runs["baseline"], runs["candidate"], allowlist)
+    outcome = comparison.compare(
+        manifest, runs["baseline"], runs["candidate"], allowlist, changed_copies=moved
+    )
     verified = len(manifest.entries)
     report = comparison.render(outcome, manifest, verified)
     if verification.unlisted:

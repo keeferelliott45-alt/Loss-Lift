@@ -59,11 +59,13 @@ printed to stderr, because that is a local path.
 | 0 | Every document behaved identically, or every difference was approved | Proceed |
 | 1 | Behavior changed and the allowlist does not approve it, or an allowlist entry matched nothing | Review each change; approve only what was intended |
 | 2 | The command line was wrong | Fix the arguments |
-| 3 | The corpus, manifest, allowlist or a revision cannot be trusted; **nothing was run** | Restore the missing or changed document, or fix the input |
-| 4 | A revision could not start, crashed, timed out, or left documents unmeasured | Treat as a failure of the candidate until shown otherwise |
+| 3 | The corpus, manifest, allowlist or a revision cannot be trusted, or a document changed after it was verified; **nothing was run** | Restore the missing or changed document, or fix the input |
+| 4 | A revision could not start, crashed, timed out, or left a document unmeasured; a verified copy changed during the run; or the gate itself stopped | Treat as a failure of the candidate until shown otherwise |
 
 A pre-existing crash in the baseline still fails with exit 4. A gate that
-measured part of the corpus has not passed.
+measured part of the corpus has not passed. Nor has one whose measurement
+raised: a document is measured completely or not at all, and two commits
+failing the same way have measured nothing, not the same thing.
 
 ## One-time setup
 
@@ -89,6 +91,26 @@ The manifest establishes the expected set:
   report and not run. To include it, regenerate the manifest; a manifest
   that grows is a change a reviewer sees.
 
+## What each run reads
+
+Verifying the corpus proves what the files held when they were hashed, not
+what a commit reads minutes later. So neither commit reads the corpus. Each
+run verifies it, then copies every listed document into a private snapshot,
+hashing the bytes as they are copied:
+
+* a document that no longer matches its entry by the time it is copied
+  stops the gate (exit 3) before anything runs;
+* both commits read the snapshot and nothing else, so they measure the same
+  bytes, exactly the bytes that were verified, whatever happens to the
+  corpus meanwhile;
+* the copies are named by id, made read-only, and hashed again once both
+  commits have finished. A copy that changed during the run fails it
+  (exit 4), because the two commits may no longer have read the same thing.
+
+However the run ends, whether finished, timed out, interrupted or stopped by
+an error, every collector the gate started is killed and reaped before any
+worktree, copy or temporary file is removed. Then all of them are removed.
+
 ## What is compared
 
 For every document, both commits' results are compared field by field:
@@ -105,10 +127,11 @@ For every document, both commits' results are compared field by field:
 | `claims` | a digest of every extracted claim; a digest per field, so a report can say `claims.fields.incurred_total` changed; null counts per field |
 | `metadata` | a digest per document-level field (carrier, insured, policy, period, valuation date, locale, mapping, profile) |
 | `warnings` | count and digest |
-| per document | whether the pipeline raised, and the exception's type name |
+| per document | whether the pipeline raised or a measurement could not be taken, and the exception's type name |
 
-A field one commit reports and the other does not is a change. Timing is
-recorded and never compared.
+A field one commit reports and the other does not is a change. Values are
+compared as JSON values, type included: `true` is not `1`, and `1` is not
+`1.0`, at any depth. Timing is recorded and never compared.
 
 ## Privacy
 
@@ -116,9 +139,11 @@ Real loss runs carry claimant names, injury descriptions and claim numbers
 (spec section 9). The gate is built so that none of that can reach its
 output, even by accident:
 
-* **The documents never move.** They stay where they are. The pipeline's own
-  temporary copies land in a directory the gate creates per run and deletes
-  afterwards, whatever happens.
+* **Copies stay private and temporary.** The corpus itself is never written
+  to. Each run's verified snapshot, and the pipeline's own temporary copies,
+  live in a directory the gate creates per run and deletes afterwards,
+  whatever happens, once every collector has been stopped. Snapshot copies
+  are named by id, never by file name.
 * **Nothing textual is written.** Every value in the output is an integer, a
   boolean, null, a page number, a string matching the strict shape of an
   enumeration (`R-22`, `NEEDS_REVIEW`, `financial`), checked before it is
@@ -156,6 +181,7 @@ allowlist is empty.
   "version": 1,
   "entries": [
     {
+      "document_id": "doc-3f9a1c2b7e44",
       "document_sha256": "3f9a1c2b7e44...all 64 hex characters...",
       "field": "findings.by_rule.R-22",
       "baseline": 9,
@@ -169,10 +195,15 @@ allowlist is empty.
 
 Rules, all enforced:
 
-* **One entry approves one change.** The match is on the document's full
-  SHA-256, the exact field path, and the exact baseline *and* candidate
-  values as they appear in `result.json`. There are no wildcards, patterns,
-  rule-wide approvals, or tolerances.
+* **One entry approves one change in one document.** The match is on the
+  document's manifest id *and* its full SHA-256, the exact field path, and
+  the exact baseline *and* candidate values as they appear in
+  `result.json`. The same PDF listed twice, under two ids, needs two
+  entries: approving one copy never approves the other. There are no
+  wildcards, patterns, rule-wide approvals, or tolerances.
+* **Values match in type as well as value.** `true` does not match `1`,
+  `false` does not match `0`, and `1` does not match `1.0`, including
+  inside lists and objects.
 * **Every entry must say why**, in a sentence.
 * **An entry that matches nothing fails the gate** (exit 1). An allowlist
   describes the changes a reviewer expected. A stale one describes nothing
@@ -181,10 +212,12 @@ Rules, all enforced:
 * `baseline_commit` and `candidate_commit` are optional. When set, the entry
   applies only to that exact pair.
 
-To write an entry, copy the values from the failing run's `result.json`
-(`documents.<id>.changes`). Digested values are copied as the digest. A
-digest is stable for a given manifest, so the same change produces the same
-digest on every run.
+To write an entry, copy the values from the failing run's `result.json`:
+`document_id` is the `<id>` in `documents.<id>`, `document_sha256` is
+`documents.<id>.sha256`, and the field and both values come from
+`documents.<id>.changes`. Digested values are copied as the digest. A digest
+is stable for a given manifest, so the same change produces the same digest
+on every run.
 
 ## Outputs
 

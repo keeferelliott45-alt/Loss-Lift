@@ -1,11 +1,16 @@
 """Compare two revisions' measurements, and say plainly what moved.
 
 Every difference fails the gate unless an allowlist entry names it exactly:
-the document by its SHA-256, the measurement by its full path, and both the
-baseline and the candidate value. Nothing is approved by pattern, by rule, or
-because it looks small. An entry that matches nothing fails too -- an
-allowlist describes the changes a reviewer expected, and a stale one is a
-review nobody is reading any more.
+the document by its manifest id and its SHA-256, the measurement by its full
+path, and both the baseline and the candidate value. Nothing is approved by
+pattern, by rule, or because it looks small. An entry that matches nothing
+fails too -- an allowlist describes the changes a reviewer expected, and a
+stale one is a review nobody is reading any more.
+
+Values are compared as JSON values, where the type is part of the value:
+``true`` is not ``1`` and ``1`` is not ``1.0``, at any depth. That holds for
+deciding whether a measurement changed and for deciding whether an entry
+approves the change.
 
 Execution failures -- a revision that cannot start, times out, crashes, or
 leaves a document unmeasured -- fail with their own exit code and are never
@@ -16,11 +21,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tools.corpus_gate.manifest import SHA256, Manifest, SetupError
+from tools.corpus_gate.manifest import DOCUMENT_ID, SHA256, Manifest, SetupError
 
 EXIT_PASS = 0
 EXIT_CHANGED = 1
@@ -34,7 +40,9 @@ ABSENT = "<absent>"
 ALLOWLIST_VERSION = 1
 _FIELD_PATH = re.compile(r"[A-Za-z0-9_.:/<>-]{1,240}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_GROUP = re.compile(r"[a-z][a-z_]{0,31}")
 _ENTRY_KEYS = {
+    "document_id",
     "document_sha256",
     "field",
     "baseline",
@@ -61,6 +69,7 @@ class RevisionRun:
 @dataclass(frozen=True)
 class AllowEntry:
     position: int
+    document_id: str
     document_sha256: str
     field: str
     baseline: Any
@@ -154,9 +163,14 @@ def load_allowlist(path: Path | None) -> list[AllowEntry]:
         unknown = set(item) - _ENTRY_KEYS
         if unknown:
             raise SetupError(f"allowlist entry {position} has unknown keys: {sorted(unknown)}")
-        for required in ("document_sha256", "field", "baseline", "candidate", "reason"):
+        for required in ("document_id", "document_sha256", "field", "baseline", "candidate", "reason"):
             if required not in item:
                 raise SetupError(f"allowlist entry {position} lacks '{required}'")
+        # The same bytes can be listed twice, under two ids: the id is what
+        # makes an entry approve one document's change and not its twin's.
+        doc_id = item["document_id"]
+        if not isinstance(doc_id, str) or not DOCUMENT_ID.fullmatch(doc_id):
+            raise SetupError(f"allowlist entry {position} must name one manifest document by id")
         sha = item["document_sha256"]
         if not isinstance(sha, str) or not SHA256.fullmatch(sha):
             raise SetupError(f"allowlist entry {position} needs a full document sha256")
@@ -172,8 +186,8 @@ def load_allowlist(path: Path | None) -> list[AllowEntry]:
             if value is not None and (not isinstance(value, str) or not _COMMIT.fullmatch(value)):
                 raise SetupError(f"allowlist entry {position}'s {key} must be a full commit id")
             commits[key] = value
-        identity = json.dumps(
-            [sha, path_name, item["baseline"], item["candidate"], commits], sort_keys=True
+        identity = canonical(
+            [doc_id, sha, path_name, item["baseline"], item["candidate"], commits]
         )
         if identity in seen:
             raise SetupError(f"allowlist entry {position} repeats an earlier entry")
@@ -181,6 +195,7 @@ def load_allowlist(path: Path | None) -> list[AllowEntry]:
         entries.append(
             AllowEntry(
                 position=position,
+                document_id=doc_id,
                 document_sha256=sha,
                 field=path_name,
                 baseline=item["baseline"],
@@ -192,12 +207,24 @@ def load_allowlist(path: Path | None) -> list[AllowEntry]:
     return entries
 
 
+def canonical(value: Any) -> str:
+    """``value`` as JSON text, in which its type is part of what it is.
+
+    Python's ``==`` holds ``True == 1`` and ``1 == 1.0``, inside lists and
+    mappings too. JSON does not, and neither does the gate: a measurement
+    that changes type has changed, and an entry approves only the value it
+    names, in the type it names it.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 def _matches(entry: AllowEntry, change: Change, baseline: str, candidate: str) -> bool:
     return (
-        entry.document_sha256 == change.sha256
+        entry.document_id == change.document
+        and entry.document_sha256 == change.sha256
         and entry.field == change.path
-        and entry.baseline == change.baseline
-        and entry.candidate == change.candidate
+        and canonical(entry.baseline) == canonical(change.baseline)
+        and canonical(entry.candidate) == canonical(change.candidate)
         and entry.baseline_commit in (None, baseline)
         and entry.candidate_commit in (None, candidate)
     )
@@ -218,13 +245,30 @@ def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: value}
 
 
+def _failure(doc_id: str, label: str, record: dict[str, Any]) -> str:
+    error = record.get("error_type", "UnnamedError")
+    group = record.get("unmeasured")
+    if group is None:
+        return f"{doc_id}: {label} raised {error}"
+    named = group if isinstance(group, str) and _GROUP.fullmatch(group) else "a measurement"
+    return f"{doc_id}: {label} could not measure {named} ({error})"
+
+
 def compare(
     manifest: Manifest,
     baseline: RevisionRun,
     candidate: RevisionRun,
     allowlist: list[AllowEntry] | None = None,
+    changed_copies: Iterable[str] = (),
 ) -> Outcome:
+    """Compare two runs over ``manifest``.
+
+    ``changed_copies`` names documents whose verified copy did not survive the
+    run intact. Neither revision's measurement of them can be trusted, so they
+    fail like a crash does.
+    """
     allowlist = allowlist or []
+    moved = set(changed_copies)
     problems: list[str] = []
     changes: list[Change] = []
     documents: dict[str, str] = {}
@@ -245,15 +289,16 @@ def compare(
 
     for entry in manifest.entries:
         failed = False
+        if entry.id in moved:
+            problems.append(f"{entry.id}: its verified copy changed during the run")
+            failed = True
         for run in (baseline, candidate):
             record = run.records.get(entry.id)
             if record is None:
                 problems.append(f"{entry.id}: no {run.label} output")
                 failed = True
             elif not record.get("ok"):
-                problems.append(
-                    f"{entry.id}: {run.label} raised {record.get('error_type', 'UnnamedError')}"
-                )
+                problems.append(_failure(entry.id, run.label, record))
                 failed = True
         if failed:
             documents[entry.id] = "failed"
@@ -264,7 +309,7 @@ def compare(
         found = False
         for path in sorted(set(before) | set(after)):
             old, new = before.get(path, ABSENT), after.get(path, ABSENT)
-            if old == new:
+            if canonical(old) == canonical(new):
                 continue
             found = True
             changes.append(
@@ -418,12 +463,15 @@ def render(outcome: Outcome, manifest: Manifest, verified: int) -> str:
 
     if outcome.unused:
         lines += ["", "Allowlist entries that matched nothing (stale -- remove or correct them):"]
-        lines += [f"  #{entry.position} {entry.field}" for entry in outcome.unused]
+        lines += [
+            f"  #{entry.position} {entry.document_id} {entry.field}" for entry in outcome.unused
+        ]
     if outcome.unapproved:
         lines += [
             "",
             "Exact values for review are in result.json. A change is approved only by an",
-            "allowlist entry naming its document sha256, field, baseline and candidate value.",
+            "allowlist entry naming its document id and sha256, field, baseline and candidate",
+            "value.",
         ]
     return "\n".join(lines) + "\n"
 

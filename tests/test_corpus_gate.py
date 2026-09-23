@@ -16,8 +16,10 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -262,6 +264,42 @@ def test_a_torn_output_file_is_incomplete(tmp_path):
     assert set(run.records) == {"doc-a"}
 
 
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        (1, True),
+        (0, False),
+        (True, 1),
+        ([1, 0], [True, False]),
+        ([{"ties": 0}], [{"ties": False}]),
+        (1, 1.0),
+    ],
+    ids=["1-to-true", "0-to-false", "true-to-1", "nested-list", "nested-object", "int-to-float"],
+)
+def test_a_value_that_changes_type_is_a_change(before, after):
+    outcome = _compare(
+        {"doc-a": _metrics(**{"summary.ties": before})},
+        {"doc-a": _metrics(**{"summary.ties": after})},
+    )
+    assert outcome.exit_code == gate.EXIT_CHANGED
+    assert [change.path for change in outcome.changes] == ["summary.ties"]
+
+
+def test_a_document_unmeasured_the_same_way_on_both_sides_still_fails():
+    unmeasured = {
+        "kind": "document", "id": "doc-a", "ok": False,
+        "error_type": "TypeError", "unmeasured": "findings",
+    }
+    outcome = gate.compare(
+        _manifest(("doc-a", SHA_A)),
+        gate.RevisionRun("baseline", COMMIT_A, {"doc-a": dict(unmeasured)}, complete=True),
+        gate.RevisionRun("candidate", COMMIT_B, {"doc-a": dict(unmeasured)}, complete=True),
+    )
+    assert outcome.exit_code == gate.EXIT_EXECUTION
+    assert outcome.documents == {"doc-a": "failed"}
+    assert "doc-a: candidate could not measure findings (TypeError)" in outcome.problems
+
+
 # --------------------------------------------------------------------------
 # The allowlist: explicit, exact, empty by default
 # --------------------------------------------------------------------------
@@ -275,6 +313,7 @@ def _allow(tmp_path, *entries):
 
 def _entry(**overrides):
     entry = {
+        "document_id": "doc-a",
         "document_sha256": SHA_A,
         "field": "claim_count",
         "baseline": 3,
@@ -358,6 +397,94 @@ def test_a_malformed_allowlist_entry_is_refused(tmp_path, entry):
 def test_a_duplicated_allowlist_entry_is_refused(tmp_path):
     with pytest.raises(SetupError):
         _allow(tmp_path, _entry(), _entry())
+
+
+@pytest.mark.parametrize(
+    "actual, written",
+    [
+        (True, 1),
+        (False, 0),
+        (1, True),
+        (0, False),
+        ([True, False], [1, 0]),
+        ([{"ties": True}], [{"ties": 1}]),
+        (1, 1.0),
+    ],
+    ids=["true-as-1", "false-as-0", "1-as-true", "0-as-false", "nested-list", "nested-object",
+         "int-as-float"],
+)
+@pytest.mark.parametrize("side", ["baseline", "candidate"])
+def test_an_allowlist_value_matches_only_in_its_own_type(tmp_path, actual, written, side):
+    other = "h:" + "0" * 32
+    before, after = (actual, other) if side == "baseline" else (other, actual)
+    values = {"baseline": other, "candidate": other, side: written}
+    allowlist = _allow(tmp_path, _entry(field="summary.ties", **values))
+    outcome = _compare(
+        {"doc-a": _metrics(**{"summary.ties": before})},
+        {"doc-a": _metrics(**{"summary.ties": after})},
+        allowlist,
+    )
+    assert outcome.exit_code == gate.EXIT_CHANGED
+    [change] = outcome.changes
+    assert change.allowlisted_by is None
+    assert [entry.position for entry in outcome.unused] == [1]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {k: v for k, v in _entry().items() if k != "document_id"},
+        _entry(document_id="doc a"),
+        _entry(document_id=""),
+        _entry(document_id=7),
+    ],
+    ids=["hash-only", "malformed-id", "empty-id", "not-a-string"],
+)
+def test_an_allowlist_entry_must_name_one_manifest_document(tmp_path, entry):
+    with pytest.raises(SetupError):
+        _allow(tmp_path, entry)
+
+
+_TWINS = (("doc-a", SHA_A), ("doc-a-2", SHA_A))  # the same bytes under two manifest entries
+
+
+def test_approving_one_of_two_identical_documents_leaves_the_other_unapproved(tmp_path):
+    allowlist = _allow(tmp_path, _entry(document_id="doc-a"))
+    outcome = _compare(
+        {"doc-a": _metrics(), "doc-a-2": _metrics()},
+        {"doc-a": _metrics(claim_count=2), "doc-a-2": _metrics(claim_count=2)},
+        allowlist,
+        docs=_TWINS,
+    )
+    assert outcome.exit_code == gate.EXIT_CHANGED
+    assert [(change.document, change.allowlisted_by) for change in outcome.changes] == [
+        ("doc-a", 1),
+        ("doc-a-2", None),
+    ]
+    assert outcome.unused == []
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"document_id": "doc-a-2"},
+        {"document_id": "doc-zzz"},
+        {"document_id": "doc-a", "document_sha256": SHA_B},
+    ],
+    ids=["the-other-copy", "not-in-the-manifest", "id-and-hash-disagree"],
+)
+def test_an_allowlist_entry_for_another_document_approves_nothing_and_fails(tmp_path, override):
+    allowlist = _allow(tmp_path, _entry(**override))
+    outcome = _compare(
+        {"doc-a": _metrics(), "doc-a-2": _metrics()},
+        {"doc-a": _metrics(claim_count=2), "doc-a-2": _metrics()},
+        allowlist,
+        docs=_TWINS,
+    )
+    assert outcome.exit_code == gate.EXIT_CHANGED
+    [change] = outcome.changes
+    assert change.document == "doc-a" and change.allowlisted_by is None
+    assert [entry.position for entry in outcome.unused] == [1]
 
 
 # --------------------------------------------------------------------------
@@ -576,6 +703,29 @@ def test_the_collector_refuses_to_measure_code_from_outside_its_root(tmp_path, m
     assert json.loads(out.read_text()) == {"kind": "fatal", "error_type": "IsolationError"}
 
 
+def test_a_measurement_that_raises_leaves_the_document_unmeasured(tmp_path, monkeypatch):
+    import core.pipeline
+
+    def unmeasurable(source, **_):
+        document = SimpleNamespace(claims=[], extraction_method="digital")
+        reconciliation = SimpleNamespace(status="CLEAN", findings=5)  # not iterable
+        return SimpleNamespace(document=document, reconciliation=reconciliation, warnings=[])
+
+    monkeypatch.setattr(core.pipeline, "run_pipeline", unmeasurable)
+    documents = tmp_path / "documents.json"
+    documents.write_text(json.dumps([{"id": "doc-a", "path": str(tmp_path / "doc-a.pdf")}]))
+    out = tmp_path / "out.jsonl"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(SALT.hex() + "\n"))
+    code = collect.main(["--root", str(REPO), "--documents", str(documents), "--out", str(out)])
+    assert code == 0
+    [record] = [
+        json.loads(line) for line in out.read_text().splitlines()
+        if json.loads(line)["kind"] == "document"
+    ]
+    assert record["ok"] is False and "metrics" not in record
+    assert (record["unmeasured"], record["error_type"]) == ("findings", "TypeError")
+
+
 # --------------------------------------------------------------------------
 # End to end: the command, against a throwaway repository
 # --------------------------------------------------------------------------
@@ -586,6 +736,9 @@ DESCRIPTION = "sentinel slipped on a wet sentinel floor"
 FILE_STEM = "Sentinelle Jane claim SNTL-44718 loss run"
 
 _FAKE_PIPELINE = '''
+import hashlib
+import json
+import os
 from decimal import Decimal
 from enum import Enum
 
@@ -618,8 +771,26 @@ class Record:
 BEHAVIOUR = "{behaviour}"
 
 
+def _record_read(source, data):
+    """For the tests that need to know which bytes a revision really read."""
+    folder = os.environ.get("GATE_TEST_READ_LOG")
+    if folder:
+        line = json.dumps(dict(path=str(source), sha256=hashlib.sha256(data).hexdigest()))
+        with open(os.path.join(folder, "%d.jsonl" % os.getpid()), "a", encoding="utf-8") as log:
+            log.write(line + "\\n")
+
+
 def run_pipeline(source, *, use_vision=True, **_):
     data = open(source, "rb").read()
+    _record_read(source, data)
+    if BEHAVIOUR == "hang":
+        import signal
+        import time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(120)
+    if BEHAVIOUR == "tamper":
+        with open(source, "ab") as handle:
+            handle.write(b" tampered")
     if BEHAVIOUR == "crash" and data.endswith(b"2"):
         raise ValueError("cannot parse {claimant} on claim {claim}")
     if BEHAVIOUR == "die":
@@ -643,8 +814,9 @@ def run_pipeline(source, *, use_vision=True, **_):
         printed_claim_count=2, named_insured="{claimant}", carrier="Sentinel Mutual",
         extraction_method="digital",
     )
+    findings = 5 if BEHAVIOUR == "unmeasurable" else [finding]
     return Record(document=document,
-                  reconciliation=Record(status=Status.NEEDS_REVIEW, findings=[finding]),
+                  reconciliation=Record(status=Status.NEEDS_REVIEW, findings=findings),
                   warnings=["page 1 mentions {claimant}"])
 '''
 
@@ -681,6 +853,10 @@ def world(tmp_path_factory):
         "more": _commit(repo, "more-claims", "one more claim"),
         "crash": _commit(repo, "crash", "raises on one document"),
         "die": _commit(repo, "die", "collector process dies"),
+        "hang": _commit(repo, "hang", "never finishes, and ignores SIGTERM"),
+        "tamper": _commit(repo, "tamper", "writes to the document it was given"),
+        "unmeasurable": _commit(repo, "unmeasurable", "one measurement group raises"),
+        "unmeasurable-again": _commit(repo, "unmeasurable", "the same group raises the same way"),
     }
     corpus = root / "corpus"
     corpus.mkdir()
@@ -704,13 +880,13 @@ def _gate(args):
     return completed.returncode, completed.stdout, completed.stderr
 
 
-def _run_gate(world, candidate, *, corpus=None, manifest=None, out="out", extra=()):
+def _run_gate(world, candidate, *, baseline="base", corpus=None, manifest=None, out="out", extra=()):
     out_dir = world["root"] / out
     code, stdout, stderr = _gate(
         [
             "run",
             "--repo", str(world["repo"]),
-            "--baseline", world["base"],
+            "--baseline", world[baseline],
             "--candidate", world[candidate],
             "--corpus", str(corpus or world["corpus"]),
             "--manifest", str(manifest or world["manifest"]),
@@ -817,13 +993,14 @@ def test_the_command_applies_an_exact_allowlist(world):
     result = json.loads((world["root"] / "to-allow" / "result.json").read_text())
     entries = [
         {
+            "document_id": doc_id,
             "document_sha256": document["sha256"],
             "field": change["field"],
             "baseline": change["baseline"],
             "candidate": change["candidate"],
             "reason": "Synthetic: the fake pipeline was told to return one more claim.",
         }
-        for document in result["documents"].values()
+        for doc_id, document in result["documents"].items()
         for change in document["changes"]
     ]
     allowlist = world["root"] / "allowlist.json"
@@ -831,3 +1008,258 @@ def test_the_command_applies_an_exact_allowlist(world):
     code, stdout, _, _ = _run_gate(world, "more", out="allowed", extra=["--allowlist", str(allowlist)])
     assert code == 0, stdout
     assert "allowed #" in stdout
+
+
+@pytest.mark.parametrize(
+    "baseline, candidate",
+    [("unmeasurable", "unmeasurable-again"), ("base", "unmeasurable")],
+    ids=["both-sides-the-same-way", "candidate-only"],
+)
+def test_the_command_fails_a_document_it_could_not_measure(world, baseline, candidate):
+    code, stdout, _, written = _run_gate(
+        world, candidate, baseline=baseline, out=f"unmeasured-{baseline}"
+    )
+    assert code == 4, stdout
+    assert "could not measure findings (TypeError)" in stdout
+    assert "0 unchanged, 0 changed, 2 failed" in stdout
+    _assert_no_leak(world, stdout, written)
+    _assert_repository_untouched(world)
+
+
+# --------------------------------------------------------------------------
+# In process: which bytes the revisions read, and what the gate leaves behind
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def gate_tmp(tmp_path, monkeypatch):
+    """Where the gate makes its private scratch directory, so a test can watch it go."""
+    target = tmp_path / "system-tmp"
+    target.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(target))
+    return target
+
+
+@pytest.fixture()
+def collectors(monkeypatch):
+    """Every collector the gate launches, and what it removed while one was unreaped.
+
+    Faults can be injected: a launch that fails, a wait that raises, or a hook
+    run just before the first collector starts. Any collector still running
+    afterwards is killed here, so a failing test leaves nothing behind either.
+    """
+    from tools.corpus_gate import runner
+
+    state = SimpleNamespace(
+        launched=[], removed=[], fail_launch=None, fail_wait=None, before_launch=None
+    )
+    real_popen = subprocess.Popen
+    real_remove_tree = runner._remove_tree
+
+    def unreaped():
+        return sum(1 for process in state.launched if process.returncode is None)
+
+    def popen(args, *rest, **kwargs):
+        words = [str(word) for word in args] if isinstance(args, (list, tuple)) else [str(args)]
+        if not any(word.endswith("collect.py") for word in words):
+            if "worktree" in words and "remove" in words:
+                state.removed.append(("worktree", unreaped()))
+            return real_popen(args, *rest, **kwargs)
+        if state.before_launch is not None:
+            hook, state.before_launch = state.before_launch, None
+            hook()
+        if state.fail_launch == len(state.launched):
+            raise OSError("injected: the collector could not be started")
+        process = real_popen(args, *rest, **kwargs)
+        state.launched.append(process)
+        real_wait = process.wait
+
+        def wait(timeout=None):
+            if timeout is not None and state.fail_wait is not None:
+                failure, state.fail_wait = state.fail_wait, None
+                raise failure
+            return real_wait(timeout)
+
+        process.wait = wait
+        return process
+
+    def remove_tree(path):
+        state.removed.append(("temporary files", unreaped()))
+        real_remove_tree(path)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "_remove_tree", remove_tree)
+    yield state
+    for process in state.launched:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def _own_corpus(world, tmp_path):
+    """A private copy of the corpus, for a test that changes it."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for source in world["corpus"].iterdir():
+        (corpus / source.name).write_bytes(source.read_bytes())
+    return corpus
+
+
+def _in_process(world, baseline, candidate, corpus, out, **options):
+    from tools.corpus_gate import runner
+
+    return runner.run_gate(
+        repo=world["repo"],
+        baseline=world[baseline],
+        candidate=world[candidate],
+        corpus=corpus,
+        manifest_path=world["manifest"],
+        out_dir=out,
+        **options,
+    )
+
+
+def _assert_nothing_survives(world, collectors, gate_tmp):
+    assert all(process.returncode is not None for process in collectors.launched), (
+        "a collector outlived the gate"
+    )
+    assert collectors.removed, "nothing was cleaned up"
+    assert all(unreaped == 0 for _, unreaped in collectors.removed), (
+        f"files were removed while a collector still ran: {collectors.removed}"
+    )
+    assert list(gate_tmp.iterdir()) == [], "temporary material was left behind"
+    _assert_repository_untouched(world)
+
+
+def test_a_document_replaced_after_verification_is_never_measured(
+    world, tmp_path, monkeypatch, collectors, gate_tmp
+):
+    corpus = _own_corpus(world, tmp_path)
+    verify = manifests.verify
+
+    def verify_then_replace(manifest, directory):
+        verification = verify(manifest, directory)
+        for path in directory.iterdir():
+            path.write_bytes(b"%PDF-1.4 replaced after verification")
+        return verification
+
+    monkeypatch.setattr(manifests, "verify", verify_then_replace)
+    outcome = _in_process(world, "base", "same", corpus, tmp_path / "out")
+    assert outcome.exit_code == gate.EXIT_SETUP, outcome.report
+    assert "changed after it was verified" in outcome.report
+    assert collectors.launched == []
+    assert list(gate_tmp.iterdir()) == []
+    _assert_no_leak(world, outcome.report, json.dumps(outcome.result))
+    assert str(corpus) not in outcome.report
+    _assert_repository_untouched(world)
+
+
+def test_both_revisions_read_only_the_verified_bytes(
+    world, tmp_path, monkeypatch, collectors, gate_tmp
+):
+    corpus = _own_corpus(world, tmp_path)
+    reads = tmp_path / "reads"
+    reads.mkdir()
+    monkeypatch.setenv("GATE_TEST_READ_LOG", str(reads))
+
+    def replace_the_corpus():
+        for path in corpus.iterdir():
+            path.write_bytes(b"%PDF-1.4 replaced as the first collector started")
+
+    collectors.before_launch = replace_the_corpus
+    outcome = _in_process(world, "base", "same", corpus, tmp_path / "out")
+    listed = sorted(entry.sha256 for entry in manifests.load(world["manifest"]).entries)
+    assert not {manifests.file_sha256(path) for path in corpus.iterdir()} & set(listed), (
+        "precondition: the corpus was replaced before any collector read it"
+    )
+    logs = sorted(reads.iterdir())
+    assert len(logs) == 2, "one read log per revision"
+    for log in logs:
+        seen = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert sorted(read["sha256"] for read in seen) == listed, "a revision read unverified bytes"
+        for read in seen:
+            path = Path(read["path"])
+            assert not path.resolve().is_relative_to(corpus.resolve())
+            assert not path.exists(), "the verified copy outlived the run"
+    assert outcome.exit_code == gate.EXIT_PASS, outcome.report
+    assert list(gate_tmp.iterdir()) == []
+
+
+def test_a_revision_that_writes_to_its_document_fails(world, tmp_path, collectors, gate_tmp):
+    corpus = _own_corpus(world, tmp_path)
+    outcome = _in_process(world, "base", "tamper", corpus, tmp_path / "out")
+    assert outcome.exit_code == gate.EXIT_EXECUTION, outcome.report
+    assert manifests.verify(manifests.load(world["manifest"]), corpus).ok, (
+        "the corpus itself was written to"
+    )
+    _assert_no_leak(world, outcome.report)
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_a_failed_worktree_leaves_no_collector_or_copy_behind(
+    world, tmp_path, monkeypatch, collectors, gate_tmp
+):
+    from tools.corpus_gate import runner
+
+    git = runner._git
+    added = []
+
+    def second_worktree_fails(repo, *args):
+        if args[:2] == ("worktree", "add"):
+            added.append(args)
+            if len(added) == 2:
+                raise SetupError("git worktree failed")
+        return git(repo, *args)
+
+    monkeypatch.setattr(runner, "_git", second_worktree_fails)
+    with pytest.raises(SetupError):
+        _in_process(world, "hang", "hang", _own_corpus(world, tmp_path), tmp_path / "out")
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_a_failed_launch_stops_the_collector_already_running(world, tmp_path, collectors, gate_tmp):
+    collectors.fail_launch = 1
+    with pytest.raises(OSError):
+        _in_process(world, "hang", "hang", _own_corpus(world, tmp_path), tmp_path / "out")
+    assert len(collectors.launched) == 1
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+@pytest.mark.parametrize(
+    "failure", [KeyboardInterrupt, RuntimeError], ids=["interrupted", "wait-failed"]
+)
+def test_an_interrupted_wait_stops_every_collector_before_cleanup(
+    world, tmp_path, collectors, gate_tmp, failure
+):
+    collectors.fail_wait = failure()
+    with pytest.raises(failure):
+        _in_process(world, "hang", "hang", _own_corpus(world, tmp_path), tmp_path / "out")
+    assert len(collectors.launched) == 2
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_a_timed_out_run_leaves_no_collector_or_copy_behind(world, tmp_path, collectors, gate_tmp):
+    outcome = _in_process(
+        world, "hang", "hang", _own_corpus(world, tmp_path), tmp_path / "out", timeout=1.0
+    )
+    assert outcome.exit_code == gate.EXIT_EXECUTION
+    assert "timed out" in outcome.report
+    assert len(collectors.launched) == 2
+    _assert_nothing_survives(world, collectors, gate_tmp)
+
+
+def test_an_unexpected_error_is_an_execution_failure_named_by_type(tmp_path, monkeypatch, capsys):
+    from tools.corpus_gate import __main__ as cli
+
+    def explode(**_):
+        raise OSError(f"cannot read {FILE_STEM} 1.pdf for {CLAIMANT}")
+
+    monkeypatch.setattr(cli, "run_gate", explode)
+    code = cli.main(
+        ["run", "--baseline", "a", "--candidate", "b", "--corpus", str(tmp_path),
+         "--manifest", str(tmp_path / "manifest.json")]
+    )
+    out, err = capsys.readouterr()
+    assert code == gate.EXIT_EXECUTION
+    assert "OSError" in out
+    assert CLAIMANT not in out + err and FILE_STEM not in out + err

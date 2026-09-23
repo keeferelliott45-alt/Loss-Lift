@@ -11,14 +11,22 @@ can check a guess against.
 A manifest establishes the expected set. A document it lists that is missing
 from the corpus, or whose bytes have changed, stops the gate before anything
 runs; a corpus that quietly shrinks is how a comparison starts lying.
+
+Verifying the corpus proves what the files held when they were hashed, not
+what a revision reads later. So the revisions never read the corpus at all:
+each run copies every listed document into a private snapshot, hashing the
+bytes as they are copied, and both revisions read that snapshot and nothing
+else.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -216,3 +224,65 @@ def verify(manifest: Manifest, corpus: Path) -> Verification:
     listed = {entry.path for entry in manifest.entries}
     unlisted = sum(1 for path in _pdfs(corpus) if _relative(path, corpus) not in listed)
     return Verification(tuple(missing), tuple(mismatched), unlisted)
+
+
+def snapshot(manifest: Manifest, corpus: Path, target: Path) -> dict[str, Path]:
+    """Copy every listed document into ``target``; return each copy by id.
+
+    Each copy's hash is taken from the bytes as they are written, so what the
+    revisions read is exactly what was checked against the manifest. A
+    document that no longer matches its entry -- replaced, edited or removed
+    since it was verified -- stops the gate here, before anything runs.
+    Copies are named by id, never by file name, and made read-only.
+    """
+    target.mkdir(parents=True)
+    copies: dict[str, Path] = {}
+    changed: list[str] = []
+    for entry in manifest.entries:
+        try:
+            source = locate(entry, corpus).open("rb")
+        except OSError:
+            changed.append(entry.id)
+            continue
+        copy = target / f"{entry.id}.pdf"
+        digest = hashlib.sha256()
+        size = 0
+        with source, copy.open("xb") as sink:
+            for block in iter(lambda: source.read(1 << 20), b""):
+                digest.update(block)
+                size += len(block)
+                sink.write(block)
+        os.chmod(copy, stat.S_IREAD)
+        if size != entry.bytes or digest.hexdigest() != entry.sha256:
+            changed.append(entry.id)
+        else:
+            copies[entry.id] = copy
+    if changed:
+        raise SetupError(
+            f"the corpus changed after it was verified: {len(changed)} document(s) no longer "
+            f"match the manifest ({', '.join(changed)})"
+        )
+    return copies
+
+
+def changed_copies(manifest: Manifest, copies: dict[str, Path]) -> tuple[str, ...]:
+    """Ids whose snapshot copy no longer holds the verified bytes.
+
+    Both revisions read the same copies, so a revision that wrote to one could
+    change what the other read. The copies are checked again once both have
+    finished: a run whose inputs moved under it has compared nothing.
+    """
+    changed: list[str] = []
+    for entry in manifest.entries:
+        copy = copies.get(entry.id)
+        try:
+            intact = (
+                copy is not None
+                and copy.stat().st_size == entry.bytes
+                and file_sha256(copy) == entry.sha256
+            )
+        except OSError:
+            intact = False
+        if not intact:
+            changed.append(entry.id)
+    return tuple(changed)

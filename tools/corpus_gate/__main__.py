@@ -16,6 +16,7 @@ from pathlib import Path
 
 from tools.corpus_gate import compare as comparison
 from tools.corpus_gate import manifest as manifests
+from tools.corpus_gate.collect import error_name
 from tools.corpus_gate.manifest import SetupError
 from tools.corpus_gate.runner import DEFAULT_TIMEOUT, repo_root, run_gate
 
@@ -73,6 +74,14 @@ def _run(args: argparse.Namespace) -> int:
     except SetupError as error:
         print(f"LossLift real-corpus gate: FAIL (exit 3)\n\n{error}")
         return comparison.EXIT_SETUP
+    except Exception as error:  # noqa: BLE001 - the run stopped; its collectors already have
+        # Named by type alone, as a crash in a collector is: the message of an
+        # error raised this far in can quote a corpus path.
+        print(
+            "LossLift real-corpus gate: FAIL (exit 4: the run stopped before it finished)\n\n"
+            f"{error_name(error)}. Nothing was compared."
+        )
+        return comparison.EXIT_EXECUTION
     sys.stdout.write(outcome.report)
     if outcome.out_dir is not None:
         print(f"result.json and report.txt written to {outcome.out_dir}", file=sys.stderr)
