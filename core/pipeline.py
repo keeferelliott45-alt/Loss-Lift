@@ -447,6 +447,14 @@ _CURRENCY_MARK = re.compile(
     re.IGNORECASE,
 )
 
+#: A sign or an opening parenthesis printed hard against the currency marker
+#: it precedes: "-$4,815", "($4,815.00)". It belongs to the amount the marker
+#: opens. A sign standing apart from the marker is not matched -- "- $4,815"
+#: can be a dash printing zero in one column and the amount beside it.
+_SIGNED_MARK = re.compile(
+    r"^\s*([-+(])(?:%s)\s*" % _CURRENCY_MARK.pattern, re.IGNORECASE
+)
+
 
 def _reads_as_money(text: str, locale: str | None) -> bool:
     """Whether this cell yields one confident amount."""
@@ -686,9 +694,17 @@ def _is_smeared(text: str) -> bool:
     came to read as one: "$1 $234" left "1 234", which is a perfectly good
     space-grouped twelve hundred and thirty-four, and nothing on the page says
     that. So the markers are asked where they sit before they are taken away.
+
+    Nor is a sign one of the groups. A recovery printed "-$4,815" or
+    "($4,815.00)" puts its sign against the marker, and taking the marker out
+    between them left the sign standing alone as a first number -- so every
+    negative amount printed that way was refused, unless its digits happened
+    to make a group of three. The sign goes back to the amount before the
+    question is asked.
     """
     if _marks_two_amounts(text):
         return True
+    text = _SIGNED_MARK.sub(r"\1", text)
     tokens = _strip_currency(_CREDIT_SUFFIX.sub("", text))[0].split()
     if len(tokens) < 2:
         return False
@@ -998,6 +1014,51 @@ def accepted_identifier_shapes(
     return consensus_shapes(candidates)
 
 
+def identifier_shapes_by_layout(
+    tables: Sequence[RawTable], mapping: ColumnMapping
+) -> dict[tuple[str, ...], set[str]]:
+    """The identifier shapes each table layout is read with, keyed by its headers.
+
+    A packet binds loss runs from several carriers, each printed under its own
+    header and numbering its claims its own way. Pooled into one vote, the
+    larger run outvotes the smaller: a run of one claim bound beside a run of
+    eight had that claim refused as a stray code, and so does any run with
+    fewer claims than a quarter of the largest run's -- all of them together.
+
+    A layout keeps the document's vote wherever that vote accepts any of its
+    identifiers: it is the same numbering, and the pooled count is what keeps
+    a one-off code inside it out. Only a layout none of whose identifiers the
+    document accepts is judged by its own claims, and then only by rows that
+    read as claims in their own right, so a page of continuation lines under a
+    differently read header cannot promote its codes.
+    """
+    document = accepted_identifier_shapes(tables, mapping)
+    printed: dict[tuple[str, ...], list[str]] = {}
+    claimed: dict[tuple[str, ...], list[str]] = {}
+    for table in tables:
+        layout = tuple(table.headers)
+        printed.setdefault(layout, [])
+        claimed.setdefault(layout, [])
+        table_mapping = mapping_for(table, mapping)
+        index = table_mapping.index_of("claim_number")
+        if index is None:
+            continue
+        for row in table.rows:
+            cell = row.cell(index).strip()
+            if not cell or not is_identifier_candidate(cell):
+                continue
+            printed[layout].append(cell)
+            if _row_establishes_claim_data(_row_values(row, table_mapping)):
+                claimed[layout].append(cell)
+
+    shapes: dict[tuple[str, ...], set[str]] = {}
+    for layout, cells in printed.items():
+        own = consensus_shapes(claimed[layout])
+        read = any(leading_identifier(cell, document) for cell in cells)
+        shapes[layout] = own if own and not read else document
+    return shapes
+
+
 def claim_identifier(
     row: RawRow, mapping: ColumnMapping, shapes: set[str]
 ) -> str | None:
@@ -1079,10 +1140,11 @@ def build_claims(
     warnings: list[str] = []
     unplaced: list[UnplacedRow] = []
     furniture = page_furniture(tables, mapping, locale)
-    shapes = accepted_identifier_shapes(tables, mapping)
+    shapes_by_layout = identifier_shapes_by_layout(tables, mapping)
 
     for table in tables:
         table_mapping = mapping_for(table, mapping)
+        shapes = shapes_by_layout[tuple(table.headers)]
         context = table_money_context(table, table_mapping, shapes)
 
         for row in table.rows:
