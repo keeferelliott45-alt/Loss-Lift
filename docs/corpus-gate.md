@@ -160,8 +160,12 @@ output, even by accident:
   written, or a keyed digest. Amounts, dates, names, claim numbers, finding
   messages, warnings and the pipeline's own reasons are only ever digested,
   because a message can quote the document it is about.
-* **Digests are keyed.** Every digest is HMAC-SHA256 under the salt in the
-  local manifest. A digest shows *that* a value changed between two commits,
+* **Digests are keyed, outside the revision's process.** Every digest is
+  HMAC-SHA256 under the salt in the local manifest. A collector runs the
+  revision's code, so it is never given the salt: it writes the text of each
+  digest slot, and the gate's own process checks the whole output against a
+  strict schema and keys the digests itself. Output outside the schema fails
+  the run (exit 4). A digest shows *that* a value changed between two commits,
   never *what* it was. Even a short value such as one printed total cannot
   be recovered by guessing without the manifest.
 * **Documents are named by id.** Reports and results name documents by

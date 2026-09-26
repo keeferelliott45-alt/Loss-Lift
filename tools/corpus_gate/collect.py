@@ -5,6 +5,13 @@ worktree of the revision under test::
 
     python -P collect.py --root WORKTREE --documents FILE --out FILE  < salt
 
+The gate itself always sends ``raw`` instead of a salt. The revision's code
+runs in this process, so nothing here may hold the salt: in raw mode every
+digest slot carries the canonical text it would have digested, marked
+``r:`` and base64url-encoded, and the gate -- a separate, trusted process --
+checks the whole output against a strict schema and keys each one itself
+(``seal.py``). A salt on stdin still works, for measuring by hand.
+
 It imports that worktree's ``core`` and nothing from the checkout it was
 started from; it proves so before measuring anything. It writes one JSON line
 per document, then a line saying it finished. A file without that last line is
@@ -36,6 +43,7 @@ the revision -- because it is executed against revisions that predate it.
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import enum
 import hashlib
@@ -44,7 +52,6 @@ import json
 import platform
 import re
 import sys
-import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -59,6 +66,8 @@ FIELD_NAME = re.compile(r"[a-z][a-z0-9_]{0,47}")
 ERROR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 
 DIGEST_PREFIX = "h:"
+RAW_PREFIX = "r:"
+RAW_MODE = "raw"
 
 #: Document-level fields compared by digest. Absent in an older revision is a
 #: value of its own, so a field appearing or disappearing is seen as a change.
@@ -109,6 +118,22 @@ class Digest:
         return DIGEST_PREFIX + mac.hexdigest()[:32]
 
 
+class RawDigest:
+    """A digest slot's canonical text, for the gate to key outside this process.
+
+    Holds no secret: what it writes is exactly the bytes ``Digest`` would have
+    keyed, so the gate's digest of it is identical to the one made here with
+    the salt.
+    """
+
+    def __call__(self, value: Any) -> str:
+        text = json.dumps(
+            plain(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        encoded = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+        return RAW_PREFIX + encoded.rstrip("=")
+
+
 def plain(value: Any) -> Any:
     """``value`` as JSON-native data, the same way in every process.
 
@@ -144,6 +169,10 @@ def plain(value: Any) -> Any:
     if hasattr(value, "__dict__") and not isinstance(value, type):
         return plain(vars(value))
     return str(value)
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def token(value: Any, pattern: re.Pattern[str], digest: Digest) -> str:
@@ -280,8 +309,8 @@ def _findings(reconciliation: Any, digest: Digest) -> dict[str, Any]:
     by_severity: Counter[str] = Counter()
     by_category: Counter[str] = Counter()
     by_scope: Counter[str] = Counter()
-    identity: dict[str, list[str]] = defaultdict(list)
-    detail: dict[str, list[str]] = defaultdict(list)
+    identity: dict[str, list[Any]] = defaultdict(list)
+    detail: dict[str, list[Any]] = defaultdict(list)
     for finding in findings:
         rule = token(getattr(finding, "rule_id", None), RULE_ID, digest)
         severity = token(getattr(finding, "severity", None), UPPER_TOKEN, digest)
@@ -293,16 +322,19 @@ def _findings(reconciliation: Any, digest: Digest) -> dict[str, Any]:
         by_scope[f"{rule}/{scope}"] += 1
         # Which things were flagged, and what was said about them, apart:
         # the same number of findings on different claims is a change too.
-        identity[rule].append(digest([getattr(finding, name, None) for name in _IDENTITY]))
-        detail[rule].append(digest([getattr(finding, name, None) for name in _DETAIL]))
+        # One digest per rule over every finding's plain values, in a fixed
+        # order: a digest is never nested inside another, so the gate can key
+        # it outside this process and get the same answer.
+        identity[rule].append(plain([getattr(finding, name, None) for name in _IDENTITY]))
+        detail[rule].append(plain([getattr(finding, name, None) for name in _DETAIL]))
     return {
         "total": len(findings),
         "by_rule": dict(sorted(by_rule.items())),
         "by_rule_severity": dict(sorted(by_severity.items())),
         "by_rule_category": dict(sorted(by_category.items())),
         "by_rule_scope": dict(sorted(by_scope.items())),
-        "identity": {rule: digest(sorted(items)) for rule, items in sorted(identity.items())},
-        "detail": {rule: digest(sorted(items)) for rule, items in sorted(detail.items())},
+        "identity": {rule: digest(sorted(items, key=_canonical)) for rule, items in sorted(identity.items())},
+        "detail": {rule: digest(sorted(items, key=_canonical)) for rule, items in sorted(detail.items())},
     }
 
 
@@ -422,8 +454,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args(argv)
 
-    salt = bytes.fromhex(sys.stdin.readline().strip())
-    digest = Digest(salt)
+    first = sys.stdin.readline().strip()
+    digest: Any = RawDigest() if first == RAW_MODE else Digest(bytes.fromhex(first))
+    del first
     documents = json.loads(args.documents.read_text(encoding="utf-8"))
 
     with args.out.open("w", encoding="utf-8") as handle:
@@ -447,7 +480,6 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         for entry in documents:
-            started = time.perf_counter()
             record: dict[str, Any] = {"kind": "document", "id": entry["id"]}
             try:
                 result = run_pipeline(Path(entry["path"]), use_vision=False)
@@ -460,7 +492,6 @@ def main(argv: list[str] | None = None) -> int:
                     record.update(
                         ok=False, error_type=failure.error_type, unmeasured=failure.group
                     )
-            record["seconds"] = round(time.perf_counter() - started, 3)
             _write(handle, record)
         _write(handle, {"kind": "complete", "documents": len(documents)})
     return 0

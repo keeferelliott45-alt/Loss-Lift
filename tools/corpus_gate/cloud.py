@@ -559,35 +559,38 @@ def _strings(value: Any):
 
 
 def stage_outputs(out_dir: Path, dest: Path, manifest_path: Path | None, forbid: list[str]) -> dict[str, Any]:
-    """Copy the gate's two privacy-safe files, after checking both; nothing else.
+    """Write the two published files, from the checked result alone; nothing else.
 
-    The collector writes its measurements beside the revision's code, so they
-    are checked here, by trusted code, before anything leaves the runner:
-    printable ASCII only, nothing shaped like a path, and none of the corpus's
-    file names, paths or salt.
+    ``result.json`` must be exactly the public result (``seal.validate_public``):
+    known keys only, exact types, bounded integers and lists, no raw
+    measurement and no timing. It is re-serialised from the validated object,
+    and ``report.txt`` is rendered from that object here, so the runner's own
+    report is never published. Both are then checked for printable ASCII,
+    nothing shaped like a path, and none of the corpus's file names, paths or
+    salt.
     """
+    from tools.corpus_gate import seal
+
     forbidden = _forbidden(manifest_path, forbid)
-    report_path, result_path = out_dir / "report.txt", out_dir / "result.json"
-    if not report_path.is_file() or not result_path.is_file():
-        raise CloudError("the gate wrote no result")
-    report = report_path.read_text(encoding="utf-8", errors="replace")
-    raw = result_path.read_text(encoding="utf-8", errors="replace")
+    result_path = out_dir / "result.json"
+    if not result_path.is_file() or result_path.stat().st_size > (4 << 20):
+        raise CloudError("the gate wrote no usable result")
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        raise CloudError("result.json is not valid JSON") from None
+        result = seal.strict_loads(result_path.read_text(encoding="utf-8", errors="strict"))
+        seal.validate_public(result)
+    except (json.JSONDecodeError, UnicodeDecodeError, seal.Rejected):
+        raise CloudError("result.json is not strict JSON") from None
+    except seal.Unpublishable as error:
+        raise CloudError(f"result.json is not the public result: {error}") from None
+    raw = json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    report = seal.render_public(result)
     _check_text(report, forbidden, "report.txt")
     _check_text(raw, forbidden, "result.json")
     for text in _strings(result):
         _check_text(text, forbidden, "result.json")
-    gate = result.get("gate") if isinstance(result, dict) else None
-    if not isinstance(gate, dict) or gate.get("verdict") not in ("pass", "fail"):
-        raise CloudError("result.json has no verdict")
-    if not isinstance(gate.get("exit_code"), int) or isinstance(gate.get("exit_code"), bool):
-        raise CloudError("result.json has no exit code")
     dest.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUT_FILES:
-        shutil.copyfile(out_dir / name, dest / name)
+    (dest / "result.json").write_text(raw, encoding="ascii")
+    (dest / "report.txt").write_text(report, encoding="ascii")
     return result
 
 
@@ -600,13 +603,19 @@ def summary(
     documents: int | None,
     exit_code: int | None,
     result: dict[str, Any] | None,
-    pr_moved: bool,
+    recheck: str = "",
+    pr_moved: str = "",
 ) -> str:
+    """The job summary. PASS needs exit 0, a passing verdict, and -- when a
+    pull request was named -- a re-check that ran, succeeded and said the head
+    had not moved. Anything short of that is FAIL."""
     verdict = "not reached"
     if isinstance(result, dict) and isinstance(result.get("gate"), dict):
         value = result["gate"].get("verdict")
         verdict = value if value in ("pass", "fail") else "unreadable"
-    passed = exit_code == 0 and verdict == "pass" and not pr_moved
+    named = bool(pr)
+    confirmed = recheck == "success" and pr_moved == "false"
+    passed = exit_code == 0 and verdict == "pass" and (confirmed or not named)
     rows = [
         ("Outcome", "PASS" if passed else "FAIL"),
         ("Gate exit code", "not reached" if exit_code is None else str(int(exit_code))),
@@ -614,6 +623,8 @@ def summary(
         ("Baseline", f"`{baseline}`" if FULL_SHA.fullmatch(baseline) else "invalid"),
         ("Candidate", f"`{candidate}`" if FULL_SHA.fullmatch(candidate) else "invalid"),
         ("Pull request", f"#{pr}" if pr and PR_NUMBER.fullmatch(pr) else "none named"),
+        ("Head re-confirmed after the run",
+         ("yes" if confirmed else "no") if named else "not needed"),
         ("Corpus release", f"`{identity.get('tag')}`" if TAG.fullmatch(str(identity.get("tag", ""))) else "unknown"),
         ("Release archive SHA-256", _hex_or_unknown(identity.get("archive_sha256"))),
         ("Manifest SHA-256", _hex_or_unknown(identity.get("manifest_sha256"))),
@@ -622,9 +633,12 @@ def summary(
     ]
     lines = ["## LossLift real-corpus gate", "", "| | |", "|---|---|"]
     lines += [f"| {key} | {value} |" for key, value in rows]
-    if pr_moved:
+    if named and pr_moved == "true":
         lines += ["", "The pull request's head moved during the run; this result is for the "
                       "candidate SHA above only. Dispatch again for the new head."]
+    elif named and not confirmed:
+        lines += ["", "The pull request's head could not be re-confirmed after the run, so the "
+                      "result cannot stand for it. Dispatch again."]
     return "\n".join(lines) + "\n"
 
 
@@ -655,20 +669,75 @@ def remove_tree(path: Path) -> None:
             shutil.rmtree(path, onerror=retry)
 
 
-def cleanup(paths: list[Path], repo_dir: Path | None, image: str | None, docker: str = "docker") -> list[str]:
-    """Remove everything; never stop half-way. Returns what could not be removed."""
+def _docker(docker: str, *args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess([docker, *args], 127, "", "")
+
+
+def _labelled(docker: str, kind: str) -> list[str] | None:
+    """Ids of task containers or images, or None when Docker cannot say."""
     from tools.corpus_gate.sandbox import LABEL
 
+    listing = ("ps", "-aq") if kind == "containers" else ("images", "-q")
+    listed = _docker(docker, *listing, "--filter", f"label={LABEL}")
+    return listed.stdout.split() if listed.returncode == 0 else None
+
+
+def clean_docker(docker: str, image: str | None, required: bool) -> list[str]:
+    """Remove every task container and the task image, then prove they are gone.
+
+    Every removal is attempted whatever happened to the one before. What
+    counts is not what the removals returned but what is left afterwards:
+    containers and images carrying the task label are listed again, and the
+    named image is inspected. Anything still there -- or a Docker that
+    cannot be asked -- is a problem.
+    """
+    problems: list[str] = []
+    if shutil.which(docker) is None:
+        return ["Docker is not available to verify cleanup"] if required else []
+    containers = _labelled(docker, "containers")
+    if containers is None:
+        return ["Docker could not list task containers"]
+    failed = [c for c in containers if _docker(docker, "rm", "--force", c).returncode != 0]
+    images = _labelled(docker, "images") or []
+    for name in ([image] if image else []) + images:
+        _docker(docker, "image", "rm", "--force", name)
+    remaining = _labelled(docker, "containers")
+    if remaining is None:
+        problems.append("Docker could not list task containers after removal")
+    elif remaining:
+        problems.append(f"{len(remaining)} task container(s) remain"
+                        + (f" ({len(failed)} removal(s) failed)" if failed else ""))
+    left_images = _labelled(docker, "images")
+    if left_images is None:
+        problems.append("Docker could not list task images after removal")
+    elif left_images:
+        problems.append(f"{len(left_images)} labelled task image(s) remain")
+    if image and _docker(docker, "image", "inspect", image).returncode == 0:
+        problems.append("the task image remains")
+    return problems
+
+
+def cleanup(
+    paths: list[Path],
+    repo_dir: Path | None,
+    image: str | None,
+    docker: str = "docker",
+    require_docker: bool = False,
+) -> list[str]:
+    """Remove everything; never stop half-way. Returns what could not be removed.
+
+    Containers go first, because a live one still has the documents mounted.
+    Host paths are removed whatever Docker said, and their removal never
+    stands in for Docker's.
+    """
     left: list[str] = []
-    if shutil.which(docker):
-        listed = subprocess.run(
-            [docker, "ps", "-aq", "--filter", f"label={LABEL}"],
-            capture_output=True, text=True, check=False,
-        )
-        for container in listed.stdout.split():
-            subprocess.run([docker, "rm", "--force", container], capture_output=True, check=False)
-        if image:
-            subprocess.run([docker, "image", "rm", "--force", image], capture_output=True, check=False)
+    try:
+        left += clean_docker(docker, image, require_docker)
+    except Exception:  # noqa: BLE001 - keep cleaning; report it
+        left.append("Docker cleanup raised")
     for position, path in enumerate(paths, start=1):
         try:
             remove_tree(path)
@@ -730,12 +799,16 @@ def _parser() -> argparse.ArgumentParser:
     summ.add_argument("--identity", type=Path, required=True)
     summ.add_argument("--result", type=Path, required=True)
     summ.add_argument("--exit-code", default="")
-    summ.add_argument("--pr-moved", default="false")
+    summ.add_argument("--recheck", default="")
+    summ.add_argument("--pr-moved", default="")
 
     remove = commands.add_parser("cleanup")
     remove.add_argument("--path", action="append", type=Path, default=[])
     remove.add_argument("--repo-dir", type=Path, default=None)
     remove.add_argument("--image", default=None)
+    remove.add_argument("--docker", default="docker")
+    remove.add_argument("--require-docker", action="store_true",
+                        help="fail unless Docker can be asked and confirms nothing is left")
     return parser
 
 
@@ -799,10 +872,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(summary(
                 baseline=args.baseline, candidate=args.candidate, pr=args.pr,
                 identity=identity, documents=docs if isinstance(docs, int) else None,
-                exit_code=code, result=result, pr_moved=args.pr_moved == "true",
+                exit_code=code, result=result, recheck=args.recheck, pr_moved=args.pr_moved,
             ))
         elif args.command == "cleanup":
-            left = cleanup(args.path, args.repo_dir, args.image)
+            left = cleanup(args.path, args.repo_dir, args.image, docker=args.docker,
+                           require_docker=args.require_docker)
             if left:
                 print(f"corpus gate cleanup: could not remove {', '.join(left)}", file=sys.stderr)
                 return EXIT_SETUP

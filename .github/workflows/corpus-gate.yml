@@ -107,7 +107,8 @@ jobs:
           context="$GATE/image"
           mkdir "$context"
           cp tools/corpus_gate/sandbox_image/Dockerfile requirements.txt "$context/"
-          docker build --quiet --pull --tag "$SANDBOX_IMAGE" "$context" > /dev/null
+          docker build --quiet --pull --label losslift.corpus-gate=1 \
+            --tag "$SANDBOX_IMAGE" "$context" > /dev/null
           rm -rf "$context"
 
       - name: Download the private corpus release
@@ -144,6 +145,7 @@ jobs:
               --repo . --baseline "$BASELINE" --candidate "$CANDIDATE" \
               --corpus "$GATE/corpus/pdfs" --manifest "$GATE/corpus/manifest.json" \
               --out "$GATE/out" --timeout 3600 --sandbox-image "$SANDBOX_IMAGE" \
+              --public-output \
               > /dev/null 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
 
@@ -160,7 +162,12 @@ jobs:
 
       - name: Check and stage the privacy-safe outputs
         id: stage
-        if: always() && steps.gate.outcome == 'success'
+        # A named pull request must have been re-confirmed, by a re-check that
+        # ran, succeeded and answered "not moved", before anything is staged.
+        if: >-
+          always() && steps.gate.outcome == 'success' &&
+          (inputs.pr_number == '' ||
+           (steps.recheck.outcome == 'success' && steps.recheck.outputs.moved == 'false'))
         working-directory: trusted
         run: >-
           python3 -m tools.corpus_gate.cloud stage-outputs
@@ -169,11 +176,12 @@ jobs:
           >> "$GITHUB_OUTPUT"
 
       - name: Remove documents, manifest, worktrees and containers
+        id: cleanup
         if: always()
         working-directory: trusted
         run: >-
           python3 -m tools.corpus_gate.cloud cleanup
-          --path "$GATE" --repo-dir . --image "$SANDBOX_IMAGE"
+          --path "$GATE" --repo-dir . --image "$SANDBOX_IMAGE" --require-docker
 
       - name: Upload report.txt and result.json
         if: always() && steps.stage.outcome == 'success'
@@ -191,20 +199,28 @@ jobs:
         working-directory: trusted
         env:
           GATE_CODE: ${{ steps.gate.outputs.code }}
+          RECHECK: ${{ steps.recheck.outcome }}
           PR_MOVED: ${{ steps.recheck.outputs.moved }}
         run: >-
           python3 -m tools.corpus_gate.cloud summary
           --baseline "$BASELINE" --candidate "$CANDIDATE" --pr "$PR_NUMBER"
           --identity "$IDENTITY" --result "$UPLOAD/result.json"
-          --exit-code "$GATE_CODE" --pr-moved "$PR_MOVED" >> "$GITHUB_STEP_SUMMARY"
+          --exit-code "$GATE_CODE" --recheck "$RECHECK" --pr-moved "$PR_MOVED"
+          >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail unless the gate passed
         if: always()
         env:
           GATE_CODE: ${{ steps.gate.outputs.code }}
+          RECHECK: ${{ steps.recheck.outcome }}
           PR_MOVED: ${{ steps.recheck.outputs.moved }}
           STAGED: ${{ steps.stage.outcome }}
+          CLEANED: ${{ steps.cleanup.outcome }}
         run: |
           test "$GATE_CODE" = "0" || { echo "corpus gate exit code: ${GATE_CODE:-not reached}"; exit 1; }
-          test "$PR_MOVED" != "true" || { echo "the pull request head moved during the run"; exit 1; }
+          if [ -n "$PR_NUMBER" ]; then
+            test "$RECHECK" = "success" || { echo "the pull request head was not re-confirmed"; exit 1; }
+            test "$PR_MOVED" = "false" || { echo "the pull request head moved, or its re-check gave no answer"; exit 1; }
+          fi
           test "$STAGED" = "success" || { echo "the outputs did not pass the privacy check"; exit 1; }
+          test "$CLEANED" = "success" || { echo "cleanup could not prove everything was removed"; exit 1; }

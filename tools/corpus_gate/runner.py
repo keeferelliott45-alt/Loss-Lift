@@ -24,6 +24,12 @@ every collector still running is killed and reaped before any worktree, copy
 or temporary file is removed, so nothing is deleted from under a live process
 and no process outlives the gate.
 
+No collector is given the salt. The revision's code runs inside the
+collector's process, so the collector writes each digest slot as the text to
+be digested, and this process -- which holds the salt and runs no revision
+code -- checks every line against a strict schema and keys the digests
+itself (``seal.py``). An output outside the schema fails the run.
+
 Collector output streams are discarded, never shown and never stored: a
 traceback can quote the cell that caused it. What a revision did is read only
 from the measurements it wrote.
@@ -52,6 +58,7 @@ from pathlib import Path
 
 from tools.corpus_gate import compare as comparison
 from tools.corpus_gate import manifest as manifests
+from tools.corpus_gate import seal
 from tools.corpus_gate.manifest import SetupError
 from tools.corpus_gate.sandbox import DockerSandbox
 
@@ -113,7 +120,6 @@ def _launch(
     documents: Path,
     out: Path,
     scratch: Path,
-    salt: bytes,
     collectors: list[subprocess.Popen],
     sandbox: DockerSandbox | None = None,
     snapshot: Path | None = None,
@@ -167,8 +173,13 @@ def _launch(
         containers[process.pid] = name
     assert process.stdin is not None
     with process.stdin as pipe:
-        pipe.write(salt.hex() + "\n")
+        pipe.write(collect_raw_mode() + "\n")
     return process
+
+
+def collect_raw_mode() -> str:
+    """What a collector is told on stdin: never the salt."""
+    return "raw"
 
 
 def _stop(
@@ -260,6 +271,7 @@ def run_gate(
     out_dir: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     sandbox: DockerSandbox | None = None,
+    public: bool = False,
 ) -> GateRun:
     """Verify the corpus, snapshot it, measure both revisions, compare, and write the result.
 
@@ -321,7 +333,6 @@ def run_gate(
                     documents,
                     scratch / f"{label}-out" / "measurements.jsonl",
                     private,
-                    manifest.salt,
                     collectors,
                     sandbox,
                     scratch / "snapshot",
@@ -343,7 +354,7 @@ def run_gate(
                     sandbox.stop(containers[process.pid])
                 timed_out = True
             run.seconds = time.monotonic() - started
-            comparison.read_run(scratch / f"{label}-out" / "measurements.jsonl", run)
+            seal.read_run(scratch / f"{label}-out" / "measurements.jsonl", run, manifest)
             if timed_out:
                 run.process = f"timed out after {timeout:.0f} s"
             elif process.returncode != 0 and not run.fatal:
@@ -361,6 +372,14 @@ def run_gate(
         manifest, runs["baseline"], runs["candidate"], allowlist, changed_copies=moved
     )
     verified = len(manifest.entries)
+    if public:
+        # Published output: states, changed schema fields and two critical
+        # values, never a measurement, a timing or a raw record.
+        result = seal.public_result(outcome, manifest, verified, verification.unlisted)
+        report = seal.render_public(result)
+        target = out_dir or _default_out(manifest_path, base_sha, cand_sha)
+        _write(target, result, report)
+        return GateRun(outcome.exit_code, report, result, target)
     report = comparison.render(outcome, manifest, verified)
     if verification.unlisted:
         report += (

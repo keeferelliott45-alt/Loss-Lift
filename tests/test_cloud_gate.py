@@ -387,11 +387,25 @@ def test_scrub_removes_stored_credentials_and_refuses_a_token_in_the_environment
                         "LOSSLIFT_CORPUS_TOKEN is set in the gate's environment"]
 
 
-def _gate_out(tmp_path, report="LossLift real-corpus gate: PASS\n", result=None):
+def _public(verdict="pass", code=0, problems=(), **document):
+    doc = {"sha256": "c" * 64, "state": "unchanged" if code == 0 else "changed", "changed": []}
+    doc.update(document)
+    return {
+        "gate": {"schema": 2, "verdict": verdict, "exit_code": code, "problems": list(problems)},
+        "revisions": {label: {"commit": sha, "complete": True, "fatal": None, "process": "ok",
+                              "measured": 1}
+                      for label, sha in (("baseline", SHA_A), ("candidate", SHA_B))},
+        "corpus": {"manifest_sha256": "d" * 64, "documents": 1, "verified": 1, "unlisted": 0},
+        "allowlist": {"approved": 0, "unused": []},
+        "documents": {"doc-0123456789ab": doc},
+    }
+
+
+def _gate_out(tmp_path, report="LossLift real-corpus gate: PASS\n", result=None, raw=None):
     out = tmp_path / "gate-out"
     out.mkdir()
     (out / "report.txt").write_text(report)
-    (out / "result.json").write_text(json.dumps(result or {"gate": {"verdict": "pass", "exit_code": 0}}))
+    (out / "result.json").write_text(raw if raw is not None else json.dumps(result or _public()))
     (out / "measurements.jsonl").write_text("{}")  # never staged
     return out
 
@@ -410,31 +424,40 @@ def test_only_report_and_result_are_staged(tmp_path):
     assert result["gate"]["verdict"] == "pass"
 
 
+def test_the_runners_own_report_is_never_published(tmp_path):
+    out = _gate_out(tmp_path, report=f"{SECRET_NAME} 1250.00 {'5' * 64}\n")
+    cloud.stage_outputs(out, tmp_path / "up", _manifest_file(tmp_path), [str(tmp_path)])
+    published = (tmp_path / "up" / "report.txt").read_text()
+    assert SECRET_NAME not in published and "1250" not in published
+    assert published.startswith("LossLift real-corpus gate: PASS (exit 0")
+
+
+def _problem(text):
+    return _public("fail", 4, problems=[text])
+
+
 @pytest.mark.parametrize(
-    "report, result, words",
+    "result, words",
     [
-        (f"doc-1 {SECRET_NAME}\n", None, "corpus name, path or secret"),
-        ("fine\n", {"gate": {"verdict": "fail", "exit_code": 4}, "x": "5" * 64}, "corpus name, path or secret"),
-        ("fine\n", {"gate": {"verdict": "fail", "exit_code": 4}, "x": f"{SECRET_NAME.lower()}.pdf"},
-         "corpus name"),
-        ("written to /home/runner/work/x\n", None, "local path"),
-        ("fine\n", {"gate": {"verdict": "fail", "exit_code": 4}, "p": "/tmp/losslift-gate-x/1.pdf"},
-         "local path"),
-        ("C:\\Users\\keefe\\Downloads\n", None, "local path"),
-        ("Jos\u00e9\n", None, "printable ASCII"),
-        ("fine\n", {"gate": {"verdict": "fail", "exit_code": 4}, "who": "Jos\u00e9"}, "printable ASCII"),
-        ("fine\n", {"gate": {"exit_code": 4}}, "no verdict"),
+        (_problem(f"doc-1 {SECRET_NAME}"), "corpus name, path or secret"),
+        (_problem("5" * 64), "corpus name, path or secret"),
+        (_problem(f"{SECRET_NAME.lower()}.pdf"), "corpus name"),
+        (_problem("written to /home/runner/work/x"), "local path"),
+        (_problem("/tmp/losslift-gate-x/1.pdf"), "local path"),
+        (_problem("Jos\u00e9"), "not the public result"),
+        (dict(_public(), x="anything"), "not the public result"),
+        ({"gate": {"exit_code": 4}}, "not the public result"),
     ],
 )
-def test_outputs_that_could_leak_are_not_staged(tmp_path, report, result, words):
-    out = _gate_out(tmp_path, report, result)
+def test_outputs_that_could_leak_are_not_staged(tmp_path, result, words):
+    out = _gate_out(tmp_path, result=result)
     with pytest.raises(CloudError, match=words):
         cloud.stage_outputs(out, tmp_path / "up", _manifest_file(tmp_path), [str(tmp_path)])
     assert not (tmp_path / "up").exists()
 
 
 def test_names_are_matched_as_whole_words_and_generic_names_fail_closed(tmp_path):
-    out = _gate_out(tmp_path, "LossLift real-corpus gate: FAIL (exit 1)\nBuffalonian\n")
+    out = _gate_out(tmp_path, result=_problem("doc-0123456789ab Buffalonian"))
     cloud.stage_outputs(out, tmp_path / "up", _manifest_file(tmp_path, "Buffalo"), [])
     with pytest.raises(CloudError, match="corpus name"):
         cloud.stage_outputs(out, tmp_path / "up2", _manifest_file(tmp_path, "real-corpus"), [])
@@ -453,15 +476,15 @@ def test_cleanup_removes_read_only_trees_and_reports_nothing_left(tmp_path):
 
 
 @pytest.mark.parametrize("code, verdict, moved, outcome", [
-    (0, "pass", False, "PASS"), (1, "fail", False, "FAIL"), (3, "fail", False, "FAIL"),
-    (4, "fail", False, "FAIL"), (None, None, False, "FAIL"), (0, "pass", True, "FAIL"),
+    (0, "pass", "false", "PASS"), (1, "fail", "false", "FAIL"), (3, "fail", "false", "FAIL"),
+    (4, "fail", "false", "FAIL"), (None, None, "false", "FAIL"), (0, "pass", "true", "FAIL"),
 ])
 def test_the_summary_names_the_run_exactly(code, verdict, moved, outcome):
     identity = {"tag": "corpus-v2", "archive_sha256": "1" * 64, "manifest_sha256": "2" * 64,
                 "documents": 7, "bound": True}
     result = {"gate": {"verdict": verdict, "exit_code": code}} if verdict else None
     text = cloud.summary(baseline=SHA_A, candidate=SHA_B, pr="12", identity=identity, documents=7,
-                         exit_code=code, result=result, pr_moved=moved)
+                         exit_code=code, result=result, recheck="success", pr_moved=moved)
     assert f"| Outcome | {outcome} |" in text
     for needle in (SHA_A, SHA_B, "corpus-v2", "1" * 64, "2" * 64, "| Documents verified | 7 |", "#12"):
         assert needle in text
@@ -577,7 +600,8 @@ def test_only_the_privacy_safe_files_are_uploaded():
 @pytest.mark.parametrize("code", ["1", "2", "3", "4", "", "137"])
 def test_the_final_step_fails_for_every_exit_code_but_zero(code):
     step = next(s for s in _steps(WORKFLOW, "gate") if s["name"] == "Fail unless the gate passed")
-    env = {"PATH": os.environ["PATH"], "GATE_CODE": code, "PR_MOVED": "false", "STAGED": "success"}
+    env = {"PATH": os.environ["PATH"], "GATE_CODE": code, "PR_MOVED": "false", "STAGED": "success",
+           "CLEANED": "success", "PR_NUMBER": "7", "RECHECK": "success"}
     assert subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True).returncode != 0
     env["GATE_CODE"] = "0"
     assert subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True).returncode == 0
@@ -734,7 +758,7 @@ def _sandboxed(world, candidate, out, **options):
 
     return runner.run_gate(repo=world["repo"], baseline=world["base"], candidate=world[candidate],
                            corpus=world["corpus"], manifest_path=world["manifest"], out_dir=out,
-                           sandbox=DockerSandbox(IMAGE), **options)
+                           sandbox=DockerSandbox(IMAGE), public=True, **options)
 
 
 def _assert_nothing_left(world, private_tmp):

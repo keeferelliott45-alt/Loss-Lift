@@ -46,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--repo", type=Path, default=Path.cwd())
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per run")
     run.add_argument(
+        "--public-output",
+        action="store_true",
+        help="write only the publishable result: states, changed fields, claim count and status",
+    )
+    run.add_argument(
         "--sandbox-image",
         default=None,
         help="run each collector in this local container image, with no network and no credentials",
@@ -87,6 +92,7 @@ def _run(args: argparse.Namespace) -> int:
             out_dir=args.out,
             timeout=args.timeout,
             sandbox=sandbox,
+            public=args.public_output,
         )
     except SetupError as error:
         print(f"LossLift real-corpus gate: FAIL (exit 3)\n\n{error}")

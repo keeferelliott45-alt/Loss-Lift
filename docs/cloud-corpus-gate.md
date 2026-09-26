@@ -80,19 +80,50 @@ What happens, in order:
    list mounted read-only, plus its own output and scratch directories. The
    gate's hour-per-run timeout, and a cancelled job's SIGTERM, stop and remove
    every container.
-8. Both output files are checked by trusted code (printable ASCII, nothing
-   shaped like a path, no corpus file name, path or salt) before being staged.
+   **No collector is given the salt.** The candidate's code runs in the
+   collector's process, so the collector writes each digest slot as the text to
+   be digested; the gate's own process, which holds the salt and runs no
+   candidate code, reads that output under a strict allowlisted schema
+   (`tools/corpus_gate/seal.py`) and keys the digests itself. Exact JSON only
+   (no NaN, Infinity or fractions, integers of at most seven digits, no repeated
+   keys), exactly the known keys, integers within each field's range, bounded
+   lists, maps and nesting, real booleans, and exception names only if they are
+   Python builtins. A ready-made digest from a collector is refused. Any
+   violation fails the run with exit 4.
+8. With `--public-output` the gate writes only the publishable result: per
+   document its state, *which* schema fields changed (map keys collapsed to
+   `*`), and the before and after of the claim count and status. No other
+   measured value, no timing and no raw record. The staging step accepts
+   nothing but that exact shape, re-serialises it, renders `report.txt` from it
+   itself (the runner's report is never published), and checks both for
+   printable ASCII, paths, corpus file names and the salt. When a pull request
+   is named, nothing is staged unless the re-check ran, succeeded and answered
+   "not moved".
 9. Every document, the manifest, worktrees, containers and the image are
-   removed, whether the run passed, failed or was cancelled.
+   removed, whether the run passed, failed or was cancelled. Cleanup then
+   lists containers and images by the task label again and inspects the
+   image; anything still there, a failed removal, or a Docker that cannot be
+   asked fails the job.
 
 A candidate that needs a package `main` does not install cannot fetch it:
 it fails with exit 4. Land the requirement on `main` first.
 
-**What the sandbox does not stop.** The candidate's code runs beside the
-documents and can write whatever it likes into its own measurements, and a
-deliberately malicious candidate could encode text there as numbers. The
-output check catches text, paths and names, not a covert encoding. What keeps
-that out is who can dispatch the workflow (write access to LossLift) and that
+**What is left.** A candidate that sets out to leak can still choose what the
+published result says, within its schema. Per document that is: its state
+(unchanged, changed or failed: 2 bits), which of the 87 known schema fields
+changed (87 bits), the claim count before and after (each at most 1,000,000:
+40 bits), the status before and after (`CLEAN`, `NEEDS_REVIEW` or `unlisted`:
+4 bits), and which builtin exception each revision raised (about 14 bits). That
+is at most 147 bits, under 19 bytes, per document per run, and only a run that
+fails the gate publishes anything beyond the state. The test suite measures
+this: candidates that encode document bytes and the salt as huge integers,
+runs of small integers, page lists, map keys, exception names and status
+tokens all run through the real workflow steps, and none of the encodings
+reaches the artifacts. Across the run it can also choose whether
+each revision completed, how many documents it measured, and how long the job
+took, which the job's own duration shows to a precision of seconds. None of it
+can carry the salt, which the candidate never sees. What bounds the rest is
+the schema, who can dispatch the workflow (write access to LossLift) and that
 the artifact stays in a private repository.
 
 ## Adding loss runs from the browser
