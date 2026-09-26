@@ -67,6 +67,12 @@ measured part of the corpus has not passed. Nor has one whose measurement
 raised: a document is measured completely or not at all, and two commits
 failing the same way have measured nothing, not the same thing.
 
+**From the browser**, with no local terminal: the *Corpus gate* GitHub
+workflow runs this same command on a private corpus release, with each
+commit's collector in a container that has no network and no credentials.
+New documents join the corpus through the *Corpus update* workflow. See
+[cloud-corpus-gate.md](cloud-corpus-gate.md).
+
 ## One-time setup
 
 Keep the real documents **outside the repository**, anywhere on local disk.
