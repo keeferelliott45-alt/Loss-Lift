@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, field as dataclass_field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pymupdf
 
@@ -320,6 +320,34 @@ def build_claim(
 #: and the page number is the one part that changes, so it has to come out
 #: before two pages' footers can be compared.
 _PAGE_MARKER = re.compile(r"\bpage\s+\d+\s*(?:of\s*\d+)?\b", re.IGNORECASE)
+
+#: A report numbering one of its own pages against its length: "Page 3 of 8".
+#: The count is what makes it pagination -- "see page 1" in a sentence names a
+#: page, it does not number this one.
+_PAGE_OF = re.compile(r"\bpage\s+(\d+)\s*of\s*\d+\b", re.IGNORECASE)
+
+
+def printed_runs(page_texts: Mapping[int, str]) -> dict[int, int]:
+    """Which printed report each page belongs to, by the reports' own numbering.
+
+    A packet binds several loss runs, and each numbers its own pages. A page
+    calling itself page 1 of a count is where a report begins, and every page
+    after it belongs to that report until another page does the same. Pages
+    ahead of the first are run 0, as is every page of a document that numbers
+    none: nothing on it says where one report ends and the next begins.
+
+    Only the report's own statement counts. The table header cannot say this:
+    two carriers print the same generic labels, and one report's header reads
+    differently on a page where a label wraps. A stamp numbering the whole
+    packet says 1 only on its first page, so it opens nothing further.
+    """
+    runs: dict[int, int] = {}
+    run = 0
+    for page, text in sorted(page_texts.items()):
+        if any(int(match.group(1)) == 1 for match in _PAGE_OF.finditer(text)):
+            run += 1
+        runs[page] = run
+    return runs
 
 
 def _normalised(row: RawRow) -> str:
@@ -1014,31 +1042,43 @@ def accepted_identifier_shapes(
     return consensus_shapes(candidates)
 
 
-def identifier_shapes_by_layout(
-    tables: Sequence[RawTable], mapping: ColumnMapping
-) -> dict[tuple[str, ...], set[str]]:
-    """The identifier shapes each table layout is read with, keyed by its headers.
+def _run_of(table: RawTable, runs: Mapping[int, int] | None) -> int:
+    """The printed run a table's page belongs to; one run where none is known."""
+    return runs.get(table.page, 0) if runs else 0
 
-    A packet binds loss runs from several carriers, each printed under its own
-    header and numbering its claims its own way. Pooled into one vote, the
-    larger run outvotes the smaller: a run of one claim bound beside a run of
-    eight had that claim refused as a stray code, and so does any run with
-    fewer claims than a quarter of the largest run's -- all of them together.
 
-    A layout keeps the document's vote wherever that vote accepts any of its
+def identifier_shapes_by_run(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    runs: Mapping[int, int] | None = None,
+) -> dict[int, set[str]]:
+    """The identifier shapes each printed run is read with, keyed by run.
+
+    A packet binds loss runs from several carriers, each numbering its claims
+    its own way. Pooled into one vote, the larger run outvotes the smaller: a
+    run of one claim bound beside a run of eight had that claim refused as a
+    stray code, and so does any run with fewer claims than a quarter of the
+    largest run's -- all of them together.
+
+    Runs are where the reports' own page numbering puts them (see
+    :func:`printed_runs`), never where their headers differ: two carriers
+    print the same generic labels, and one run's header reads differently on
+    a page where a label wraps. Given no runs, every table is one run.
+
+    A run keeps the document's vote wherever that vote accepts any of its
     identifiers: it is the same numbering, and the pooled count is what keeps
-    a one-off code inside it out. Only a layout none of whose identifiers the
+    a one-off code inside it out. Only a run none of whose identifiers the
     document accepts is judged by its own claims, and then only by rows that
-    read as claims in their own right, so a page of continuation lines under a
-    differently read header cannot promote its codes.
+    read as claims in their own right, so a run of continuation codes cannot
+    promote them.
     """
     document = accepted_identifier_shapes(tables, mapping)
-    printed: dict[tuple[str, ...], list[str]] = {}
-    claimed: dict[tuple[str, ...], list[str]] = {}
+    printed: dict[int, list[str]] = {}
+    claimed: dict[int, list[str]] = {}
     for table in tables:
-        layout = tuple(table.headers)
-        printed.setdefault(layout, [])
-        claimed.setdefault(layout, [])
+        run = _run_of(table, runs)
+        printed.setdefault(run, [])
+        claimed.setdefault(run, [])
         table_mapping = mapping_for(table, mapping)
         index = table_mapping.index_of("claim_number")
         if index is None:
@@ -1047,15 +1087,15 @@ def identifier_shapes_by_layout(
             cell = row.cell(index).strip()
             if not cell or not is_identifier_candidate(cell):
                 continue
-            printed[layout].append(cell)
+            printed[run].append(cell)
             if _row_establishes_claim_data(_row_values(row, table_mapping)):
-                claimed[layout].append(cell)
+                claimed[run].append(cell)
 
-    shapes: dict[tuple[str, ...], set[str]] = {}
-    for layout, cells in printed.items():
-        own = consensus_shapes(claimed[layout])
+    shapes: dict[int, set[str]] = {}
+    for run, cells in printed.items():
+        own = consensus_shapes(claimed[run])
         read = any(leading_identifier(cell, document) for cell in cells)
-        shapes[layout] = own if own and not read else document
+        shapes[run] = own if own and not read else document
     return shapes
 
 
@@ -1128,6 +1168,7 @@ def build_claims(
     dash_means_zero: bool = False,
     source_method: SourceMethod = SourceMethod.DIGITAL,
     confidence_cap: float = 1.0,
+    runs: Mapping[int, int] | None = None,
 ) -> tuple[list[Claim], list[str], list[UnplacedRow]]:
     """Normalise every row of every page, folding wrapped lines into their claim.
 
@@ -1135,16 +1176,19 @@ def build_claims(
     separately from the warnings. A warning is a note to the reader; an amount
     the app parsed and could not place is a hole in the reading, and only the
     rules can say so.
+
+    ``runs`` maps each page to the printed report it belongs to (see
+    :func:`printed_runs`), which decides whose claim numbers vote together.
     """
     claims: list[Claim] = []
     warnings: list[str] = []
     unplaced: list[UnplacedRow] = []
     furniture = page_furniture(tables, mapping, locale)
-    shapes_by_layout = identifier_shapes_by_layout(tables, mapping)
+    shapes_by_run = identifier_shapes_by_run(tables, mapping, runs)
 
     for table in tables:
         table_mapping = mapping_for(table, mapping)
-        shapes = shapes_by_layout[tuple(table.headers)]
+        shapes = shapes_by_run[_run_of(table, runs)]
         context = table_money_context(table, table_mapping, shapes)
 
         for row in table.rows:
@@ -2097,7 +2141,8 @@ def _run_pipeline(
     # a guess about which line of the letterhead names the carrier.
     stated = read_document_columns(digital_tables)
     claims, row_warnings, unplaced_rows = build_claims(
-        digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero
+        digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero,
+        runs=printed_runs(extraction.page_texts),
     )
     warnings.extend(row_warnings)
 
