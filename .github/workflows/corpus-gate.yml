@@ -1,0 +1,226 @@
+# Real-corpus A/B gate, run from the browser. See docs/cloud-corpus-gate.md.
+#
+# Manually dispatched only, and only from main: the definition that runs is
+# always main's, never a candidate's. The corpus token lives in the
+# `corpus-gate` environment, whose deployment branch policy admits main alone,
+# so a copy of this file on any other branch cannot read it.
+#
+# Candidate code runs only inside a container with no network, no credentials
+# and no environment of its own; everything around it is main's code.
+name: Corpus gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: Baseline commit (exact 40-character SHA)
+        required: true
+        type: string
+      candidate_sha:
+        description: Candidate commit (exact 40-character SHA)
+        required: true
+        type: string
+      corpus_tag:
+        description: Corpus release tag (blank = the LOSSLIFT_ACTIVE_CORPUS variable)
+        required: false
+        type: string
+        default: ""
+      pr_number:
+        description: Pull request whose live head must equal the candidate (optional)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: corpus-gate-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Real-corpus gate
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: corpus-gate
+    timeout-minutes: 180
+    env:
+      BASELINE: ${{ inputs.baseline_sha }}
+      CANDIDATE: ${{ inputs.candidate_sha }}
+      CORPUS_TAG: ${{ inputs.corpus_tag || vars.LOSSLIFT_ACTIVE_CORPUS }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      REPOSITORY: ${{ github.repository }}
+      SANDBOX_IMAGE: losslift-corpus-gate:${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Confirm this is main's definition
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$EVENT_NAME" = "workflow_dispatch"
+          test "$WORKFLOW_REF" = "$REPOSITORY/.github/workflows/corpus-gate.yml@refs/heads/main"
+          gate="$RUNNER_TEMP/losslift-gate"
+          mkdir -m 700 "$gate" "$gate/tmp" "$gate/home"
+          mkdir -m 700 "$RUNNER_TEMP/losslift-gate-upload"
+          echo "GATE=$gate" >> "$GITHUB_ENV"
+          echo "UPLOAD=$RUNNER_TEMP/losslift-gate-upload" >> "$GITHUB_ENV"
+          # Release tag, archive and manifest SHA-256 and document count: ids and
+          # hashes only, kept outside the gate directory for the job summary.
+          echo "IDENTITY=$RUNNER_TEMP/losslift-gate-identity.json" >> "$GITHUB_ENV"
+
+      - name: Check out main (trusted gate code)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the commits and the pull request
+        working-directory: trusted
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -m tools.corpus_gate.cloud check-inputs
+          --repository "$REPOSITORY" --baseline "$BASELINE"
+          --candidate "$CANDIDATE" --pr "$PR_NUMBER"
+
+      - name: Fetch the commits under test
+        working-directory: trusted
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # The token is passed for this one command and never written to disk.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          refs=("$BASELINE" "$CANDIDATE")
+          if [ -n "$PR_NUMBER" ]; then refs+=("+refs/pull/$PR_NUMBER/head:refs/remotes/pr/head"); fi
+          git -c "http.https://github.com/.extraheader=$auth" fetch --quiet --no-tags \
+            --no-recurse-submodules origin "${refs[@]}"
+          git cat-file -e "$BASELINE^{commit}"
+          git cat-file -e "$CANDIDATE^{commit}"
+
+      - name: Build the sandbox image from main's requirements
+        working-directory: trusted
+        run: |
+          context="$GATE/image"
+          mkdir "$context"
+          cp tools/corpus_gate/sandbox_image/Dockerfile requirements.txt "$context/"
+          docker build --quiet --pull --label losslift.corpus-gate=1 \
+            --tag "$SANDBOX_IMAGE" "$context" > /dev/null
+          rm -rf "$context"
+
+      - name: Download the private corpus release
+        id: download
+        working-directory: trusted
+        env:
+          LOSSLIFT_CORPUS_TOKEN: ${{ secrets.LOSSLIFT_CORPUS_TOKEN }}
+        run: >-
+          python3 -m tools.corpus_gate.cloud download
+          --tag "$CORPUS_TAG" --out "$GATE/corpus.zip" --identity "$IDENTITY"
+          >> "$GITHUB_OUTPUT"
+
+      - name: Validate, extract and verify the corpus
+        id: corpus
+        working-directory: trusted
+        run: >-
+          python3 -m tools.corpus_gate.cloud unpack
+          --zip "$GATE/corpus.zip" --dest "$GATE/corpus" --identity "$IDENTITY"
+          >> "$GITHUB_OUTPUT"
+
+      - name: Remove every GitHub credential
+        working-directory: trusted
+        run: python3 -m tools.corpus_gate.cloud scrub --repo-dir .
+
+      - name: Run the corpus gate (collectors sandboxed)
+        id: gate
+        working-directory: trusted
+        run: |
+          set +e
+          # An empty environment: no token, no runner variable, no docker login.
+          env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$GATE/home" TMPDIR="$GATE/tmp" \
+            LANG=C.UTF-8 PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 \
+            python3 -P -m tools.corpus_gate run \
+              --repo . --baseline "$BASELINE" --candidate "$CANDIDATE" \
+              --corpus "$GATE/corpus/pdfs" --manifest "$GATE/corpus/manifest.json" \
+              --out "$GATE/out" --timeout 3600 --sandbox-image "$SANDBOX_IMAGE" \
+              --public-output \
+              > /dev/null 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Re-check the pull request head
+        id: recheck
+        if: always() && inputs.pr_number != '' && steps.gate.outcome == 'success'
+        working-directory: trusted
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -m tools.corpus_gate.cloud check-inputs --recheck
+          --repository "$REPOSITORY" --baseline "$BASELINE"
+          --candidate "$CANDIDATE" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Check and stage the privacy-safe outputs
+        id: stage
+        # A named pull request must have been re-confirmed, by a re-check that
+        # ran, succeeded and answered "not moved", before anything is staged.
+        if: >-
+          always() && steps.gate.outcome == 'success' &&
+          (inputs.pr_number == '' ||
+           (steps.recheck.outcome == 'success' && steps.recheck.outputs.moved == 'false'))
+        working-directory: trusted
+        run: >-
+          python3 -m tools.corpus_gate.cloud stage-outputs
+          --out "$GATE/out" --dest "$UPLOAD" --manifest "$GATE/corpus/manifest.json"
+          --forbid "$RUNNER_TEMP" --forbid "$GITHUB_WORKSPACE" --forbid "$HOME"
+          >> "$GITHUB_OUTPUT"
+
+      - name: Remove documents, manifest, worktrees and containers
+        id: cleanup
+        if: always()
+        working-directory: trusted
+        run: >-
+          python3 -m tools.corpus_gate.cloud cleanup
+          --path "$GATE" --repo-dir . --image "$SANDBOX_IMAGE" --require-docker
+
+      - name: Upload report.txt and result.json
+        if: always() && steps.stage.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-gate-${{ inputs.candidate_sha }}
+          path: |
+            ${{ runner.temp }}/losslift-gate-upload/report.txt
+            ${{ runner.temp }}/losslift-gate-upload/result.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        working-directory: trusted
+        env:
+          GATE_CODE: ${{ steps.gate.outputs.code }}
+          RECHECK: ${{ steps.recheck.outcome }}
+          PR_MOVED: ${{ steps.recheck.outputs.moved }}
+        run: >-
+          python3 -m tools.corpus_gate.cloud summary
+          --baseline "$BASELINE" --candidate "$CANDIDATE" --pr "$PR_NUMBER"
+          --identity "$IDENTITY" --result "$UPLOAD/result.json"
+          --exit-code "$GATE_CODE" --recheck "$RECHECK" --pr-moved "$PR_MOVED"
+          >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail unless the gate passed
+        if: always()
+        env:
+          GATE_CODE: ${{ steps.gate.outputs.code }}
+          RECHECK: ${{ steps.recheck.outcome }}
+          PR_MOVED: ${{ steps.recheck.outputs.moved }}
+          STAGED: ${{ steps.stage.outcome }}
+          CLEANED: ${{ steps.cleanup.outcome }}
+        run: |
+          test "$GATE_CODE" = "0" || { echo "corpus gate exit code: ${GATE_CODE:-not reached}"; exit 1; }
+          if [ -n "$PR_NUMBER" ]; then
+            test "$RECHECK" = "success" || { echo "the pull request head was not re-confirmed"; exit 1; }
+            test "$PR_MOVED" = "false" || { echo "the pull request head moved, or its re-check gave no answer"; exit 1; }
+          fi
+          test "$STAGED" = "success" || { echo "the outputs did not pass the privacy check"; exit 1; }
+          test "$CLEANED" = "success" || { echo "cleanup could not prove everything was removed"; exit 1; }

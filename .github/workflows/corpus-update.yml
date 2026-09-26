@@ -1,0 +1,157 @@
+# Grow the private corpus from the browser. See docs/cloud-corpus-gate.md.
+#
+#   propose  compare an intake release with the active corpus release and
+#            write a privacy-safe proposal. Reads only; admits nothing.
+#   publish  rebuild the proposal, require its review digest and the ids a
+#            person approved, and create a new versioned release. Runs in the
+#            `corpus-publish` environment, which requires a reviewer's
+#            approval in the browser before the job starts. It never changes
+#            which release is active: the LOSSLIFT_ACTIVE_CORPUS variable does.
+#
+# Only main's definition runs. No repository code under review is executed and
+# no PDF is parsed: files are hashed, sized and checked for the %PDF- marker.
+name: Corpus update
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: propose (review only) or publish (after approval)
+        required: true
+        type: choice
+        options: [propose, publish]
+        default: propose
+      active_tag:
+        description: Active corpus release (blank = the LOSSLIFT_ACTIVE_CORPUS variable)
+        required: false
+        type: string
+        default: ""
+      intake_tag:
+        description: Intake release carrying the new ZIP
+        required: true
+        type: string
+      new_tag:
+        description: "publish only: the new release, e.g. corpus-v2"
+        required: false
+        type: string
+        default: ""
+      approve_ids:
+        description: "publish only: approved candidate ids, comma-separated"
+        required: false
+        type: string
+        default: ""
+      review_digest:
+        description: "publish only: the review digest from the proposal"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-update
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    name: Propose a corpus update
+    if: inputs.action == 'propose' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: corpus-gate
+    timeout-minutes: 60
+    env:
+      ACTIVE_TAG: ${{ inputs.active_tag || vars.LOSSLIFT_ACTIVE_CORPUS }}
+      INTAKE_TAG: ${{ inputs.intake_tag }}
+    steps:
+      - name: Confirm this is main's definition
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: test "$WORKFLOW_REF" = "$REPOSITORY/.github/workflows/corpus-update.yml@refs/heads/main"
+
+      - name: Check out main (trusted code)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Compare the intake with the active corpus
+        working-directory: trusted
+        env:
+          LOSSLIFT_CORPUS_TOKEN: ${{ secrets.LOSSLIFT_CORPUS_TOKEN }}
+        run: >-
+          python3 -m tools.corpus_gate.intake propose
+          --active-tag "$ACTIVE_TAG" --intake-tag "$INTAKE_TAG"
+          --work "$RUNNER_TEMP/losslift-update" --report "$RUNNER_TEMP/proposal/proposal.md"
+
+      - name: Remove every document and manifest
+        if: always()
+        working-directory: trusted
+        run: python3 -m tools.corpus_gate.cloud cleanup --path "$RUNNER_TEMP/losslift-update"
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/proposal/proposal.md" ]; then
+            cat "$RUNNER_TEMP/proposal/proposal.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the proposal
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-proposal-${{ github.run_id }}
+          path: ${{ runner.temp }}/proposal/proposal.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+  publish:
+    name: Publish an approved corpus release
+    if: inputs.action == 'publish' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: corpus-publish
+    timeout-minutes: 60
+    env:
+      ACTIVE_TAG: ${{ inputs.active_tag || vars.LOSSLIFT_ACTIVE_CORPUS }}
+      INTAKE_TAG: ${{ inputs.intake_tag }}
+      NEW_TAG: ${{ inputs.new_tag }}
+      APPROVE_IDS: ${{ inputs.approve_ids }}
+      REVIEW_DIGEST: ${{ inputs.review_digest }}
+    steps:
+      - name: Confirm this is main's definition
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: test "$WORKFLOW_REF" = "$REPOSITORY/.github/workflows/corpus-update.yml@refs/heads/main"
+
+      - name: Check out main (trusted code)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Rebuild the proposal, check the approval, publish
+        working-directory: trusted
+        env:
+          LOSSLIFT_CORPUS_WRITE_TOKEN: ${{ secrets.LOSSLIFT_CORPUS_WRITE_TOKEN }}
+        run: >-
+          python3 -m tools.corpus_gate.intake publish
+          --token-variable LOSSLIFT_CORPUS_WRITE_TOKEN
+          --active-tag "$ACTIVE_TAG" --intake-tag "$INTAKE_TAG" --new-tag "$NEW_TAG"
+          --approve "$APPROVE_IDS" --review-digest "$REVIEW_DIGEST"
+          --work "$RUNNER_TEMP/losslift-update" --report "$RUNNER_TEMP/proposal/proposal.md"
+
+      - name: Remove every document and manifest
+        if: always()
+        working-directory: trusted
+        run: python3 -m tools.corpus_gate.cloud cleanup --path "$RUNNER_TEMP/losslift-update"
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/proposal/proposal.md" ]; then
+            cat "$RUNNER_TEMP/proposal/proposal.md" >> "$GITHUB_STEP_SUMMARY"
+          fi

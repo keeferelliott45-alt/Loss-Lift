@@ -11,6 +11,7 @@ stands. Where the result was written goes to stderr: it is a local path.
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from tools.corpus_gate import manifest as manifests
 from tools.corpus_gate.collect import error_name
 from tools.corpus_gate.manifest import SetupError
 from tools.corpus_gate.runner import DEFAULT_TIMEOUT, repo_root, run_gate
+from tools.corpus_gate.sandbox import DockerSandbox
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -43,6 +45,16 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--out", type=Path, default=None)
     run.add_argument("--repo", type=Path, default=Path.cwd())
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per run")
+    run.add_argument(
+        "--public-output",
+        action="store_true",
+        help="write only the publishable result: states, changed fields, claim count and status",
+    )
+    run.add_argument(
+        "--sandbox-image",
+        default=None,
+        help="run each collector in this local container image, with no network and no credentials",
+    )
     return parser
 
 
@@ -59,7 +71,16 @@ def _init(args: argparse.Namespace) -> int:
     return comparison.EXIT_PASS
 
 
+def _interrupted(signum, _frame):
+    # A cancelled CI job is sent SIGTERM. Raising here runs every ``finally``
+    # in the runner: collectors and their containers are stopped and every
+    # worktree and copy is removed, exactly as on Ctrl-C.
+    raise KeyboardInterrupt
+
+
 def _run(args: argparse.Namespace) -> int:
+    signal.signal(signal.SIGTERM, _interrupted)
+    sandbox = DockerSandbox(args.sandbox_image) if args.sandbox_image else None
     try:
         outcome = run_gate(
             repo=args.repo,
@@ -70,10 +91,18 @@ def _run(args: argparse.Namespace) -> int:
             allowlist_path=args.allowlist,
             out_dir=args.out,
             timeout=args.timeout,
+            sandbox=sandbox,
+            public=args.public_output,
         )
     except SetupError as error:
         print(f"LossLift real-corpus gate: FAIL (exit 3)\n\n{error}")
         return comparison.EXIT_SETUP
+    except KeyboardInterrupt:
+        print(
+            "LossLift real-corpus gate: FAIL (exit 4: the run stopped before it finished)\n\n"
+            "Interrupted. Nothing was compared."
+        )
+        return comparison.EXIT_EXECUTION
     except Exception as error:  # noqa: BLE001 - the run stopped; its collectors already have
         # Named by type alone, as a crash in a collector is: the message of an
         # error raised this far in can quote a corpus path.

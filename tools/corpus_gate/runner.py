@@ -24,9 +24,22 @@ every collector still running is killed and reaped before any worktree, copy
 or temporary file is removed, so nothing is deleted from under a live process
 and no process outlives the gate.
 
+No collector is given the salt. The revision's code runs inside the
+collector's process, so the collector writes each digest slot as the text to
+be digested, and this process -- which holds the salt and runs no revision
+code -- checks every line against a strict schema and keys the digests
+itself (``seal.py``). An output outside the schema fails the run.
+
 Collector output streams are discarded, never shown and never stored: a
 traceback can quote the cell that caused it. What a revision did is read only
 from the measurements it wrote.
+
+Given a ``sandbox``, each collector runs in a container of its own instead
+(see ``sandbox.py``): no network, no inherited environment, and nothing
+mounted but its worktree, the collector, the snapshot and the document list,
+read-only, plus its own output and scratch directories. Each collector writes
+into a directory of its own, so neither revision can touch the other's
+measurements.
 """
 
 from __future__ import annotations
@@ -45,7 +58,9 @@ from pathlib import Path
 
 from tools.corpus_gate import compare as comparison
 from tools.corpus_gate import manifest as manifests
+from tools.corpus_gate import seal
 from tools.corpus_gate.manifest import SetupError
+from tools.corpus_gate.sandbox import DockerSandbox
 
 COLLECTOR = Path(__file__).with_name("collect.py")
 DEFAULT_TIMEOUT = 3600.0
@@ -105,13 +120,12 @@ def _launch(
     documents: Path,
     out: Path,
     scratch: Path,
-    salt: bytes,
     collectors: list[subprocess.Popen],
+    sandbox: DockerSandbox | None = None,
+    snapshot: Path | None = None,
+    containers: dict[int, str] | None = None,
 ) -> subprocess.Popen:
-    env = dict(os.environ)
-    for key in ("PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT"):
-        env.pop(key, None)
-    env.update(
+    isolated = dict(
         PYTHONPATH=str(worktree),
         PYTHONSAFEPATH="1",
         PYTHONHASHSEED="0",
@@ -120,18 +134,33 @@ def _launch(
         TEMP=str(scratch),
         TMP=str(scratch),
     )
+    argv = ["-P", str(COLLECTOR), "--root", str(worktree), "--documents", str(documents),
+            "--out", str(out)]
+    if sandbox is None:
+        env = dict(os.environ)
+        for key in ("PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT"):
+            env.pop(key, None)
+        env.update(isolated)
+        command = [sys.executable, *argv]
+        name = None
+    else:
+        # The client gets the host environment it needs to reach the engine;
+        # the container gets ``isolated`` and nothing else.
+        env = dict(os.environ)
+        assert snapshot is not None and containers is not None
+        name = sandbox.new_name()
+        writable = [out.parent, scratch]
+        sandbox.prepare(writable, [snapshot])
+        command = sandbox.command(
+            name=name,
+            argv=argv,
+            env={**isolated, "HOME": str(scratch)},
+            read_only=[worktree, COLLECTOR, snapshot, documents],
+            writable=writable,
+            workdir=worktree,
+        )
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-P",
-            str(COLLECTOR),
-            "--root",
-            str(worktree),
-            "--documents",
-            str(documents),
-            "--out",
-            str(out),
-        ],
+        command,
         cwd=str(worktree),
         env=env,
         stdin=subprocess.PIPE,
@@ -140,24 +169,39 @@ def _launch(
         text=True,
     )
     collectors.append(process)  # tracked before anything else can fail
+    if name is not None:
+        containers[process.pid] = name
     assert process.stdin is not None
     with process.stdin as pipe:
-        pipe.write(salt.hex() + "\n")
+        pipe.write(collect_raw_mode() + "\n")
     return process
 
 
-def _stop(collectors: list[subprocess.Popen]) -> None:
+def collect_raw_mode() -> str:
+    """What a collector is told on stdin: never the salt."""
+    return "raw"
+
+
+def _stop(
+    collectors: list[subprocess.Popen],
+    sandbox: DockerSandbox | None = None,
+    containers: dict[int, str] | None = None,
+) -> None:
     """Kill every collector still running, then reap them all.
 
     Nothing a collector uses is removed before this returns: a collector left
     running would go on reading from a directory being deleted under it, with
-    nobody left to notice.
+    nobody left to notice. A sandboxed collector's container is removed as
+    well, running or not: killing its client leaves the container running.
     """
     for process in collectors:
         if process.poll() is None:
             process.kill()
     for process in collectors:
         process.wait()
+    if sandbox is not None and containers:
+        for name in containers.values():
+            sandbox.stop(name)
 
 
 def _clean_up(root: Path, worktrees: list[Path], scratch: Path) -> None:
@@ -226,6 +270,8 @@ def run_gate(
     allowlist_path: Path | None = None,
     out_dir: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    sandbox: DockerSandbox | None = None,
+    public: bool = False,
 ) -> GateRun:
     """Verify the corpus, snapshot it, measure both revisions, compare, and write the result.
 
@@ -259,6 +305,7 @@ def run_gate(
     }
     scratch = Path(tempfile.mkdtemp(prefix="losslift-gate-")).resolve()
     collectors: list[subprocess.Popen] = []
+    containers: dict[int, str] = {}
     worktrees: list[Path] = []
     try:
         try:
@@ -279,14 +326,17 @@ def run_gate(
         for label in runs:
             private = scratch / f"{label}-tmp"
             private.mkdir()
+            (scratch / f"{label}-out").mkdir()
             processes[label] = (
                 _launch(
                     scratch / label,
                     documents,
-                    scratch / f"{label}.jsonl",
+                    scratch / f"{label}-out" / "measurements.jsonl",
                     private,
-                    manifest.salt,
                     collectors,
+                    sandbox,
+                    scratch / "snapshot",
+                    containers,
                 ),
                 time.monotonic(),
             )
@@ -300,9 +350,11 @@ def run_gate(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+                if sandbox is not None and process.pid in containers:
+                    sandbox.stop(containers[process.pid])
                 timed_out = True
             run.seconds = time.monotonic() - started
-            comparison.read_run(scratch / f"{label}.jsonl", run)
+            seal.read_run(scratch / f"{label}-out" / "measurements.jsonl", run, manifest)
             if timed_out:
                 run.process = f"timed out after {timeout:.0f} s"
             elif process.returncode != 0 and not run.fatal:
@@ -312,7 +364,7 @@ def run_gate(
         moved = manifests.changed_copies(manifest, copies)
     finally:
         try:
-            _stop(collectors)
+            _stop(collectors, sandbox, containers)
         finally:
             _clean_up(root, worktrees, scratch)
 
@@ -320,6 +372,14 @@ def run_gate(
         manifest, runs["baseline"], runs["candidate"], allowlist, changed_copies=moved
     )
     verified = len(manifest.entries)
+    if public:
+        # Published output: states, changed schema fields and two critical
+        # values, never a measurement, a timing or a raw record.
+        result = seal.public_result(outcome, manifest, verified, verification.unlisted)
+        report = seal.render_public(result)
+        target = out_dir or _default_out(manifest_path, base_sha, cand_sha)
+        _write(target, result, report)
+        return GateRun(outcome.exit_code, report, result, target)
     report = comparison.render(outcome, manifest, verified)
     if verification.unlisted:
         report += (
