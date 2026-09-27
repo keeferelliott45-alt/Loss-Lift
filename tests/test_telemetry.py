@@ -173,3 +173,13 @@ def test_a_document_awaiting_its_column_mapping_is_never_logged_clean(tmp_path, 
     edit_claims(result, records)
     events = telemetry.review_events(result, result.document.review_log.entries[logged:])
     assert events and all(e["review_status_after"] == "NEEDS_REVIEW" for e in events)
+
+
+def test_an_unmapped_packet_publishes_no_clean_run(tmp_path, monkeypatch):
+    """Codex P2 on 67e7624: per-run statuses take the pending mapping too."""
+    result = _packet(tmp_path)
+    before = telemetry.processed_event(result)["runs"]["items"]
+    assert any(item["status"] == "CLEAN" for item in before)
+    monkeypatch.setattr(type(result), "needs_mapping", property(lambda self: True))
+    after = telemetry.processed_event(result)["runs"]["items"]
+    assert after and all(item["status"] == "NEEDS_REVIEW" for item in after)

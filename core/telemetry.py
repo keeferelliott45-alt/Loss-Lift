@@ -202,7 +202,8 @@ def document_facts(result: Any) -> dict[str, Any]:
                     "incomplete": bool(run.incomplete),
                     "claims": len(document.run_claims(run)),
                     "printed_claim_count": run.printed_claim_count,
-                    "status": _token(canonical_run_status(reconciliation, run.run_id)),
+                    "status": _token(canonical_run_status(
+                        reconciliation, run.run_id, needs_mapping=_needs_mapping(result))),
                 }
                 for index, run in enumerate(runs, start=1)
             ] if packet else [],
