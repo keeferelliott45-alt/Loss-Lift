@@ -1650,7 +1650,7 @@ def _claims_in_two_runs(doc: LossRunDocument) -> list[Finding]:
             category=FindingCategory.EXTRACTION,
             scope=FindingScope.DOCUMENT,
             subject="document",
-            condition=f"across-runs:{number}",
+            condition=f"across-runs:{number}:{loss_date}",
             message=(
                 f"Claim {number} (loss date {loss_date}) is read in {', '.join(runs)}: "
                 f"the same claim counted twice across the packet, or two reports "

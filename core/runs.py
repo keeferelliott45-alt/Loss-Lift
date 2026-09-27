@@ -154,19 +154,56 @@ def identity_of(text: str | None, exclude: Iterable[str] = ()) -> str | None:
     return " ".join(words)
 
 
-def same_heading(one: str | None, other: str | None) -> bool | None:
-    """Whether two pages' headings name the same report; None if either is unknown.
+#: Words every loss run's heading may print whoever issued it: the kind of
+#: report, the insurer's corporate form, the lines of business, the labels
+#: around the facts. They say what a page is, not whose. What is left -- the
+#: carrier's name, the insured's -- is what names a report.
+GENERIC_WORDS = frozenset("""
+a about account all am an and as at by carrier claim claims co comp company
+companies compensation cont continued corp corporation coverage date dated
+detail details effective excluding experience for from general group history
+holdings in inc including insurance insured line lines list listing llc loss
+losses ltd named of on page period pm policy print printed report reports run
+runs section summary term the through thru time to total totals valuation
+valued with workers liability auto automobile property umbrella excess
+commercial physical damage professional package inland marine casualty
+specialty assurance indemnity underwriters mutual fire national business
+open closed status addendum schedule
+""".split())
 
-    By containment of their words: one page of a report may print a section
-    title or an "ADDENDUM" line the others do not, and a scanned page's
-    heading as the model transcribes it may be shorter than the text layer's
-    band -- but two different carriers, insureds or policies each print
-    something the other does not.
+
+def naming_words(identity: str | None) -> set[str]:
+    """The words of a heading that name whose report it is."""
+    if not identity:
+        return set()
+    return {word for word in identity.split() if word not in GENERIC_WORDS and len(word) > 1}
+
+
+def same_heading(one: str | None, other: str | None) -> bool | None:
+    """Whether two pages' headings name the same report; None if either names nothing.
+
+    A report's pages share the words that name it -- its carrier, its insured
+    -- whatever section title, "ADDENDUM" or "CONTINUED" line one of them
+    adds, and a scanned page's heading as the model transcribes it may be
+    shorter than the text layer's band. Two carriers' reports share none of
+    those words, however alike their generic lines ("LOSS RUN REPORT").
     """
-    if not one or not other:
+    first, second = naming_words(one), naming_words(other)
+    if not first or not second:
         return None
-    first, second = set(one.split()), set(other.split())
-    return first <= second or second <= first
+    return bool(first & second)
+
+
+def confirms(page: str | None, report: str | None) -> bool:
+    """Whether a page's heading carries everything the report's heading does.
+
+    It may add to it -- a section title, an "ADDENDUM" line -- but a heading
+    that drops words the report prints on its pages (its carrier's name, with
+    only a generic "Loss Run Report" left) does not confirm the page is that
+    report's: it may be another report whose name is only in its logo.
+    """
+    wanted, printed = naming_words(report), naming_words(page)
+    return bool(wanted) and wanted <= printed
 
 
 def heading_of(text: str | None, limit: int = 120) -> str | None:
@@ -331,17 +368,18 @@ class _Planner:
         return count, None
 
     def interrupted(self, labels: Sequence[Pagination]) -> _Segment | None:
-        """The report a run of pages without claims tables interrupted, if this
-        page continues its numbering -- an ACORD form bound inside a report
-        numbers itself "1 of 1" and does not end the report around it."""
-        if self.current is None or self.current.tables:
+        """The report other pages interrupted, if this page continues its own
+        numbering -- an ACORD form bound inside a report numbers itself "1 of 1"
+        and does not end the report around it, and pages bound between a
+        report's page 1 and its page 2 do not take its numbering from it."""
+        if self.current is None:
             return None
         for segment in reversed(self.segments):
-            if segment is self.current or not segment.tables:
+            if segment is self.current or not segment.numbered or not segment.tables:
                 continue
-            if segment.numbered and segment.continued_by(labels) is not None:
-                return segment
-            return None
+            if segment.exhausted:
+                return None
+            return segment if segment.continued_by(labels) is not None else None
         return None
 
     # -- the walk ----------------------------------------------------------
@@ -365,17 +403,25 @@ class _Planner:
         current = self.current
         continuing = current.continued_by(labels) if current is not None else None
         openers = [label for label in labels if label.index == 1]
-        if (continuing is not None and not current.tables
-                and any(label.count < continuing.count for label in openers)):
-            # Pages carrying no claims table, numbered only by a packet-wide
-            # stamp, and then a report's own page 1 inside that stamp: the
-            # numbering followed so far was the packet's.
+        if (continuing is not None
+                and any(label.count < continuing.count for label in openers)
+                and (not current.tables
+                     or same_heading(page_evidence.identity, current.identity) is False)):
+            # A report's own page 1 inside a larger numbering that carries on
+            # -- after pages carrying no claims table, or under a heading
+            # naming another report: the numbering followed so far was the
+            # packet's, not a report's.
             self.stamps[continuing.count] = continuing.index
             labels = [label for label in labels if label is not continuing]
             continuing = None
         if continuing is not None:
             self.add(current, page)
             current.track = (continuing.index, continuing.count)
+            if same_heading(page_evidence.identity, current.identity) is False:
+                # The numbering carries on under a heading naming something
+                # else -- a packet-wide count, or a report whose summary and
+                # detail pages differ. Kept together; not confirmed.
+                current.blind.add(page)
             return
 
         resumed = self.interrupted(labels)
@@ -454,6 +500,10 @@ class _Planner:
                       if 1 <= item.index - 1 <= len(current.pages)), None)
         if label is None:
             return False
+        moved_first = current.pages[-(label.index - 1)]
+        if same_heading(self.page_evidence(moved_first).identity,
+                        self.page_evidence(page).identity) is False:
+            return False  # those pages name another report
         back = label.index - 1
         moved = current.pages[-back:]
         current.pages = current.pages[:-back]
@@ -514,7 +564,7 @@ class _Planner:
                 and (next_label is None or next_label.index == 1))
         if exact or fits:
             self.add(current, page)
-            if not exact and heading is None:
+            if not exact and not confirms(page_evidence.identity, current.identity):
                 current.blind.add(page)
             current.track = (index + 1, count)
             current.evidence.append(RunBoundary(
@@ -604,7 +654,7 @@ def plan_runs(
                      (f"numbering restarts on page {segment.pages[0]} and nothing on it "
                       f"names another report: read as a section of the same report"),
             ))
-            if heading is None:
+            if not confirms(segment.identity, previous.identity):
                 previous.blind.update(segment.pages)
             continue
         merged.append(segment)

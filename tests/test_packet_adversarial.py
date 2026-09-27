@@ -479,3 +479,136 @@ def test_e6_every_page_prints_page_1_of_1_letterhead_on_page_one_only(tmp_path):
     ])
     assert result.reconciliation.status is DocumentStatus.CLEAN, (
         f"runs={_runs(result)} rules={_rules(result)}")
+
+
+# Round 3: headings that name nothing (a logo letterhead) and interleaved reports.
+
+LOGO_ONLY = LETTER                      # carrier name is an image: generic words only
+BARE = [(r[0], r[1], r[2], "", "", "") for r in SMALL_RUN]   # claims without amounts
+
+
+def _named_or_read(result, rows):
+    return {row[0]: _claim_read_or_named(result, row[0]) for row in rows}
+
+
+def _msg(result):
+    refused = [r.identifier for r in result.document.refused_claim_rows]
+    return (f"runs={_runs(result)} claims={_numbers(result)[-3:]} refused={refused} "
+            f"status={result.reconciliation.status.value} rules={_rules(result)}")
+
+
+def test_r3_1_logo_carrier_inside_a_truncated_reports_count(tmp_path):
+    """A prints "Page 1 of 3" but only page 1 is bound; B (logo letterhead, no
+    numbering, claims without amounts) follows. B's band words are a subset of
+    A's, so B "fits" A's count as page 2, not blind; its claims are refused,
+    and with one run and a bounded vote nothing reports them."""
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": _large_run(8)},
+        {"top": LOGO_ONLY, "headers": SMALL_HEADERS, "rows": BARE[:1]},
+    ])
+    seen = _named_or_read(result, BARE[:1])
+    assert all(ok for ok, _ in seen.values()), _msg(result)
+
+
+def test_r3_2_two_logo_carriers_restarting_numbering_merge_as_sections(tmp_path):
+    """Two one-page reports, each "Page 1 of 1", both carriers printing logos.
+    Same (generic) heading, previous exhausted: merged as a section, not
+    blind. B's claims are refused by the pooled vote and nothing names them."""
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", *LOGO_ONLY), "rows": _large_run(8)},
+        {"top": ("Page 1 of 1", *LOGO_ONLY), "headers": SMALL_HEADERS, "rows": BARE[:1]},
+    ])
+    seen = _named_or_read(result, BARE[:1])
+    assert all(ok for ok, _ in seen.values()), _msg(result)
+
+
+def test_r3_3_packet_stamp_is_the_first_reports_only_numbering(tmp_path):
+    """A prints no numbering of its own; the merge tool's stamp "Page k of 3"
+    is the only label on its pages, so the planner tracks the stamp as A's
+    numbering. B's page prints its own "Page 1 of 1" and the stamp "Page 3 of
+    3"; the stamp continues A's track (A has tables, so the stamp rule does
+    not fire) and B is swallowed into A's run and outvoted."""
+    large = _large_run(16)
+    result = _read(tmp_path, [
+        {"top": (LARGE_CARRIER, *LETTER), "rows": large[:8], "bottom": ("Page 1 of 3",)},
+        {"top": (LARGE_CARRIER, *LETTER), "rows": large[8:], "bottom": ("Page 2 of 3",)},
+        {"top": ("Page 1 of 1", "HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+         "headers": SMALL_HEADERS, "rows": list(SMALL_RUN[:2]), "bottom": ("Page 3 of 3",)},
+    ])
+    assert _numbers(result)[-2:] == [SMALL_RUN[0][0], SMALL_RUN[1][0]], _msg(result)
+
+
+def test_r3_4_resume_after_another_carriers_unnumbered_report(tmp_path):
+    """A "Page 1 of 3" / B (other carrier, unnumbered) / A "2 of 3", "3 of 3"
+    with A's grand total. B's page is left out of A's count as unsettled: its
+    claim is read or named, and the packet needs review."""
+    large = _large_run(12)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": large[:4]},
+        {"top": ("HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+         "headers": SMALL_HEADERS, "rows": list(SMALL_RUN[:1])},
+        {"top": ("Page 2 of 3", LARGE_CARRIER, *LETTER), "rows": large[4:8]},
+        {"top": ("Page 3 of 3", LARGE_CARRIER, *LETTER), "rows": large[8:],
+         "total": _total(large)},
+    ])
+    ok, _ = _claim_read_or_named(result, SMALL_RUN[0][0])
+    assert ok, _msg(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW, _msg(result)
+
+
+def test_r3_5_single_report_sections_by_line_of_business(tmp_path):
+    """One carrier's account loss run, a section per line of business, each
+    numbered from 1, grand total closing the last. The section titles differ
+    by words, so neither band is a subset of the other: two runs, and the
+    grand total is checked against the last section alone. Must stay single."""
+    a, b = _large_run(6), _large_run(4, first=71005500)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "AUTOMOBILE LIABILITY", *LETTER), "rows": a},
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "PHYSICAL DAMAGE", *LETTER), "rows": b,
+         "total": _total([*a, *b])},
+    ])
+    assert result.document.runs == [], _msg(result)
+    assert result.reconciliation.status is DocumentStatus.CLEAN, _msg(result)
+
+
+def test_r3_6_single_report_with_a_running_head_on_continuation_pages(tmp_path):
+    """Full letterhead and "Page 1 of 2" on page 1 only; page 2 carries the
+    running head "NORTHFIELD AUTO INSURANCE COMPANY - CONTINUED". Neither band
+    contains the other, so page 2 is "under another heading": unsettled
+    (R-28) and the total is checked against page 2 alone. Must stay single."""
+    large = _large_run(8)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 2", LARGE_CARRIER, *LETTER), "rows": large[:4]},
+        {"top": (f"{LARGE_CARRIER} - CONTINUED",), "rows": large[4:],
+         "total": _total(large)},
+    ])
+    assert result.document.runs == [], _msg(result)
+    assert result.reconciliation.status is DocumentStatus.CLEAN, _msg(result)
+
+
+def test_r3_7_same_length_report_under_a_logo_after_a_truncated_one(tmp_path):
+    """A prints "Page 1 of 2" (its page 2 is missing); B, a logo carrier,
+    prints "Page 1 of 2" and "Page 2 of 2". B's opener is taken for a
+    back-reference (same count, 'same' heading) and B's page 1 is read as A's
+    page 2; B's page 2 then breaks the count. B's claims are refused."""
+    large = _large_run(8)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 2", LARGE_CARRIER, *LETTER), "rows": large},
+        {"top": ("Page 1 of 2", *LOGO_ONLY), "headers": SMALL_HEADERS,
+         "rows": list(SMALL_RUN[:1])},
+        {"top": ("Page 2 of 2", *LOGO_ONLY), "headers": SMALL_HEADERS,
+         "rows": list(SMALL_RUN[1:2])},
+    ])
+    assert _numbers(result)[-2:] == [SMALL_RUN[0][0], SMALL_RUN[1][0]], _msg(result)
+
+
+def test_r3_8_blind_page_inside_the_count_is_named(tmp_path):
+    """GUARD: B with no letterhead at all inside A's count is joined blind,
+    and its refused claim (no amounts) is named by R-29."""
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": _large_run(8)},
+        {"top": (), "headers": SMALL_HEADERS, "rows": BARE[:1]},
+    ])
+    seen = _named_or_read(result, BARE[:1])
+    assert all(ok for ok, _ in seen.values()), _msg(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW

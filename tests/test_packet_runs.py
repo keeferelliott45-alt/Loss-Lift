@@ -416,7 +416,7 @@ def test_the_same_claim_read_in_two_runs_is_counted_once_or_reviewed(tmp_path):
          {"marker": "Page 1 of 1"}),
     ])
     across = [f for f in result.reconciliation.findings
-              if f.rule_id == "R-11" and f.condition == "across-runs:40117"]
+              if f.rule_id == "R-11" and f.condition.startswith("across-runs:40117:")]
     assert len(across) == 1 and "run-1, run-2" in across[0].message
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
@@ -904,8 +904,11 @@ def test_headings_are_compared_by_what_each_names():
     from core.runs import same_heading
 
     report = identity_of("NORTHWIND MUTUAL LOSS RUN REPORT Valuation Date")
-    assert same_heading(report, identity_of("NORTHWIND MUTUAL LOSS RUN REPORT ADDENDUM")) is False
+    # A section line the report adds is still that report: it names the same carrier.
+    assert same_heading(report, identity_of("NORTHWIND MUTUAL LOSS RUN REPORT ADDENDUM")) is True
     assert same_heading(report, identity_of("NORTHWIND MUTUAL")) is True
+    # Generic words alone name nothing, so they neither join nor separate.
+    assert same_heading(report, identity_of("LOSS RUN REPORT CONTINUED")) is None
     assert same_heading(identity_of("LOSS RUN REPORT NORTHWIND MUTUAL"),
                         identity_of("LOSS RUN REPORT HARBOR CREST")) is False
     assert same_heading(report, None) is None
@@ -916,8 +919,8 @@ def test_numbering_on_a_recognised_scan_is_a_reading(tmp_path):
     from core.runs import OCR, Pagination, PageEvidence as Evidence, plan_packet
 
     evidence = {
-        1: Evidence(1, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="a"),
-        2: Evidence(2, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="b"),
+        1: Evidence(1, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="alpha harbor"),
+        2: Evidence(2, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="beta crest"),
     }
     plan = plan_packet([1, 2], evidence, {1, 2})
     assert [run.confidence for run in plan.runs] == [RunConfidence.MODEL] * 2
@@ -933,3 +936,97 @@ def test_the_model_must_state_the_numbers_it_reports():
     assert label("1 of 3", 1, 3).page_label_index is None     # not page numbering to the text layer either
     assert label("Pg. 2 of 3", 2, 3).page_label_index == 2
     assert label("Sheet 1 of 4", 1, 4).page_label_count == 4
+
+
+def test_a_claim_repeated_under_two_loss_dates_across_runs_is_two_findings():
+    """One report bound twice, a claim number repeating with two loss dates:
+    two findings with their own identities -- never a crash."""
+    from core.reconcile import reconcile
+    from core.schema import Claim, LogicalRun, LossRunDocument
+    from datetime import date
+
+    def claim(page, row, loss):
+        return Claim(claim_number="X1", date_of_loss=loss, source_page=page, source_row=row,
+                     incurred_total=Decimal("1"), paid_total=Decimal("1"), reserve_total=Decimal("0"))
+
+    runs = [LogicalRun(run_id=f"run-{n}", pages=[n], confidence=RunConfidence.PRINTED)
+            for n in (1, 2, 3)]
+    document = LossRunDocument(
+        source_filename="x.pdf", file_sha256="0" * 64, page_count=3, runs=runs,
+        claims=[claim(1, 1, date(2022, 1, 5)), claim(1, 2, date(2022, 2, 5)),
+                claim(2, 1, date(2022, 1, 5)), claim(3, 1, date(2022, 2, 5))],
+    )
+    across = [f for f in reconcile(document).findings if f.condition.startswith("across-runs:")]
+    assert len(across) == 2
+
+
+def test_a_generic_heading_does_not_confirm_a_page_belongs_to_the_report():
+    """A report prints "ACME Insurance Loss Run Report"; unnumbered pages after
+    its "2 of 5" print only "Loss Run Report" -- another report whose name is
+    in a logo, perhaps. They are kept with it, but marked unconfirmed, so any
+    claim its vote refuses there is reported."""
+    from core.runs import plan_packet
+
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 5", "footer")),
+                        identity=identity_of("ACME Insurance Loss Run Report")),
+        2: PageEvidence(2, paginations=tuple(paginations_in("Page 2 of 5", "footer")),
+                        identity=identity_of("ACME Insurance Loss Run Report")),
+        3: PageEvidence(3, identity=identity_of("Loss Run Report")),
+        4: PageEvidence(4, identity=identity_of("Loss Run Report")),
+    }
+    plan = plan_packet([1, 2, 3, 4], evidence, {1, 2, 3, 4})
+    assert plan.runs == [] and plan.blind == {3, 4}
+
+
+def test_a_restart_under_a_generic_heading_is_an_unconfirmed_section():
+    from core.runs import plan_packet
+
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 1", "footer")),
+                        identity=identity_of("ACME Insurance Loss Run Report")),
+        2: PageEvidence(2, paginations=tuple(paginations_in("Page 1 of 1", "footer")),
+                        identity=identity_of("Loss Run Report")),
+    }
+    plan = plan_packet([1, 2], evidence, {1, 2})
+    assert plan.runs == [] and plan.blind == {2}
+
+
+def test_a_heading_change_under_continuing_numbering_is_unconfirmed():
+    from core.runs import plan_packet
+
+    evidence = {
+        n: PageEvidence(n, paginations=tuple(paginations_in(f"Page {n} of 4", "footer")),
+                        identity=identity_of("Carrier Alpha Loss Run" if n < 3
+                                             else "Carrier Beta Claims Listing"))
+        for n in (1, 2, 3, 4)
+    }
+    plan = plan_packet([1, 2, 3, 4], evidence, {1, 2, 3, 4})
+    assert plan.runs == [] and plan.blind == {3, 4}
+
+
+def test_refusals_on_unconfirmed_pages_are_reported(tmp_path):
+    """End to end: a numbered report, then an unnumbered report whose heading
+    is only a generic line the first one also prints. One vote, as nothing
+    splits them -- and the refused claim is named, not dropped."""
+    from tests.test_packet_p1_regressions import _page_ex
+
+    large = _large_run(12)
+    document = pymupdf.open()
+    _page_ex(document, "ACME INSURANCE", LARGE_HEADERS, large[:6], marker="Page 1 of 5")
+    _page_ex(document, "ACME INSURANCE", LARGE_HEADERS, large[6:], marker="Page 2 of 5")
+    page = document.new_page(width=612, height=792)
+    page.insert_text((LEFT, 64), "LOSS RUN REPORT", fontsize=9)
+    from tests.test_packet_claim_series import COLUMNS
+    for offset, label in zip(COLUMNS, SMALL_HEADERS):
+        page.insert_text((LEFT + offset, 120), label, fontsize=8.5)
+    for offset, cell in zip(COLUMNS, (SMALL_RUN[0][0], SMALL_RUN[0][1], SMALL_RUN[0][2], "", "", "")):
+        if cell:
+            page.insert_text((LEFT + offset, 134), cell, fontsize=8.5)
+    document.save(tmp_path / "generic.pdf")
+    document.close()
+    result = run_pipeline(tmp_path / "generic.pdf", use_vision=False,
+                          profiles_dir=tmp_path / "profiles")
+    named = any(SMALL_RUN[0][0] in f.message for f in result.reconciliation.findings)
+    assert SMALL_RUN[0][0] in _numbers(result) or named
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
