@@ -57,6 +57,21 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         },
         "printed_claim_count": {"type": "integer", "nullable": True},
         "valuation_date": {"type": "string", "nullable": True},
+        # Page furniture: what the page prints about which report it is part
+        # of. A packet binds several loss runs, and on a scan this is the only
+        # evidence of where one ends and the next begins.
+        "page_label": {
+            "type": "object",
+            "nullable": True,
+            "properties": {
+                "text": {"type": "string"},
+                "number": {"type": "integer"},
+                "of": {"type": "integer"},
+                "position": {"type": "string", "enum": ["header", "footer", "body"]},
+            },
+            "required": ["text", "number", "of", "position"],
+        },
+        "report_heading": {"type": "string", "nullable": True},
     },
     "required": ["headers", "rows"],
 }
@@ -140,6 +155,34 @@ def _claim_count(value: object) -> int | None:
         return None
     return value if value >= 0 else None
 
+def _whole(value: object) -> int | None:
+    """A positive whole number the model gave, or None -- never a bool or float."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 1 else None
+
+
+def _page_label(value: object) -> tuple[str, int, int, str] | None:
+    """The page numbering the model read in the furniture, if it is usable.
+
+    Only numbering the model places in the header or the footer is page
+    furniture. "Page 1 of 3" in a paragraph or a table cell is the page
+    talking about a page, and taking it for this page's number splits one
+    report in two -- so it is not kept. Nor is anything malformed: a number
+    past its own count, or a count that is not a whole number.
+    """
+    if not isinstance(value, dict):
+        return None
+    number, count = _whole(value.get("number")), _whole(value.get("of"))
+    position = str(value.get("position") or "").strip().lower()
+    if number is None or count is None or number > count:
+        return None
+    if position not in ("header", "footer"):
+        return None
+    text = clean_text(str(value.get("text") or "")) or f"Page {number} of {count}"
+    return text, number, count, position
+
+
 def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> RawTable:
     """Turn the model's JSON into the same RawTable the digital path produces.
 
@@ -183,6 +226,9 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
 
     count = _claim_count(data.get("printed_claim_count"))
     valuation = data.get("valuation_date")
+    label = _page_label(data.get("page_label"))
+    heading = data.get("report_heading")
+    heading = clean_text(heading) if isinstance(heading, str) else None
     return RawTable(
         page=page_number,
         headers=headers,
@@ -191,6 +237,11 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
         strategy="vision",
         printed_claim_count=count,
         valuation_date_text=clean_text(valuation) or None if valuation else None,
+        page_label=label[0] if label else None,
+        page_label_index=label[1] if label else None,
+        page_label_count=label[2] if label else None,
+        page_label_position=label[3] if label else None,
+        heading=heading or None,
     )
 
 

@@ -49,6 +49,7 @@ from core.schema import (
     ReconciliationResult,
     Severity,
     SourceMethod,
+    sum_present,
 )
 
 #: Column-order templates offered on the export screen.
@@ -255,15 +256,19 @@ def _cell_value(claim: Claim, field_name: str, source_path: Any = None) -> Any:
 
 def _findings_index(
     result: ReconciliationResult | None,
-) -> dict[tuple[str, str], Severity]:
-    """Which (claim, field) pairs carry a finding, and how bad."""
-    index: dict[tuple[str, str], Severity] = {}
+) -> dict[tuple[str | None, str, str], Severity]:
+    """Which (run, claim, field) triples carry a finding, and how bad.
+
+    The run is None on a single loss run. In a packet two runs can number a
+    claim alike, and a finding about one must not shade the other.
+    """
+    index: dict[tuple[str | None, str, str], Severity] = {}
     if result is None:
         return index
     for finding in result.findings:
         if not finding.claim_number or not finding.field:
             continue
-        key = (finding.claim_number, finding.field)
+        key = (finding.run_id, finding.claim_number, finding.field)
         current = index.get(key)
         if current is None or finding.severity is Severity.ERROR:
             index[key] = finding.severity
@@ -284,8 +289,11 @@ def _write_claims_sheet(
 ) -> None:
     findings = _findings_index(result)
     widths: dict[int, int] = {}
+    packet = document.is_packet
 
-    titles = [_title(name) for name in columns] + [
+    # A packet's rows say which of its loss runs they came from, and take the
+    # carrier, insured and policy that run printed where it printed them.
+    titles = [_title(name) for name in columns] + (["Run ID"] if packet else []) + [
         title for title, _ in _DOCUMENT_COLUMNS
     ]
     for column_index, title in enumerate(titles, start=1):
@@ -298,6 +306,8 @@ def _write_claims_sheet(
     document_values = _document_values(document)
 
     for row_index, claim in enumerate(document.claims, start=2):
+        run = document.run_of(claim.source_page) if packet else None
+        run_id = run.run_id if run is not None else None
         for column_index, field_name in enumerate(columns, start=1):
             value = _cell_value(claim, field_name, source_path)
             cell = sheet.cell(row=row_index, column=column_index, value=value)
@@ -307,7 +317,7 @@ def _write_claims_sheet(
             elif field_name in DATE_FIELDS:
                 cell.number_format = DATE_FORMAT
 
-            severity = findings.get((claim.claim_number, field_name))
+            severity = findings.get((run_id, claim.claim_number, field_name))
             if severity is Severity.ERROR:
                 cell.fill = _ERROR_FILL
             elif severity is not None:
@@ -321,7 +331,15 @@ def _write_claims_sheet(
             if value is not None:
                 widths[column_index] = max(widths[column_index], len(str(value)) + 2)
 
-        for offset, value in enumerate(document_values):
+        trailing = list(document_values)
+        if packet:
+            if run is not None:
+                for position, (_, attribute) in enumerate(_DOCUMENT_COLUMNS):
+                    printed = getattr(run, attribute, None)
+                    if printed:
+                        trailing[position] = printed
+            trailing.insert(0, run_id or "unassigned")
+        for offset, value in enumerate(trailing):
             column_index = len(columns) + 1 + offset
             cell = sheet.cell(row=row_index, column=column_index, value=value)
             if isinstance(value, date):
@@ -351,6 +369,9 @@ def _write_exceptions_sheet(
     headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
                "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note",
                "Subject", "Condition", "Category"]
+    packet = bool(result and result.run_status)
+    if packet:
+        headers.append("Run ID")
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
@@ -377,6 +398,8 @@ def _write_exceptions_sheet(
             finding.condition,
             finding.category.value,
         ]
+        if packet:
+            values.append(finding.run_id or "whole packet")
         for column_index, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)
             if column_index in (6, 7, 8) and isinstance(value, float):
@@ -391,6 +414,64 @@ def _write_exceptions_sheet(
     if not findings:
         sheet.cell(row=2, column=1, value="No exceptions. Every check passed.")
 
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
+def _write_runs_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    result: ReconciliationResult | None,
+) -> None:
+    """One row per loss run the packet binds: where it is, how that is known,
+    what it printed about itself, and whether it reconciles.
+
+    Written only for a packet. Every claim on the Claim Detail sheet names its
+    run, and every run's page range and evidence is here to check it against.
+    """
+    headers = [
+        "Run ID", "Pages", "Boundary evidence", "Settled", "Why not settled",
+        "Read by", "Carrier", "Named insured", "Policy number", "Valuation date",
+        "Claims read", "Printed claim count", "Printed incurred total",
+        "Extracted incurred total", "Status",
+    ]
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = len(title) + 2
+    statuses = result.run_status if result else {}
+    for row_index, run in enumerate(document.runs, start=2):
+        claims = document.run_claims(run)
+        printed = run.printed_totals.get("incurred_total")
+        extracted = sum_present(claim.incurred_total for claim in claims)
+        status = statuses.get(run.run_id)
+        values = [
+            run.run_id,
+            run.page_range,
+            "; ".join(item.text for item in run.evidence),
+            "no" if run.ambiguous else "yes",
+            run.ambiguity or "",
+            ", ".join(method.value for method in run.source_methods) or "none",
+            run.carrier or "",
+            run.named_insured or "",
+            run.policy_number or "",
+            run.valuation_date_text or "",
+            len(claims),
+            run.printed_claim_count if run.printed_claim_count is not None else "not printed",
+            float(printed) if printed is not None else "not printed",
+            float(extracted) if extracted is not None else None,
+            status.value if status is not None else "",
+        ]
+        for column_index, value in enumerate(values, start=1):
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            if column_index in (13, 14) and isinstance(value, float):
+                cell.number_format = MONEY_FORMAT
+            if run.ambiguous or status is DocumentStatus.NEEDS_REVIEW:
+                cell.fill = _FINDING_FILL
+            if value is not None:
+                widths[column_index] = max(widths[column_index], min(len(str(value)), 60) + 2)
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
 
@@ -648,6 +729,8 @@ def build_workbook(
     claims_sheet.title = "Claim Detail"
     _write_claims_sheet(claims_sheet, document, columns, result, source_path)
     _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
+    if document.is_packet:
+        _write_runs_sheet(workbook.create_sheet("Runs"), document, result)
     _write_large_loss_sheet(
         workbook.create_sheet("Large Loss"), document, large_loss_threshold
     )

@@ -53,6 +53,7 @@ from core.pipeline import (
 )
 from core.profiles import list_profiles, llm_enabled
 from core.account import UNNAMED_ACCOUNT, build_accounts
+from core.runs import runs_overview, unsettled_runs
 from core.summary import summarise_by_period
 from core.schema import (
     CANONICAL_FIELDS,
@@ -262,6 +263,12 @@ def _reconciliation_card(result: ExtractionResult) -> None:
             if printed_count is not None
             else f"{extracted_count} claims captured"
         )
+        if document.is_packet:
+            # Each run's count and total are its own; see "Loss runs" below.
+            count_line = (
+                f"{extracted_count} claims captured across {len(document.runs)} "
+                f"loss runs in this PDF"
+            )
         st.write(count_line)
 
         printed_incurred = document.printed_totals.get("incurred_total")
@@ -269,7 +276,8 @@ def _reconciliation_card(result: ExtractionResult) -> None:
         cols = st.columns(3)
         cols[0].metric(
             "Carrier total incurred",
-            f"{printed_incurred:,.2f}" if printed_incurred is not None else "not printed",
+            f"{printed_incurred:,.2f}" if printed_incurred is not None
+            else ("per run" if document.is_packet else "not printed"),
         )
         cols[1].metric("LossLift total incurred", f"{extracted_incurred:,.2f}")
         if printed_incurred is not None:
@@ -337,6 +345,8 @@ def _findings_table(result: ExtractionResult) -> None:
                 "Expected": _money(finding.expected),
                 "Actual": _money(finding.actual),
                 "Difference": _money(finding.delta),
+                **({"Run": finding.run_id or "whole packet"}
+                   if result.document.is_packet else {}),
             }
             for finding in findings
         ]
@@ -1191,6 +1201,26 @@ def _loss_snapshot(document) -> None:
         st.caption(f"No claims at or above {threshold:,.0f}.")
 
 
+def _runs_summary(result: ExtractionResult) -> None:
+    """The loss runs this PDF binds, when it binds more than one.
+
+    A single loss run shows nothing here. A packet shows each run's pages, how
+    its boundary is known and whether it reconciles, and names every page
+    range whose boundary the printed pages did not settle.
+    """
+    rows = runs_overview(result.document, result.reconciliation)
+    if not rows:
+        return
+    st.markdown(f"**Loss runs in this PDF ({len(rows)})**")
+    for run_id, pages, why in unsettled_runs(result.document):
+        st.warning(
+            f"Pages {pages} ({run_id}): where this loss run begins is not settled -- "
+            f"{why}. Its claims are kept and marked for review. Check the PDF and "
+            f"confirm which report these pages belong to before exporting."
+        )
+    st.dataframe(rows, hide_index=True, width="stretch")
+
+
 def _period_summary(document) -> None:
     """Claims by policy term — the loss history a submission actually asks for.
 
@@ -1345,6 +1375,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         _document_facts(result)
         _document_notes(result)
 
+    _runs_summary(result)
     _period_summary(result.document)
     _loss_snapshot(result.document)
 

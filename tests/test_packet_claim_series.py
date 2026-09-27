@@ -314,28 +314,43 @@ def test_a_run_judged_alone_is_voted_on_by_its_claim_rows(tmp_path):
     assert all(code in (claims[-1].loss_description or "") for code in CAUSE_CODES)
 
 
-def test_printed_page_numbers_mark_where_each_report_begins():
-    """The boundary evidence itself, read from each page's printed text."""
-    from core.pipeline import printed_runs
+def _evidence(page, *labels, heading=None, source="header"):
+    """What a page prints in its furniture, as the digital reader reports it."""
+    from core.runs import PageEvidence, heading_of, identity_of, paginations_in
 
-    pages = {
-        1: "Renewal submission\nCover letter",                     # before any report
-        2: "Loss Run Report\nPage 1 of 2",
-        3: "Page 2 of 2\nsee page 1 for the policy terms",         # prose is not a page number
-        4: "Account summary",                                      # an unnumbered cover page
-        5: "PAGE 1 OF 4   Printed 03/31/2023",
-        6: "Page 2 of 4",
-        7: "Packet page 7 of 40\nPage 1 of 1",                     # a packet stamp beside the report's own
+    found = tuple(item for label in labels for item in paginations_in(label, source))
+    return PageEvidence(page=page, paginations=found, identity=identity_of(heading),
+                        heading=heading_of(heading))
+
+
+def _plan(evidence, tables):
+    from core.runs import plan_runs
+
+    pages = sorted(evidence)
+    return [segment.pages for segment in plan_runs(pages, evidence, tables)]
+
+
+def test_printed_page_numbers_mark_where_each_report_begins():
+    """The boundary evidence itself: numbering in each page's furniture."""
+    evidence = {
+        1: _evidence(1, heading="Renewal submission cover letter"),     # before any report
+        2: _evidence(2, "Page 1 of 2", heading="Loss Run Report"),
+        3: _evidence(3, "Page 2 of 2", heading="Loss Run Report"),
+        4: _evidence(4, heading="Account summary"),                      # no claims table
+        5: _evidence(5, "PAGE 1 OF 4   Printed 03/31/2023", heading="Other Carrier"),
+        6: _evidence(6, "Page 2 of 4", heading="Other Carrier"),
+        7: _evidence(7, "Packet page 7 of 40", "Page 1 of 1", heading="Third Carrier"),
     }
-    assert printed_runs(pages) == {1: 0, 2: 1, 3: 1, 4: 1, 5: 2, 6: 2, 7: 3}
+    # Pages carrying no claims table are not runs of their own: the cover
+    # letter joins the first report and the account summary the report it
+    # follows.
+    assert _plan(evidence, {2, 3, 5, 6, 7}) == [[1, 2, 3, 4], [5, 6], [7]]
 
 
 def test_one_report_numbered_across_its_pages_is_one_run():
     """Page 1 opens the report and every later page continues it."""
-    from core.pipeline import printed_runs
-
-    pages = {n: f"Page {n} of 3" for n in (1, 2, 3)}
-    assert printed_runs(pages) == {1: 1, 2: 1, 3: 1}
+    evidence = {n: _evidence(n, f"Page {n} of 3", heading="Loss Run Report") for n in (1, 2, 3)}
+    assert _plan(evidence, {1, 2, 3}) == [[1, 2, 3]]
 
 
 # --------------------------------------------------------------------------

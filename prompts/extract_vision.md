@@ -50,3 +50,20 @@ Return exactly this JSON shape:
 
 Set `printed_claim_count` and `valuation_date` to `null` if the page does not
 print them.
+
+A PDF can bind several loss runs, so also report the page's furniture:
+
+- `page_label`: the page numbering the page prints about itself, such as
+  "Page 2 of 5", with `number` and `of` as integers and `position` set to
+  `"header"` or `"footer"` for where it is printed. Use `"body"` if the only
+  such text is in a paragraph, a table cell or an embedded form. Set the whole
+  field to `null` if the page prints no page numbering.
+- `report_heading`: the heading printed across the top of the page that names
+  the report (carrier, insured, policy), transcribed, or `null`.
+
+For example:
+
+```json
+"page_label": {"text": "Page 2 of 5", "number": 2, "of": 5, "position": "footer"},
+"report_heading": "Northwind Mutual Insurance Loss Run Report"
+```
