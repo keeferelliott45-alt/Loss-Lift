@@ -28,8 +28,10 @@ from typing import Sequence
 
 from core.schema import (
     LOCAL_REVIEWER,
+    DocumentStatus,
     Finding,
     LossRunDocument,
+    ReconciliationResult,
     ReviewAction,
     ReviewLog,
     Resolution,
@@ -44,7 +46,10 @@ __all__ = [
     "ReviewLog",
     "Resolution",
     "ReviewSummary",
+    "blocks_trust",
     "bucket_of",
+    "canonical_run_status",
+    "canonical_status",
     "finding_key",
     "resolution_for",
     "summarise_review",
@@ -73,6 +78,72 @@ UNDERWRITING = "underwriting"
 def bucket_of(finding: Finding) -> str:
     """Which of the three questions this finding belongs to."""
     return finding.category.value
+
+
+# --------------------------------------------------------------------------
+# The one status policy
+#
+# Every layer that says whether a document can be used without a person --
+# the queue, the review card, the workbook, a structured export, telemetry,
+# the corpus gate -- asks these functions and nothing else. The engine's own
+# ``ReconciliationResult.status`` answers a narrower question (did any rule
+# raise an ERROR) and is kept as the spec defines it; it is one input here,
+# never a substitute. A WARN that says the document could not be read cleanly
+# (an unreadable amount, a duplicate the extractor made) blocks trust exactly
+# as an ERROR does, so no layer can call such a document reconciled.
+# --------------------------------------------------------------------------
+
+
+def blocks_trust(finding: Finding) -> bool:
+    """Whether this finding alone stops the document being trusted unreviewed.
+
+    Financial and extraction findings do, at any severity; an underwriting
+    observation never does. An ERROR always does -- the schema forbids an
+    underwriting ERROR, and this holds even if that ever changes.
+    """
+    return bucket_of(finding) != UNDERWRITING or finding.severity.value == "ERROR"
+
+
+def canonical_status(
+    reconciliation: ReconciliationResult | None, *, needs_mapping: bool = False
+) -> DocumentStatus:
+    """CLEAN only when nothing anywhere says the document needs a person.
+
+    Fails closed: no reconciliation, a column mapping still to confirm, an
+    engine NEEDS_REVIEW, any run not clean, or any finding that blocks trust
+    each make it NEEDS_REVIEW.
+    """
+    if reconciliation is None or needs_mapping:
+        return DocumentStatus.NEEDS_REVIEW
+    if reconciliation.status is not DocumentStatus.CLEAN:
+        return DocumentStatus.NEEDS_REVIEW
+    if any(status is not DocumentStatus.CLEAN for status in reconciliation.run_status.values()):
+        return DocumentStatus.NEEDS_REVIEW
+    if any(blocks_trust(finding) for finding in reconciliation.findings):
+        return DocumentStatus.NEEDS_REVIEW
+    return DocumentStatus.CLEAN
+
+
+def canonical_run_status(
+    reconciliation: ReconciliationResult | None, run_id: str
+) -> DocumentStatus:
+    """One logical run's status under the same policy.
+
+    A finding carrying no run applies to every run of the packet: it was
+    raised about the whole document (or deduplicated because every run raised
+    it). A run the engine gave no status is not known to be clean.
+    """
+    if reconciliation is None:
+        return DocumentStatus.NEEDS_REVIEW
+    if reconciliation.run_status.get(run_id) is not DocumentStatus.CLEAN:
+        return DocumentStatus.NEEDS_REVIEW
+    if any(
+        blocks_trust(finding)
+        for finding in reconciliation.findings
+        if finding.run_id in (None, run_id)
+    ):
+        return DocumentStatus.NEEDS_REVIEW
+    return DocumentStatus.CLEAN
 
 
 @dataclass(frozen=True)

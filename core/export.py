@@ -38,7 +38,13 @@ if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
 from core.evidence import Evidence, EvidenceKind, claim_evidence, confirm_region
 
-from core.review import ReviewAction, ReviewLog, finding_key
+from core.review import (
+    ReviewAction,
+    ReviewLog,
+    canonical_run_status,
+    canonical_status,
+    finding_key,
+)
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -441,12 +447,11 @@ def _write_runs_sheet(
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         widths[column_index] = len(title) + 2
-    statuses = result.run_status if result else {}
     for row_index, run in enumerate(document.runs, start=2):
         claims = document.run_claims(run)
         printed = run.printed_totals.get("incurred_total")
         extracted = sum_present(claim.incurred_total for claim in claims)
-        status = statuses.get(run.run_id)
+        status = canonical_run_status(result, run.run_id) if result is not None else None
         values = [
             run.run_id,
             run.page_range,
@@ -634,7 +639,9 @@ def _write_source_sheet(
     redacted: bool,
     template: str,
 ) -> None:
-    status = result.status if result else DocumentStatus.CLEAN
+    # The same policy as the queue and the review card: a workbook must never
+    # call reconciled a document the app shows as needing review.
+    status = canonical_status(result)
     error_count = len(result.errors) if result else 0
     warn_count = len(result.warnings) if result else 0
 

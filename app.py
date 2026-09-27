@@ -24,9 +24,10 @@ import streamlit as st
 
 from core import export as export_module
 from core.review import (
-    finding_key,
-    bucket_of,
     ReviewAction,
+    bucket_of,
+    canonical_status,
+    finding_key,
     summarise_review,
 )
 from core.evidence import (
@@ -60,6 +61,7 @@ from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
     ClaimStatus,
+    DocumentStatus,
     Severity,
 )
 
@@ -122,8 +124,10 @@ def _status_pill(result: ExtractionResult) -> str:
     if result.needs_mapping:
         return '<span class="ll-pill ll-pill-mapping">Needs mapping</span>'
     data_issues, _flags = _split_findings(result.reconciliation.findings)
-    if not data_issues:
+    if canonical_status(result.reconciliation) is DocumentStatus.CLEAN:
         return '<span class="ll-pill ll-pill-clean">✓ Ready</span>'
+    if not data_issues:
+        return '<span class="ll-pill ll-pill-review">Review</span>'
     label = f"Review {len(data_issues)} issue{'s' if len(data_issues) != 1 else ''}"
     return f'<span class="ll-pill ll-pill-review">{label}</span>'
 
@@ -187,8 +191,8 @@ def _status_of(result: ExtractionResult) -> str:
     the open document never disagree about whether it is reconciled."""
     if result.needs_mapping:
         return "mapping"
-    data_issues, _flags = _split_findings(result.reconciliation.findings)
-    return "needs_review" if data_issues else "clean"
+    status = canonical_status(result.reconciliation)
+    return "clean" if status is DocumentStatus.CLEAN else "needs_review"
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +231,7 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     """
     document = result.document
     data_issues, flags = _split_findings(result.reconciliation.findings)
-    passed = not data_issues
+    passed = canonical_status(result.reconciliation) is DocumentStatus.CLEAN
 
     st.markdown(
         f"#### {document.carrier or 'Carrier unknown'}"

@@ -820,12 +820,13 @@ def runs_overview(document, result=None) -> list[dict[str, object]]:
     """One row per logical run, for the review screen. Empty for a single run."""
     if not document.is_packet:
         return []
-    statuses = result.run_status if result is not None else {}
+    from core.review import canonical_run_status
+
     rows = []
     for run in document.runs:
         claims = document.run_claims(run)
         printed = run.printed_totals.get("incurred_total")
-        status = statuses.get(run.run_id)
+        status = canonical_run_status(result, run.run_id) if result is not None else None
         rows.append({
             "Run": run.run_id,
             "Pages": run.page_range,
