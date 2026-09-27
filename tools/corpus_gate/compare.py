@@ -34,7 +34,7 @@ EXIT_SETUP = 3
 EXIT_EXECUTION = 4
 
 #: A change here is called out first: it is what a reviewer must see.
-CRITICAL = ("claim_count", "status")
+CRITICAL = ("claim_count", "status", "review_status")
 ABSENT = "<absent>"
 
 ALLOWLIST_VERSION = 1

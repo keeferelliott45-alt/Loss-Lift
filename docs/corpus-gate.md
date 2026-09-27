@@ -128,7 +128,10 @@ For every document, both commits' results are compared field by field:
 | Group | Compared as |
 | --- | --- |
 | `claim_count` | integer (**critical**) |
-| `status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) |
+| `status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) -- the engine's own status (any ERROR) |
+| `review_status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) -- the canonical trust status every layer shows (`core.review.canonical_status`); a revision that predates the function is measured under the same policy |
+| `runs` | number of logical runs, whether the document is a packet, unsettled and incomplete runs; for a packet, per run (keyed by position): run id, pages, boundary confidence, whether settled and complete, claims held and a digest of them, refused and unplaced rows on its pages, printed claim count, which printed totals it has, engine and canonical status, R-04 and R-05 counts, digests of its boundary evidence and of its own carrier/policy/term/valuation facts |
+| `refused` | claim-like rows the claim-number vote refused: count, how many a rule reports, per page, and a digest |
 | `pages` | processed, failed, skipped, unresolved and scanned page lists; page count; column-split pages; rows seen per page; a digest of each unresolved page's reason |
 | `unplaced` | count of rows whose money could not be placed, per page and in total; digest of their content |
 | `printed` | printed claim count; a digest per printed total column; unreadable totals, count evidence and printed sections, as counts and digests |
@@ -138,6 +141,13 @@ For every document, both commits' results are compared field by field:
 | `metadata` | a digest per document-level field (carrier, insured, policy, period, valuation date, locale, mapping, profile) |
 | `warnings` | count and digest |
 | per document | whether the pipeline raised or a measurement could not be taken, and the exception's type name |
+
+A document without logical runs is measured as one run however a revision
+represents it -- no `runs` attribute at all, `runs=[]`, or a single run -- and
+refused rows a revision does not record are measured as none. So moving from
+one representation to another is never a change in itself; a packet read as
+one report, or a claim moving between runs, is. A finding's identity includes
+its `run_id`, so the same rule on the same claim in two runs is two findings.
 
 A field one commit reports and the other does not is a change. Values are
 compared as JSON values, type included: `true` is not `1`, and `1` is not

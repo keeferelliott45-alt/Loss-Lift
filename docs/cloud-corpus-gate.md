@@ -92,7 +92,7 @@ What happens, in order:
    violation fails the run with exit 4.
 8. With `--public-output` the gate writes only the publishable result: per
    document its state, *which* schema fields changed (map keys collapsed to
-   `*`), and the before and after of the claim count and status. No other
+   `*`), and the before and after of the claim count, status and review status. No other
    measured value, no timing and no raw record. The staging step accepts
    nothing but that exact shape, re-serialises it, renders `report.txt` from it
    itself (the runner's report is never published), and checks both for
@@ -110,11 +110,12 @@ it fails with exit 4. Land the requirement on `main` first.
 
 **What is left.** A candidate that sets out to leak can still choose what the
 published result says, within its schema. Per document that is: its state
-(unchanged, changed or failed: 2 bits), which of the 87 known schema fields
-changed (87 bits), the claim count before and after (each at most 1,000,000:
-40 bits), the status before and after (`CLEAN`, `NEEDS_REVIEW` or `unlisted`:
-4 bits), and which builtin exception each revision raised (about 14 bits). That
-is at most 147 bits, under 19 bytes, per document per run, and only a run that
+(unchanged, changed or failed: 2 bits), which of the 117 known schema fields
+changed (117 bits), the claim count before and after (each at most 1,000,000:
+40 bits), the status and the review status before and after (`CLEAN`,
+`NEEDS_REVIEW` or `unlisted`: 8 bits), and which builtin exception each
+revision raised (about 14 bits). That is at most 181 bits, under 23 bytes, per
+document per run, and only a run that
 fails the gate publishes anything beyond the state. The test suite measures
 this: candidates that encode document bytes and the salt as huge integers,
 runs of small integers, page lists, map keys, exception names and status
