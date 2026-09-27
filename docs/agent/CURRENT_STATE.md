@@ -62,12 +62,10 @@ Grades: A strong · B reasonable · C weak · D effectively unprotected.
 | Single-run backward compatibility | A |
 
 Catastrophic blind spots found:
-1. **A claim row can vanish into another claim's description and the
-   document reads CLEAN.** Identifier refused by the vote + day/month-ambiguous
-   loss date + blank status + no amounts: `_row_establishes_claim_data` parses
-   dates with no date order, so the row is not claim-like and is folded as a
-   continuation line. R-19 notices the row-count gap but is categorised
-   `underwriting`, so it never blocks trust (and `trust_class` never sees it).
+1. ~~A claim row can vanish into another claim's description and the
+   document reads CLEAN.~~ Closed after `2e62e69` (Codex P1s): a refused row
+   is judged under the settled date order (either order when none is
+   settled), recorded and never folded; R-19 blocks trust.
 2. Per-run R-05 (printed count per run) works but no test pins it; one
    changed line in `run_view` would disable it silently.
 3. Vision: a clean scan always reads NEEDS_REVIEW (R-27; the model's count
@@ -81,7 +79,8 @@ Catastrophic blind spots found:
   are per document; per run they are only *checked* (borrowed-convention R-15).
 - Packet document header, Source Info and Loss Summary show page 1's facts.
 - Refused rows on a bounded single report are recorded but named by no rule.
-- R-19 (row-count gap) is an underwriting observation.
+- R-19 (row-count gap) is categorised underwriting (spec WARN) but blocks
+  trust through `UNACCOUNTED_RULES`.
 
 ## Intentional limitations
 
@@ -94,15 +93,13 @@ Catastrophic blind spots found:
 
 ## Highest-value next tasks
 
-1. Close blind spot 1: claim-like detection with the document's date order;
-   treat the R-19 row-count gap as blocking trust; tests first.
-2. Pin per-run R-05 and per-run printed facts with tests; mutation-check
+1. Pin per-run R-05 and per-run printed facts with tests; mutation-check
    `run_view`.
-3. Make the real corpus measurable (aggregate-only gate output; merge so the
+2. Make the real corpus measurable (aggregate-only gate output; merge so the
    run-aware collector runs in the cloud).
-4. Scanned path: adopt the model's claim count safely (R-27); carry vision
+3. Scanned path: adopt the model's claim count safely (R-27); carry vision
    recordings into the cloud gate.
-5. Stop column labels being read as carrier names (run facts, account
+4. Stop column labels being read as carrier names (run facts, account
    identity).
 
 ## Explicitly deferred

@@ -11,7 +11,8 @@ Coverage grades and blind spots per invariant: the coverage audit in
 - Every row with a well-formed identifier and a parsed loss date or status of
   its own is either read as a claim or recorded in
   `LossRunDocument.refused_claim_rows` — never only folded into another claim
-  (`pipeline.build_claims`, `_note_refusal`; property test
+  (`pipeline.build_claims`, `_note_refusal`, which reads dates under the
+  settled order or, with none settled, either order; property test
   `test_packet_runs.py::test_every_claim_like_row_becomes_a_claim_or_is_recorded`).
 - A row carrying money under mapped money columns that no claim took is an
   `UnplacedRow` and raises R-23 (`test_unplaced_money.py`).
@@ -81,7 +82,8 @@ Coverage grades and blind spots per invariant: the coverage audit in
 **Enforced.**
 - One policy: `core.review.canonical_status` / `canonical_run_status`.
   NEEDS_REVIEW on any financial or extraction finding at any severity, any
-  ERROR, any run not clean, a mapping to confirm, or no reconciliation.
+  ERROR, any `UNACCOUNTED_RULES` finding (R-19 included, though a WARN), any
+  run not clean, a mapping to confirm, or no reconciliation.
   App queue/pill/card, workbook Source Info and Runs sheets, runs overview,
   claim accounting, JSON export, telemetry and the gate all use it
   (`test_status_policy.py`).
@@ -101,7 +103,10 @@ Coverage grades and blind spots per invariant: the coverage audit in
 - Account rollup merges two appearances only when both runs name the same
   carrier and the same policy (number, or the term covering the loss);
   different carriers/policies are distinct claims; unknown carrier or policy
-  is kept apart and flagged `uncertain` (`test_account_safety.py`).
+  is kept apart and flagged `uncertain` (`test_account_safety.py`). An
+  appearance joins a history only when it is the same claim as *every*
+  appearance already in it (`account._joins`): a run naming no policy number
+  cannot bridge policy A and policy B.
 
 **Desired / not yet.**
 - The two layers deliberately differ (reconcile flags cross-carrier repeats;
