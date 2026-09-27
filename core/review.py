@@ -162,15 +162,16 @@ def trust_class(
 
 
 def canonical_run_status(
-    reconciliation: ReconciliationResult | None, run_id: str
+    reconciliation: ReconciliationResult | None, run_id: str, *, needs_mapping: bool = False
 ) -> DocumentStatus:
     """One logical run's status under the same policy.
 
     A finding carrying no run applies to every run of the packet: it was
     raised about the whole document (or deduplicated because every run raised
-    it). A run the engine gave no status is not known to be clean.
+    it). A run the engine gave no status is not known to be clean, and no run
+    of a document whose column mapping is still to be confirmed is.
     """
-    if reconciliation is None:
+    if reconciliation is None or needs_mapping:
         return DocumentStatus.NEEDS_REVIEW
     if reconciliation.run_status.get(run_id) is not DocumentStatus.CLEAN:
         return DocumentStatus.NEEDS_REVIEW
@@ -243,6 +244,20 @@ class ReviewSummary:
         return "reconciled"
 
 
+def review_bucket(finding: Finding) -> str:
+    """Which question a finding answers on screen, in step with the policy.
+
+    A finding's category is what the spec made it and is never rewritten. But
+    a summary must never call reconciled what :func:`blocks_trust` does not:
+    an underwriting-category finding that says a claim or page may be
+    unaccounted for (R-19) is shown with the reading problems, not the flags.
+    """
+    bucket = bucket_of(finding)
+    if bucket == UNDERWRITING and finding.rule_id in UNACCOUNTED_RULES:
+        return EXTRACTION
+    return bucket
+
+
 def summarise_review(
     findings: Sequence[Finding], log: ReviewLog | None = None
 ) -> ReviewSummary:
@@ -250,7 +265,7 @@ def summarise_review(
     log = log or ReviewLog()
     buckets: dict[str, list[Finding]] = {FINANCIAL: [], EXTRACTION: [], UNDERWRITING: []}
     for finding in findings:
-        buckets[bucket_of(finding)].append(finding)
+        buckets[review_bucket(finding)].append(finding)
 
     made = {name: Bucket(items, log.unresolved(items)) for name, items in buckets.items()}
     outstanding = sum(bucket.outstanding for bucket in made.values())

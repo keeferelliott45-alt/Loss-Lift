@@ -27,7 +27,7 @@ from core import export as export_module
 from core import telemetry
 from core.review import (
     ReviewAction,
-    bucket_of,
+    review_bucket,
     canonical_status,
     finding_key,
     summarise_review,
@@ -251,7 +251,7 @@ def _status_of(result: ExtractionResult) -> str:
 # add up; extraction rules ask whether the document could be read at all.
 # Together they are what blocks the reconciled badge -- exactly as before.
 def _is_data_issue(finding) -> bool:
-    return bucket_of(finding) != "underwriting"
+    return review_bucket(finding) != "underwriting"
 
 
 def _split_findings(findings: list) -> tuple[list, list]:

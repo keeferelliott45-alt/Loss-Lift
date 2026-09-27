@@ -195,3 +195,29 @@ def test_without_a_row_count_gap_the_same_document_is_clean():
     result = reconcile(_row_gap_document(seen=2))
     assert not [f for f in result.findings if f.rule_id == "R-19"]
     assert canonical_status(result) is DocumentStatus.CLEAN
+
+
+def test_a_run_awaiting_its_column_mapping_is_not_clean():
+    result = ReconciliationResult(status=DocumentStatus.CLEAN,
+                                  run_status={"run-1": DocumentStatus.CLEAN})
+    assert canonical_run_status(result, "run-1") is DocumentStatus.CLEAN
+    assert canonical_run_status(result, "run-1", needs_mapping=True) \
+        is DocumentStatus.NEEDS_REVIEW
+
+
+def test_every_summary_of_a_row_count_gap_agrees_with_the_policy():
+    """Codex P2 on 67e7624: the headline and the card follow blocks_trust.
+
+    R-19 keeps its underwriting category, but no summary may call a document
+    missing a claim row reconciled.
+    """
+    from core.review import review_bucket, summarise_review
+
+    result = reconcile(_row_gap_document(seen=3))
+    summary = summarise_review(result.findings)
+    assert summary.headline() == "not read cleanly"
+    gap = [f for f in result.findings if f.rule_id == "R-19"]
+    assert all(review_bucket(f) == "extraction" for f in gap)
+    assert all(f in summary.extraction.findings for f in gap)
+    assert not any(f in summary.underwriting.findings for f in gap)
+    assert all(f.category.value == "underwriting" for f in gap)
