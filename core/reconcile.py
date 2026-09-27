@@ -1521,14 +1521,24 @@ _DOCUMENT_WIDE = frozenset({"R-06", "R-15", "R-16", "R-18", "R-21", "R-22", "R-2
 def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
     """One loss run of a packet, as a document of its own for the rules.
 
-    Its claims, what it printed about itself, and the rows found on its
-    pages. What the document states once for every page -- page accounting,
-    the mapping, the valuation date -- is left as it is, so a finding about it
-    is the same finding in every run and is reported once.
+    Its claims, what it printed about itself -- carrier, insured, policy and
+    its term, line of business, valuation date, totals and count -- and the
+    rows found on its pages. Nothing is taken from another run's letterhead:
+    where the run does not say, the fact is unknown for it, so R-09 is not
+    judged against another report's term and R-06 is raised for a run that
+    prints no valuation date of its own. What the document states once for
+    every page -- page accounting, the mapping -- is left as it is, so a
+    finding about it is the same finding in every run and is reported once.
     """
     return doc.model_copy(update={
         "claims": doc.run_claims(run),
-        "valuation_date": run.valuation_date or doc.valuation_date,
+        "carrier": run.carrier,
+        "named_insured": run.named_insured,
+        "policy_number": run.policy_number,
+        "policy_period_start": run.policy_period_start,
+        "policy_period_end": run.policy_period_end,
+        "line_of_business": run.line_of_business,
+        "valuation_date": run.valuation_date,
         "printed_totals": dict(run.printed_totals),
         "printed_claim_count": run.printed_claim_count,
         "printed_count_evidence": list(run.printed_count_evidence),

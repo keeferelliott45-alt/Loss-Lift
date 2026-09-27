@@ -560,9 +560,14 @@ class LogicalRun(BaseModel):
     #: Pages carrying a claims table the run's claims were read from.
     table_pages: list[int] = Field(default_factory=list)
 
+    #: What this run printed about itself on its own pages -- never another
+    #: run's letterhead. None where the run does not say.
     carrier: str | None = None
     named_insured: str | None = None
     policy_number: str | None = None
+    policy_period_start: date | None = None
+    policy_period_end: date | None = None
+    line_of_business: LineOfBusiness | None = None
     valuation_date_text: str | None = None
     valuation_date: date | None = None
 

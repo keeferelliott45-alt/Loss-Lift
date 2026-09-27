@@ -1735,6 +1735,31 @@ def extract_metadata(page_text: str) -> DocumentMetadata:
     )
 
 
+def pages_metadata(page_texts: Mapping[int, str], first: int | None) -> DocumentMetadata:
+    """The letterhead facts one set of pages states about itself.
+
+    What :func:`extract_pdf` does for the whole document, over a logical run's
+    own pages: the letterhead of ``first`` (the run's first claims page), a
+    valuation date wherever on those pages it is printed, and every policy
+    period they declare. Nothing is read from any other page.
+    """
+    metadata = extract_metadata(page_texts.get(first, "") if first is not None else "")
+    if metadata.valuation_date_text is None:
+        for _, text in sorted(page_texts.items()):
+            found = _first_match(text, _VALUATION_PATTERNS)
+            if found:
+                metadata.valuation_date_text = found
+                break
+    seen: set[tuple[str, str]] = set()
+    for _, text in sorted(page_texts.items()):
+        for match in _PERIOD_PATTERN.finditer(text):
+            period = (clean_text(match.group(1)), clean_text(match.group(2)))
+            if period not in seen:
+                seen.add(period)
+                metadata.policy_periods.append(period)
+    return metadata
+
+
 # --------------------------------------------------------------------------
 # Whole-document entry point
 # --------------------------------------------------------------------------

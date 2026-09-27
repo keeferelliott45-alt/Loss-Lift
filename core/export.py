@@ -162,12 +162,12 @@ _DOCUMENT_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _plain(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
+
+
 def _document_values(document: LossRunDocument) -> list[Any]:
-    values: list[Any] = []
-    for _, attribute in _DOCUMENT_COLUMNS:
-        value = getattr(document, attribute, None)
-        values.append(value.value if hasattr(value, "value") else value)
-    return values
+    return [_plain(getattr(document, attribute, None)) for _, attribute in _DOCUMENT_COLUMNS]
 
 
 
@@ -339,11 +339,13 @@ def _write_claims_sheet(
 
         trailing = list(document_values)
         if packet:
-            if run is not None:
-                for position, (_, attribute) in enumerate(_DOCUMENT_COLUMNS):
-                    printed = getattr(run, attribute, None)
-                    if printed:
-                        trailing[position] = printed
+            # Only what this claim's own run printed: another run's carrier,
+            # term or valuation date on this row would be a wrong answer that
+            # looks right. Unknown for the run is left blank.
+            trailing = [
+                _plain(getattr(run, attribute, None)) if run is not None else None
+                for _, attribute in _DOCUMENT_COLUMNS
+            ]
             trailing.insert(0, run_id or "unassigned")
         for offset, value in enumerate(trailing):
             column_index = len(columns) + 1 + offset
@@ -439,7 +441,7 @@ def _write_runs_sheet(
         "Run ID", "Pages", "Boundary evidence", "Settled", "Why not settled",
         "Read by", "Carrier", "Named insured", "Policy number", "Valuation date",
         "Claims read", "Printed claim count", "Printed incurred total",
-        "Extracted incurred total", "Status",
+        "Extracted incurred total", "Status", "Policy term",
     ]
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
@@ -468,6 +470,8 @@ def _write_runs_sheet(
             float(printed) if printed is not None else "not printed",
             float(extracted) if extracted is not None else None,
             status.value if status is not None else "",
+            (f"{run.policy_period_start or '?'} to {run.policy_period_end or '?'}"
+             if run.policy_period_start or run.policy_period_end else "not printed"),
         ]
         for column_index, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)

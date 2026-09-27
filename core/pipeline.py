@@ -27,6 +27,7 @@ from core.extract_digital import (
     COUNTED_TOTAL_LABEL,
     DocumentMetadata,
     extract_metadata,
+    pages_metadata,
 )
 from core.ingest import IngestedFile, discard, ingest_path, verify_source_unchanged
 from core.normalize import (
@@ -1850,6 +1851,25 @@ _LOB_WORDS: tuple[tuple[str, LineOfBusiness], ...] = (
 )
 
 
+def _period_of(
+    metadata: DocumentMetadata, order: str | None
+) -> tuple[date | None, date | None]:
+    """The policy term a letterhead states, widened to every term its pages
+    declare -- the same reading the document's own term gets."""
+    start = parse_date(metadata.policy_period_start_text or "", order).value
+    end = parse_date(metadata.policy_period_end_text or "", order).value
+    declared = [
+        (start_value, end_value)
+        for start_text, end_text in metadata.policy_periods
+        if (start_value := parse_date(start_text, order).value) is not None
+        and (end_value := parse_date(end_text, order).value) is not None
+    ]
+    if len(declared) > 1:
+        start = min(item for item, _ in declared)
+        end = max(item for _, item in declared)
+    return start, end
+
+
 def _line_of_business(text: str | None) -> LineOfBusiness | None:
     if not text:
         return None
@@ -2406,14 +2426,17 @@ def _run_pipeline(
             texts, [entry["count"] for entry in counted]
         )
         run.printed_count_evidence = counted_claim_evidence(texts) + counted
-        # What the run's own first claims page says about it.
+        # What the run's own pages say about it -- its first claims page's
+        # letterhead, a valuation date or policy term printed on any of its
+        # pages -- and nothing another run printed.
         first = next((page for page in run.table_pages if page in texts), None)
-        if first is not None:
-            letterhead = extract_metadata(texts[first])
-            run.carrier = letterhead.carrier
-            run.named_insured = letterhead.named_insured
-            run.policy_number = letterhead.policy_number
-            run.valuation_date_text = letterhead.valuation_date_text
+        letterhead = pages_metadata(texts, first)
+        run.carrier = letterhead.carrier
+        run.named_insured = letterhead.named_insured
+        run.policy_number = letterhead.policy_number
+        run.line_of_business = _line_of_business(letterhead.line_of_business)
+        run.valuation_date_text = letterhead.valuation_date_text
+        run.policy_period_start, run.policy_period_end = _period_of(letterhead, header_order)
         if run.valuation_date_text is None:
             run.valuation_date_text = next(
                 (table.valuation_date_text for table in run_tables[run.run_id]
