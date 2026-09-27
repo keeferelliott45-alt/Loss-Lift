@@ -324,6 +324,23 @@ def _covers(source: Source, claim: Claim) -> bool:
     return any(start <= loss <= end for start, end in source.terms)
 
 
+def _joins(history: ClaimHistory, appearance: Appearance) -> str:
+    """How an appearance relates to a whole history, not just its latest entry.
+
+    Identity is not transitive: a run that names no policy number matches both
+    policy A and policy B by term, yet A and B are two claims. An appearance
+    joins a history only when it is the same claim as every appearance already
+    in it; distinct from every one, it is another claim; anything in between
+    is undecidable and must be reviewed.
+    """
+    relations = {same_claim(earlier, appearance) for earlier in history.appearances}
+    if relations == {SAME}:
+        return SAME
+    if relations == {DISTINCT}:
+        return DISTINCT
+    return UNKNOWN
+
+
 def build_account(
     name: str,
     documents: Sequence[LossRunDocument],
@@ -359,10 +376,9 @@ def build_account(
                 term=source.term_of(claim),
                 trusted=source.trusted,
             )
-            same = [h for h in histories
-                    if same_claim(h.appearances[-1], appearance) == SAME]
-            unknown = [h for h in histories
-                       if same_claim(h.appearances[-1], appearance) == UNKNOWN]
+            relations = [(h, _joins(h, appearance)) for h in histories]
+            same = [h for h, relation in relations if relation == SAME]
+            unknown = [h for h, relation in relations if relation == UNKNOWN]
             if len(same) == 1 and not unknown:
                 history = same[0]
                 history.appearances.append(appearance)

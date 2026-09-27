@@ -153,3 +153,32 @@ def test_the_account_workbook_says_whether_it_can_be_used():
     assert status[0][:2] == ("Acme Haulage", "Needs review")
     review = [row[-1] for row in book["Claims"].iter_rows(min_row=2, values_only=True)]
     assert all(review)
+
+
+def test_a_run_without_a_policy_number_does_not_bridge_two_policies():
+    """Codex P1 on 2e62e69: identity is checked against every appearance.
+
+    P-A, then the same claim in a run that names no policy (its term matches
+    both), then P-B. Comparing only with the latest appearance merged all
+    three into one history and reported development between two policies.
+    """
+    one = _doc("a.pdf", date(2023, 9, 30), [_claim("100", "1000.00")], policy="P-A")
+    two = _doc("b.pdf", date(2023, 12, 31), [_claim("100", "2000.00")], policy=None)
+    three = _doc("c.pdf", date(2024, 6, 30), [_claim("100", "9000.00")], policy="P-B")
+    account = build_account("Acme Haulage", [one, two, three], _clean(one, two, three))
+    assert not any(
+        {a.policy_number for a in history.appearances} >= {"P-A", "P-B"}
+        for history in account.histories
+    )
+    assert account.uncertain
+    assert account.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_run_without_a_policy_number_still_joins_one_policy():
+    one = _doc("a.pdf", date(2023, 9, 30), [_claim("100", "1000.00")], policy="P-A")
+    two = _doc("b.pdf", date(2023, 12, 31), [_claim("100", "2000.00")], policy=None)
+    three = _doc("c.pdf", date(2024, 6, 30), [_claim("100", "9000.00")], policy="P-A")
+    account = build_account("Acme Haulage", [one, two, three], _clean(one, two, three))
+    [history] = account.histories
+    assert history.development == Decimal("8000.00")
+    assert account.status is DocumentStatus.CLEAN
