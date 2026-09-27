@@ -1221,8 +1221,9 @@ def build_claims(
             # multiplies the count by however many lines each claim occupies.
             identifier = claim_identifier(row, table_mapping, shapes)
             if identifier is None:
-                if refused is not None:
-                    _note_refusal(row, table_mapping, source_method, refused)
+                refusal = refused is not None and _note_refusal(
+                    row, table_mapping, source_method, refused, date_order,
+                )
                 extra = clean_text(" ".join(row.cells))
                 # Numeric evidence is weighed before anything may absorb the
                 # row. A cell under a money column that carries digits and
@@ -1243,7 +1244,8 @@ def build_claims(
                         row, table_mapping, locale, warnings, unplaced, extra,
                         context=context,
                     )
-                elif (extra and claims and _continuation_text(row, table_mapping)
+                elif (extra and claims and not refusal
+                      and _continuation_text(row, table_mapping)
                       and _same_run(claims[-1], run, runs)):
                     previous = claims[-1]
                     previous.loss_description = clean_text(
@@ -1295,18 +1297,33 @@ def _note_refusal(
     mapping: ColumnMapping,
     method: SourceMethod,
     refused: list[RefusedClaimRow],
-) -> None:
-    """Record a row the vote refused if it reads as a claim in its own right."""
+    date_order: str | None = None,
+) -> bool:
+    """Record a row the vote refused if it reads as a claim in its own right.
+
+    Returns whether it was recorded; a recorded row is a claim-like row and
+    is never folded into the claim above it. Its dates are read under the
+    document's settled order, and where no order is settled a date valid in
+    either order still counts: ``03/04/2022`` is a date whichever way it is
+    read, and not knowing which is no reason to treat the row as prose.
+    """
     index = mapping.index_of("claim_number")
     if index is None:
-        return
+        return False
     cell = row.cell(index).strip()
-    if cell and is_identifier_candidate(cell) and _row_establishes_claim_data(
-        _row_values(row, mapping)
-    ):
-        refused.append(RefusedClaimRow(
-            page=row.page, row=row.line_index, identifier=cell, method=method,
-        ))
+    if not cell or not is_identifier_candidate(cell):
+        return False
+    values = _row_values(row, mapping)
+    orders = (date_order,) if date_order else ("mdy", "dmy")
+    if not (_row_establishes_claim_data(values) or any(
+        parse_date(values.get(field, ""), order).value is not None
+        for field in DATE_FIELDS for order in orders
+    )):
+        return False
+    refused.append(RefusedClaimRow(
+        page=row.page, row=row.line_index, identifier=cell, method=method,
+    ))
+    return True
 
 
 def _carries_numeric_evidence(
