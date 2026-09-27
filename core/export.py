@@ -919,3 +919,101 @@ def suggested_filename(document: LossRunDocument) -> str:
     valuation = document.valuation_date.isoformat() if document.valuation_date else "no-valuation-date"
     safe = "".join(ch if ch.isalnum() or ch in " -_." else "-" for ch in label).strip()
     return f"{safe} {valuation}.xlsx".replace("  ", " ")
+
+
+# --------------------------------------------------------------------------
+# Machine-readable export
+#
+# The same canonical objects the workbook is written from, as JSON: the
+# document, its logical runs, its claims with their provenance, the
+# reconciliation and every finding with what a reviewer decided about it, the
+# claim accounting, and the canonical status. Nothing is computed here that the
+# workbook does not also show; it exists so a spreadsheet is not the only way
+# out of LossLift. Redaction removes claimant names and loss descriptions
+# everywhere they are held -- the fields, their raw cells, their original
+# values and any review entry about them.
+# --------------------------------------------------------------------------
+
+JSON_SCHEMA = "losslift.result/1"
+
+
+def _redact_claim(record: dict[str, Any]) -> dict[str, Any]:
+    for name in REDACTED_FIELDS:
+        record.pop(name, None)
+        for holder in ("raw_cells", "original_values", "field_confidence", "field_issues",
+                       "original_issues"):
+            if isinstance(record.get(holder), dict):
+                record[holder].pop(name, None)
+        if isinstance(record.get("edited_fields"), list):
+            record["edited_fields"] = [f for f in record["edited_fields"] if f != name]
+    return record
+
+
+def build_json(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    *,
+    redact: bool = False,
+) -> dict[str, Any]:
+    """The canonical result as JSON-native data."""
+    from core.accounting import claim_accounting
+    from core.review import blocks_trust, trust_class
+
+    resolutions = {entry.key: entry.action.value for entry in document.review_log.entries}
+    claims = []
+    for claim in document.claims:
+        record = claim.model_dump(mode="json")
+        run = document.run_of(claim.source_page) if document.is_packet else None
+        record["run_id"] = run.run_id if run is not None else None
+        claims.append(_redact_claim(record) if redact else record)
+
+    review = []
+    for entry in document.review_log.entries:
+        record = entry.model_dump(mode="json")
+        if redact and entry.field in REDACTED_FIELDS:
+            record.update(before=None, after=None, note="", expected=None, actual=None,
+                          message="(redacted)")
+        review.append(record)
+
+    findings = []
+    for finding in result.findings if result is not None else []:
+        record = finding.model_dump(mode="json")
+        record["blocks_trust"] = blocks_trust(finding)
+        record["review"] = resolutions.get(finding_key(finding), "open")
+        findings.append(record)
+
+    header = document.model_dump(mode="json", exclude={
+        "claims", "runs", "review_log", "refused_claim_rows", "unplaced_rows"})
+    return {
+        "schema": JSON_SCHEMA,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "redacted": redact,
+        "status": {
+            "review_status": canonical_status(result).value,
+            "engine_status": result.status.value if result is not None else None,
+            "trust": trust_class(result),
+            "runs": {run.run_id: canonical_run_status(result, run.run_id).value
+                     for run in document.runs} if result is not None else {},
+        },
+        "document": header,
+        "runs": [run.model_dump(mode="json") for run in document.runs],
+        "accounting": [item.as_dict() for item in claim_accounting(document, result)],
+        "claims": claims,
+        "refused_claim_rows": [row.model_dump(mode="json") for row in document.refused_claim_rows],
+        "unplaced_rows": [row.model_dump(mode="json") for row in document.unplaced_rows],
+        "findings": findings,
+        "review_log": review,
+    }
+
+
+def to_json_bytes(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    *,
+    redact: bool = False,
+) -> bytes:
+    """The JSON export as UTF-8 bytes, for a download button."""
+    import json
+
+    return json.dumps(build_json(document, result, redact=redact), indent=2,
+                      sort_keys=True, ensure_ascii=False).encode("utf-8")

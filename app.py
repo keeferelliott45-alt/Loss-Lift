@@ -56,7 +56,8 @@ from core.pipeline import (
 )
 from core.profiles import list_profiles, llm_enabled
 from core.account import UNNAMED_ACCOUNT, build_accounts
-from core.runs import runs_overview, unsettled_runs
+from core.accounting import claim_accounting
+from core.runs import unsettled_runs
 from core.summary import summarise_by_period
 from core.schema import (
     CANONICAL_FIELDS,
@@ -1256,17 +1257,54 @@ def _runs_summary(result: ExtractionResult) -> None:
     its boundary is known and whether it reconciles, and names every page
     range whose boundary the printed pages did not settle.
     """
-    rows = runs_overview(result.document, result.reconciliation)
-    if not rows:
-        return
-    st.markdown(f"**Loss runs in this PDF ({len(rows)})**")
-    for run_id, pages, why in unsettled_runs(result.document):
-        st.warning(
-            f"Pages {pages} ({run_id}): where this loss run begins is not settled -- "
-            f"{why}. Its claims are kept and marked for review. Check the PDF and "
-            f"confirm which report these pages belong to before exporting."
+    accounts = claim_accounting(result.document, result.reconciliation)
+    packet = result.document.is_packet
+    if packet:
+        st.markdown(f"**Loss runs in this PDF ({len(accounts)})**")
+        for run_id, pages, why in unsettled_runs(result.document):
+            st.warning(
+                f"Pages {pages} ({run_id}): where this loss run begins is not settled -- "
+                f"{why}. Its claims are kept and marked for review. Check the PDF and "
+                f"confirm which report these pages belong to before exporting."
+            )
+    # What was accounted for, and what could not be: shown open for a packet
+    # or anything unaccounted, folded away for a single clean report.
+    unaccounted = any(a.refused_rows or a.unplaced_rows or not a.boundary_settled
+                      for a in accounts)
+    with st.expander("What LossLift accounted for", expanded=packet or unaccounted):
+        st.dataframe(
+            [
+                {
+                    "Run": a.run_id or "whole document",
+                    "Pages": a.pages,
+                    "Carrier": a.carrier or "",
+                    "Policy term": (f"{a.policy_term_start or '?'} to {a.policy_term_end or '?'}"
+                                    if a.policy_term_start or a.policy_term_end else ""),
+                    "Printed claim count": a.printed_claim_count,
+                    "Claims read": a.claims_read,
+                    "Refused claim-like rows": a.refused_rows,
+                    "Unplaced rows": a.unplaced_rows,
+                    "Printed totals": a.totals,
+                    "Claim count": a.claim_count,
+                    "Boundary settled": "yes" if a.boundary_settled else "no",
+                    "Status": "Reconciled" if a.status is DocumentStatus.CLEAN
+                    else "Needs review",
+                }
+                for a in accounts
+            ],
+            hide_index=True, width="stretch",
         )
-    st.dataframe(rows, hide_index=True, width="stretch")
+        for a in accounts:
+            where = a.run_id or "This document"
+            if a.refused_pages:
+                st.caption(f"{where}: claim-like rows refused on page(s) "
+                           f"{', '.join(map(str, a.refused_pages))} -- open those pages "
+                           f"to check them.")
+            if a.unplaced_pages:
+                st.caption(f"{where}: rows with amounts no claim took on page(s) "
+                           f"{', '.join(map(str, a.unplaced_pages))}.")
+            for reason in a.reasons[:5]:
+                st.caption(f"{where} needs review -- {reason}")
 
 
 def _period_summary(document) -> None:
@@ -1579,6 +1617,15 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
         key=f"download-{document_id}",
         on_click=_record_export,
         args=(result, "xlsx", redact),
+    )
+    st.download_button(
+        "Download JSON",
+        data=export_module.to_json_bytes(result.document, result.reconciliation, redact=redact),
+        file_name=export_module.suggested_filename(result.document).rsplit(".", 1)[0] + ".json",
+        mime="application/json",
+        key=f"download-json-{document_id}",
+        on_click=_record_export,
+        args=(result, "json", redact),
     )
     st.caption(
         "Three sheets: Claims, Exceptions, and Source Info with the file hash "

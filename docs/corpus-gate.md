@@ -186,6 +186,26 @@ gate still measures scanned pages as unread. Adding them means shipping the
 recordings in the private corpus release and mounting them read-only into
 the sandbox, which the local sandboxed run already does.
 
+## Labels: what a person judged each document to be
+
+The gate is a correctness check and reads no labels. For analysis -- review
+rates by carrier, by scan quality, for packets against single reports --
+label each document in a separate file keyed by its manifest id:
+
+```
+python -m tools.corpus_gate init-labels --manifest <manifest file> --labels <labels file>
+```
+
+writes every manifest document with every label unknown (null): carrier,
+template family, line of business, digital / scanned / mixed, scan-quality
+band, single report or packet, expected run count, whether printed totals and
+a printed claim count are present, and a claim-count band
+(`tools/corpus_gate/labels.py`). Only what a person assigns lives there;
+what the collector measures (detected runs, method, status, refused and
+unplaced counts) is joined by id, never copied in. The file names real
+carriers, so it lives outside the repository beside the manifest, and the
+manifest itself is never touched by relabelling.
+
 ## Privacy
 
 Real loss runs carry claimant names, injury descriptions and claim numbers
