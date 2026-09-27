@@ -439,7 +439,18 @@ def _canonical_status(result: Any, reconciliation: Any) -> Any:
     return "CLEAN"
 
 
-def _canonical_run_status(reconciliation: Any, run_id: Any) -> Any:
+def _canonical_run_status(
+    reconciliation: Any, run_id: Any, *, needs_mapping: bool = False
+) -> Any:
+    """``core.review.canonical_run_status``, for any revision.
+
+    No run of a document whose column mapping is still to be confirmed is
+    clean. That is decided here, before the revision's own function is asked,
+    so a revision whose function predates the mapping input is measured under
+    the same rule as one that takes it.
+    """
+    if needs_mapping:
+        return "NEEDS_REVIEW"
     try:
         from core.review import canonical_run_status
     except ImportError:
@@ -476,7 +487,9 @@ _RUN_FACTS = ("carrier", "named_insured", "policy_number", "policy_period_start"
               "policy_period_end", "line_of_business", "valuation_date")
 
 
-def _run_item(document: Any, reconciliation: Any, run: Any, digest: Digest) -> dict[str, Any]:
+def _run_item(
+    document: Any, reconciliation: Any, run: Any, digest: Digest, *, needs_mapping: bool = False
+) -> dict[str, Any]:
     pages = {int(page) for page in getattr(run, "pages", None) or []}
     run_id = getattr(run, "run_id", None)
     claims = [claim for claim in getattr(document, "claims", None) or []
@@ -501,7 +514,8 @@ def _run_item(document: Any, reconciliation: Any, run: Any, digest: Digest) -> d
         "printed_totals": sorted(field_key(name, digest)
                                  for name, value in printed.items() if value is not None),
         "engine_status": None if engine is None else token(engine, UPPER_TOKEN, digest),
-        "status": token(_canonical_run_status(reconciliation, run_id), UPPER_TOKEN, digest),
+        "status": token(_canonical_run_status(reconciliation, run_id, needs_mapping=needs_mapping),
+                        UPPER_TOKEN, digest),
         "r04": sum(1 for f in findings if getattr(f, "rule_id", None) == "R-04"),
         "r05": sum(1 for f in findings if getattr(f, "rule_id", None) == "R-05"),
         "evidence": digest(list(getattr(run, "evidence", None) or [])),
@@ -509,7 +523,9 @@ def _run_item(document: Any, reconciliation: Any, run: Any, digest: Digest) -> d
     }
 
 
-def _runs(document: Any, reconciliation: Any, digest: Digest) -> dict[str, Any]:
+def _runs(
+    document: Any, reconciliation: Any, digest: Digest, *, needs_mapping: bool = False
+) -> dict[str, Any]:
     runs = list(getattr(document, "runs", None) or [])
     packet = len(runs) > 1
     return {
@@ -518,7 +534,8 @@ def _runs(document: Any, reconciliation: Any, digest: Digest) -> dict[str, Any]:
         "unsettled": sum(1 for run in runs if getattr(run, "ambiguous", False)),
         "incomplete": sum(1 for run in runs if getattr(run, "incomplete", None)),
         "items": {
-            str(index): _run_item(document, reconciliation, run, digest)
+            str(index): _run_item(document, reconciliation, run, digest,
+                                  needs_mapping=needs_mapping)
             for index, run in enumerate(runs, start=1)
         } if packet else {},
     }
@@ -554,7 +571,8 @@ def measure(result: Any, digest: Digest) -> dict[str, Any]:
         "review_status": lambda: token(
             _canonical_status(result, reconciliation), UPPER_TOKEN, digest
         ),
-        "runs": lambda: _runs(document, reconciliation, digest),
+        "runs": lambda: _runs(document, reconciliation, digest,
+                              needs_mapping=bool(getattr(result, "needs_mapping", False))),
         "refused": lambda: _refused(document, digest),
     }
     try:

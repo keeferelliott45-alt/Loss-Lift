@@ -141,26 +141,64 @@ KINDS = [("R-15", "extraction", Severity.WARN), ("R-04", "financial", Severity.E
          ("R-19", "underwriting", Severity.WARN)]
 
 
-@pytest.mark.parametrize("combo, run_status", [
-    (combo, run_status)
+@pytest.mark.parametrize("combo, run_status, needs_mapping", [
+    (combo, run_status, needs_mapping)
     for size in range(0, 3) for combo in itertools.combinations(KINDS, size)
     for run_status in ({}, {"run-1": DocumentStatus.CLEAN},
                        {"run-1": DocumentStatus.CLEAN, "run-2": DocumentStatus.NEEDS_REVIEW})
+    for needs_mapping in (False, True)
 ])
-def test_the_collectors_fallback_policy_is_the_canonical_one(monkeypatch, combo, run_status):
+def test_the_collectors_fallback_policy_is_the_canonical_one(
+    monkeypatch, combo, run_status, needs_mapping
+):
     """For a revision without ``core.review``'s functions the collector applies
     the same policy itself; the two must never drift apart."""
     findings = [_flag(*kind, run_id="run-1" if n % 2 else None, n=n) for n, kind in enumerate(combo)]
     engine = (DocumentStatus.NEEDS_REVIEW if any(f.severity is Severity.ERROR for f in findings)
               else DocumentStatus.CLEAN)
     result = ReconciliationResult(status=engine, findings=findings, run_status=run_status)
-    expected_document = canonical_status(result)
-    expected_runs = {run: canonical_run_status(result, run) for run in ("run-1", "run-2")}
+    expected_document = canonical_status(result, needs_mapping=needs_mapping)
+    expected_runs = {run: canonical_run_status(result, run, needs_mapping=needs_mapping)
+                     for run in ("run-1", "run-2")}
+    assert {run: collect._canonical_run_status(result, run, needs_mapping=needs_mapping)
+            for run in expected_runs} == expected_runs
     monkeypatch.setitem(sys.modules, "core.review", None)
-    holder = SimpleNamespace(needs_mapping=False)
+    holder = SimpleNamespace(needs_mapping=needs_mapping)
     assert collect._canonical_status(holder, result) == expected_document.value
     for run, expected in expected_runs.items():
-        assert collect._canonical_run_status(result, run) == expected.value
+        assert collect._canonical_run_status(
+            result, run, needs_mapping=needs_mapping) == expected.value
+
+
+def _unmapped(result):
+    """The same result as a revision whose column mapping is still to confirm."""
+    return SimpleNamespace(document=result.document, reconciliation=result.reconciliation,
+                           warnings=result.warnings, needs_mapping=True)
+
+
+def test_no_run_of_a_packet_awaiting_its_mapping_is_measured_clean(tmp_path):
+    """Codex P2 on 95e445c: run statuses take the document's mapping state."""
+    result = _packet_with_a_refused_row(tmp_path)
+    mapped = collect.measure(result, DIGEST)
+    assert "CLEAN" in {item["status"] for item in mapped["runs"]["items"].values()}
+    unmapped = collect.measure(_unmapped(result), DIGEST)
+    assert unmapped["review_status"] == "NEEDS_REVIEW"
+    assert {item["status"] for item in unmapped["runs"]["items"].values()} == {"NEEDS_REVIEW"}
+
+
+def test_a_revision_whose_run_policy_predates_the_mapping_input(tmp_path, monkeypatch):
+    """A revision with ``canonical_run_status(reconciliation, run_id)`` only is
+    measured under the same rule: an unmapped document has no clean run."""
+    import core.review as review
+
+    result = _packet_with_a_refused_row(tmp_path)
+    original = review.canonical_run_status
+    monkeypatch.setattr(review, "canonical_run_status",
+                        lambda reconciliation, run_id: original(reconciliation, run_id))
+    unmapped = collect.measure(_unmapped(result), DIGEST)
+    assert {item["status"] for item in unmapped["runs"]["items"].values()} == {"NEEDS_REVIEW"}
+    mapped = collect.measure(result, DIGEST)
+    assert "CLEAN" in {item["status"] for item in mapped["runs"]["items"].values()}
 
 
 def _manifest():
