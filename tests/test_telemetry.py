@@ -156,3 +156,20 @@ def test_every_event_line_is_json(tmp_path, isolated_telemetry):
     telemetry.emit(telemetry.processed_event(_clean_single(tmp_path)))
     for line in isolated_telemetry.read_text().splitlines():
         assert json.loads(line)["schema"] == telemetry.SCHEMA
+
+
+def test_a_document_awaiting_its_column_mapping_is_never_logged_clean(tmp_path, monkeypatch):
+    """Codex P2 on 2e62e69: every event states the one policy, mapping included."""
+    result = _clean_single(tmp_path)
+    assert telemetry.export_event(result, fmt="xlsx", redacted=False)["review_status"] == "CLEAN"
+    monkeypatch.setattr(type(result), "needs_mapping", property(lambda self: True))
+    exported = telemetry.export_event(result, fmt="xlsx", redacted=False)
+    assert exported["review_status"] == "NEEDS_REVIEW"
+    assert exported["trust"] == trust_class(result.reconciliation, needs_mapping=True) != AUTO_SAFE
+    assert telemetry.processed_event(result)["review_status"] == "NEEDS_REVIEW"
+    logged = len(result.document.review_log.entries)
+    records = to_records(result.document)
+    records[0]["incurred_total"] = "999999.99"
+    edit_claims(result, records)
+    events = telemetry.review_events(result, result.document.review_log.entries[logged:])
+    assert events and all(e["review_status_after"] == "NEEDS_REVIEW" for e in events)

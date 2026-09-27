@@ -178,7 +178,7 @@ def document_facts(result: Any) -> dict[str, Any]:
         },
         "profile_matched": bool(getattr(result, "profile", None)),
         "mapping_source": _token(getattr(getattr(result, "mapping", None), "source", None)),
-        "needs_mapping": bool(getattr(result, "needs_mapping", False)),
+        "needs_mapping": _needs_mapping(result),
         "vision_pages": int(getattr(result, "vision_pages", 0) or 0),
         "timings": {
             stage: float(seconds) for stage, seconds in (getattr(result, "timings", {}) or {}).items()
@@ -186,9 +186,8 @@ def document_facts(result: Any) -> dict[str, Any]:
         },
         "status": _token(reconciliation.status),
         "review_status": _token(canonical_status(
-            reconciliation, needs_mapping=bool(getattr(result, "needs_mapping", False)))),
-        "trust": trust_class(reconciliation,
-                             needs_mapping=bool(getattr(result, "needs_mapping", False))),
+            reconciliation, needs_mapping=_needs_mapping(result))),
+        "trust": trust_class(reconciliation, needs_mapping=_needs_mapping(result)),
         "runs": {
             "count": max(len(runs), 1),
             "packet": packet,
@@ -237,6 +236,11 @@ def _event(kind: str, session: str | None, document_id: str | None, **body: Any)
     return event
 
 
+def _needs_mapping(result: Any) -> bool:
+    """Whether a column mapping is still to be confirmed; every event says so."""
+    return bool(getattr(result, "needs_mapping", False))
+
+
 def processed_event(result: Any, *, session: str | None = None) -> dict[str, Any]:
     return _event("document_processed", session, result.document.document_id,
                   **document_facts(result))
@@ -250,7 +254,7 @@ def review_events(
     Only the field's canonical name and whether the value was / is empty --
     never the value itself.
     """
-    after = canonical_status(result.reconciliation)
+    after = canonical_status(result.reconciliation, needs_mapping=_needs_mapping(result))
     events = []
     for entry in entries:
         rule = entry.rule_id if _RULE.fullmatch(entry.rule_id or "") else None
@@ -276,8 +280,9 @@ def export_event(
         "exported", session, result.document.document_id,
         format=_token(fmt),
         redacted=bool(redacted),
-        review_status=_token(canonical_status(result.reconciliation)),
-        trust=trust_class(result.reconciliation),
+        review_status=_token(canonical_status(
+            result.reconciliation, needs_mapping=_needs_mapping(result))),
+        trust=trust_class(result.reconciliation, needs_mapping=_needs_mapping(result)),
         document_class=document_class(result),
         seconds_since_processed=seconds_since_processed,
     )
