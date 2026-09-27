@@ -14,6 +14,7 @@ person running this will have dozens of reports in flight at once.
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 from decimal import Decimal
@@ -23,6 +24,7 @@ import pandas as pd
 import streamlit as st
 
 from core import export as export_module
+from core import telemetry
 from core.review import (
     ReviewAction,
     bucket_of,
@@ -156,7 +158,43 @@ def _state() -> dict[str, Any]:
     # Things worth saying once about the last upload that are not failures —
     # a file read a second time, say.
     st.session_state.setdefault("notices", [])
+    # Local telemetry: counts and tokens only (core/telemetry.py).
+    st.session_state.setdefault("telemetry_session", telemetry.new_session())
+    st.session_state.setdefault("processed_at", {})  # document_id -> monotonic seconds
     return st.session_state
+
+
+def _record_processed(result: ExtractionResult) -> None:
+    state = _state()
+    state["processed_at"][result.document.document_id] = time.monotonic()
+    try:
+        telemetry.emit(telemetry.processed_event(result, session=state["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_review(result: ExtractionResult, entries_before: int) -> None:
+    entries = result.document.review_log.entries[entries_before:]
+    if not entries:
+        return
+    try:
+        telemetry.emit(telemetry.review_events(
+            result, entries, session=_state()["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_export(result: ExtractionResult, fmt: str, redacted: bool) -> None:
+    state = _state()
+    started = state["processed_at"].get(result.document.document_id)
+    try:
+        telemetry.emit(telemetry.export_event(
+            result, fmt=fmt, redacted=redacted, session=state["telemetry_session"],
+            seconds_since_processed=None if started is None
+            else round(time.monotonic() - started, 3),
+        ))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
 
 
 def _result(document_id: str) -> ExtractionResult | None:
@@ -576,13 +614,14 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
                 st.error("Enter the corrected value, or choose confirm or dismiss.")
             else:
                 try:
-                    _store(
-                        resolve_finding(
-                            result, finding, action,
-                            note=note,
-                            corrected_value=corrected if action is ReviewAction.CORRECTED else None,
-                        )
+                    logged = len(result.document.review_log.entries)
+                    resolved = resolve_finding(
+                        result, finding, action,
+                        note=note,
+                        corrected_value=corrected if action is ReviewAction.CORRECTED else None,
                     )
+                    _store(resolved)
+                    _record_review(resolved, logged)
                 except ValueError as refused:
                     # Nothing was changed and nothing was logged. Say which,
                     # rather than recording a correction that corrected nothing.
@@ -736,6 +775,7 @@ def _extract_uploads(uploads: list[Any]) -> None:
                     f"history do not carry over between uploads."
                 )
             _store(result)
+            _record_processed(result)
             state["staged"][result.document.document_id] = staged
             added += 1
         except IngestError as error:
@@ -979,6 +1019,9 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
             if st.button(f"Prepare {len(selected_ids)} report(s)", type="primary"):
                 state["batch_zip"] = _build_batch_zip(selected_ids, template, redact)
                 state["batch_zip_count"] = len(selected_ids)
+                for document_id in selected_ids:
+                    if (prepared := _result(document_id)) is not None:
+                        _record_export(prepared, "zip", redact)
 
             if state.get("batch_zip"):
                 st.download_button(
@@ -1140,6 +1183,7 @@ def _apply_mapping(
 
     save_confirmed_mapping(updated, mapping, confirmed_by_human=True)
     _store(updated)
+    _record_processed(updated)
     st.success(
         f"Saved. Documents from {updated.document.carrier or 'this carrier'} in "
         f"this format will map themselves from now on."
@@ -1439,12 +1483,14 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     edited_records = edited.to_dict("records")
     if edited_records != records:
         previous_document = result.document
+        logged = len(previous_document.review_log.entries)
         try:
             edit_claims(result, edited_records)
         except ValueError as refused:
             st.error(str(refused))
         else:
             if result.document is not previous_document:
+                _record_review(result, logged)
                 st.rerun()
 
 
@@ -1531,6 +1577,8 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         key=f"download-{document_id}",
+        on_click=_record_export,
+        args=(result, "xlsx", redact),
     )
     st.caption(
         "Three sheets: Claims, Exceptions, and Source Info with the file hash "

@@ -50,6 +50,7 @@ __all__ = [
     "bucket_of",
     "canonical_run_status",
     "canonical_status",
+    "trust_class",
     "finding_key",
     "resolution_for",
     "summarise_review",
@@ -122,6 +123,38 @@ def canonical_status(
     if any(blocks_trust(finding) for finding in reconciliation.findings):
         return DocumentStatus.NEEDS_REVIEW
     return DocumentStatus.CLEAN
+
+
+#: Rules that say something may not be accounted for at all -- claims or
+#: pages the reading could not place, rather than values that need a check:
+#: rows lost in stitching, no claims, unread source pages, money on a row no
+#: claim took, an unsettled run boundary, claim-like rows the vote refused.
+UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
+
+AUTO_SAFE = "auto_safe"
+NEEDS_REVIEW = "needs_review"
+UNRESOLVED = "unresolved"
+
+
+def trust_class(
+    reconciliation: ReconciliationResult | None, *, needs_mapping: bool = False
+) -> str:
+    """Which of three outcomes a processed document is, for measurement.
+
+    ``auto_safe``: the canonical status is CLEAN -- usable without a person.
+    ``unresolved``: something may not be accounted for at all (see
+    ``UNACCOUNTED_RULES``), or the columns were never mapped.
+    ``needs_review``: everything is accounted for, but some value or check
+    needs a person. A refinement of NEEDS_REVIEW only; it never changes a
+    document's status.
+    """
+    if canonical_status(reconciliation, needs_mapping=needs_mapping) is DocumentStatus.CLEAN:
+        return AUTO_SAFE
+    if reconciliation is None or needs_mapping:
+        return UNRESOLVED
+    if any(finding.rule_id in UNACCOUNTED_RULES for finding in reconciliation.findings):
+        return UNRESOLVED
+    return NEEDS_REVIEW
 
 
 def canonical_run_status(

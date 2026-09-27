@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, field as dataclass_field, replace
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -155,6 +156,11 @@ class ExtractionResult:
     #: (spec section 9) and this becomes None, without taking the page numbers,
     #: regions and cell text with it.
     source_path: Path | None = None
+    #: Seconds spent in each stage of this run, for operational telemetry.
+    #: Never part of what is compared or exported: timing is not behaviour.
+    timings: dict[str, float] = field(default_factory=dict)
+    #: Scanned pages handed to the vision reader (live or replayed).
+    vision_pages: int = 0
 
     @property
     def needs_mapping(self) -> bool:
@@ -1941,6 +1947,22 @@ def run_pipeline(
         discard(ingested)
 
 
+class _StageClock:
+    """Seconds per pipeline stage, measured and nothing else."""
+
+    def __init__(self) -> None:
+        self.started = self.last = time.perf_counter()
+        self.stages: dict[str, float] = {}
+
+    def mark(self, stage: str) -> None:
+        now = time.perf_counter()
+        self.stages[stage] = round(now - self.last, 6)
+        self.last = now
+
+    def done(self) -> dict[str, float]:
+        return {**self.stages, "total": round(time.perf_counter() - self.started, 6)}
+
+
 def _run_pipeline(
     ingested: IngestedFile,
     *,
@@ -1954,7 +1976,9 @@ def _run_pipeline(
     llm_client: Any | None = None,
 ) -> ExtractionResult:
     """Run extraction against a stable staged PDF."""
+    clock = _StageClock()
     classification = classify_pdf(ingested.path)
+    clock.mark("classify")
 
     digital_pages = classification.digital_pages
     # `pages=None` means "extract every page" (spec: no filter). Passing the
@@ -1963,6 +1987,7 @@ def _run_pipeline(
     # eagerly parse every heavy scanned page for a document that has nothing
     # digital on it at all. An explicit empty list correctly extracts none.
     extraction = extract_digital.extract_pdf(ingested.path, pages=digital_pages)
+    clock.mark("digital")
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
@@ -2120,6 +2145,7 @@ def _run_pipeline(
             f"Turn on vision extraction to include them."
         )
 
+    clock.mark("vision")
     # Fingerprint the letterhead plus the header labels.
     # A scanned page prints its valuation date and claim count like any other,
     # but there is no text layer to read them from, so the vision pass reports
@@ -2156,6 +2182,7 @@ def _run_pipeline(
         use_llm=use_llm,
         llm_client=llm_client,
     )
+    clock.mark("mapping")
 
     # Number and date conventions, derived from the document itself.
     locale_inference = infer_locale(_money_tokens(tables, mapping))
@@ -2526,9 +2553,14 @@ def _run_pipeline(
     scope_sections(document.printed_sections, document.claims)
 
     config = reconcile_config or _config_for(profile)
+    clock.mark("assemble")
+    reconciliation = reconcile(document, config)
+    clock.mark("reconcile")
     return ExtractionResult(
         document=document,
-        reconciliation=reconcile(document, config),
+        reconciliation=reconciliation,
+        timings=clock.done(),
+        vision_pages=len(scanned_pages) if use_vision else 0,
         mapping=mapping,
         classification=classification,
         source_path=ingested.path,
