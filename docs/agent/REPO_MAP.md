@@ -101,6 +101,12 @@ The cloud workflow always runs **main's** gate code. Docs:
 | Scans | `extract_vision.py`, `prompts/extract_vision.md`, `runs.vision_evidence` |
 | Gate measurement | `tools/corpus_gate/collect.py` + `seal.py` (schema) + tests |
 
+## Agent workflow and benchmark
+
+`docs/agent/TOPOLOGY.md` (roles, lifecycle, conflicts, escalation, modes);
+`agent_benchmark/` (stack comparison protocol and development tasks; answer
+keys are not in the repository).
+
 ## Commands
 
 ```

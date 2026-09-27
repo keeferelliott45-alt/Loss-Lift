@@ -12,6 +12,9 @@ how to work. Keep it short; history goes in `Remember.md`, the present state in
 4. Your task file (`agent_tasks/<task>.md`)
 5. `docs/agent/INVARIANTS.md` — only the sections your task touches
 
+Orchestrators and integrators also read `docs/agent/TOPOLOGY.md` (roles,
+conflict and escalation rules).
+
 Then: search symbols (`rg`, grep) before opening files; read only the modules
 the task touches; use `git log -p -- <file>` or `git blame` selectively; open
 `Remember.md` only when you need to know *why* something is the way it is.
