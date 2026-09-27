@@ -393,6 +393,21 @@ def test_signed_totals_are_read_per_run(tmp_path):
 
 
 def test_the_same_claim_number_in_two_runs_is_not_a_duplicate(tmp_path):
+    """Two carriers can issue the same claim number: different claims."""
+    one = ("40117", "02/14/2022", "OPEN", "250.00", "750.00", "1,000.00")
+    other = ("40117", "07/03/2022", "OPEN", "250.00", "750.00", "1,000.00")
+    result = _read_ex(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, [one, *_large_run(3, first=40200)],
+         {"marker": "Page 1 of 1"}),
+        (SMALL_CARRIER, SMALL_HEADERS, [other, *_large_run(2, first=40300)],
+         {"marker": "Page 1 of 1"}),
+    ])
+    assert "R-11" not in result.reconciliation.rule_ids()
+    assert "R-12" not in result.reconciliation.rule_ids()
+
+
+def test_the_same_claim_read_in_two_runs_is_counted_once_or_reviewed(tmp_path):
+    """Number and loss date both repeat: the packet counts one claim twice."""
     shared = ("40117", "02/14/2022", "OPEN", "250.00", "750.00", "1,000.00")
     result = _read_ex(tmp_path, [
         (LARGE_CARRIER, LARGE_HEADERS, [shared, *_large_run(3, first=40200)],
@@ -400,8 +415,10 @@ def test_the_same_claim_number_in_two_runs_is_not_a_duplicate(tmp_path):
         (SMALL_CARRIER, SMALL_HEADERS, [shared, *_large_run(2, first=40300)],
          {"marker": "Page 1 of 1"}),
     ])
-    assert "R-11" not in result.reconciliation.rule_ids()
-    assert "R-12" not in result.reconciliation.rule_ids()
+    across = [f for f in result.reconciliation.findings
+              if f.rule_id == "R-11" and f.condition == "across-runs:40117"]
+    assert len(across) == 1 and "run-1, run-2" in across[0].message
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_run_whose_claims_carry_no_amounts_keeps_them(tmp_path):
@@ -674,3 +691,245 @@ def test_numbering_restarts_are_not_run_boundaries(tmp_path):
     assert [len(result.document.run_claims(run)) for run in runs] == [24, 1]
     assert _numbers(result) == [row[0] for row in large] + [SMALL_RUN[0][0]]
     assert result.reconciliation.status is DocumentStatus.CLEAN
+
+
+# ==========================================================================
+# Review findings on the first implementation, kept as regressions
+# ==========================================================================
+
+
+def _table(page, numbers, *, headers=LARGE_HEADERS, dated=True, extra=()):
+    rows = [RawRow(cells=[number, "03/14/2022" if dated else "", "OPEN" if dated else "",
+                          "100.00", "0.00", "100.00"], page=page, line_index=10 + i)
+            for i, number in enumerate(numbers)]
+    rows += [RawRow(cells=list(cells), page=page, line_index=40 + i)
+             for i, cells in enumerate(extra)]
+    return RawTable(page=page, headers=list(headers), rows=rows)
+
+
+def test_a_continuation_line_never_joins_another_runs_claim():
+    """The first line of run 2 is prose; it is not folded into run 1's last claim."""
+    mapping = build_mapping(list(LARGE_HEADERS))
+    first = _table(1, [f"{71004410 + n}" for n in range(4)])
+    second = _table(2, [], extra=[("ACME HOLDINGS INC - LOCATION 4", "", "", "", "", "")])
+    second.rows = second.rows + _table(2, ["CR-40117"]).rows
+    claims, _w, _u = build_claims([first, second], mapping, "us", "mdy", runs={1: 0, 2: 1})
+    assert "ACME" not in (claims[3].loss_description or "")
+
+
+def test_a_run_keeps_its_own_series_beside_a_shape_it_shares_with_another():
+    """Run 2 prints its own numbering and one number shaped like run 1's. Its
+    own series is its vote; the shared shape does not take it away."""
+    mapping = build_mapping(list(LARGE_HEADERS))
+    first = _table(1, [f"WC{1000000 + n}" for n in range(20)])
+    second = _table(2, ["123-456-789", "123-456-790", "123-456-791", "WC7654321"])
+    claims, _w, _u = build_claims([first, second], mapping, "us", "mdy", runs={1: 0, 2: 1})
+    numbers = [claim.claim_number for claim in claims]
+    assert {"123-456-789", "123-456-790", "123-456-791", "WC7654321"} <= set(numbers)
+
+
+def test_an_unsettled_run_does_not_outvote_the_settled_run_before_it(tmp_path):
+    """A settled three-claim report, then twenty unnumbered claims under the
+    same heading: the unsettled run borrows the settled run's vote, it does not
+    pool into it -- the settled run keeps its claims."""
+    small = [(f"123-456-{780 + n}", "03/14/2022", "OPEN", "100.00", "0.00", "100.00")
+             for n in range(3)]
+    many = [(f"WC{1000000 + n}", "03/14/2022", "OPEN", "100.00", "0.00", "100.00")
+            for n in range(20)]
+    result = _read_ex(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, small, {"marker": "Page 1 of 1"}),
+        (LARGE_CARRIER, LARGE_HEADERS, many[:10], {}),
+        (LARGE_CARRIER, LARGE_HEADERS, many[10:], {}),
+    ])
+    assert _numbers(result)[:3] == [row[0] for row in small]
+    runs = result.document.runs
+    assert [(run.pages, run.ambiguous) for run in runs] == [([1], False), ([2, 3], True)]
+    boundary = [f for f in result.reconciliation.findings if f.rule_id == "R-28"]
+    assert boundary and "20 row(s) there read as claims" in boundary[0].message
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_report_cut_short_by_the_next_one_is_reported():
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 3", "footer")),
+                        identity="northfield"),
+        2: PageEvidence(2, paginations=tuple(paginations_in("Page 2 of 3", "footer")),
+                        identity="northfield"),
+        3: PageEvidence(3, paginations=tuple(paginations_in("Page 1 of 1", "footer")),
+                        identity="harbor crest"),
+    }
+    from core.runs import logical_runs
+
+    runs = logical_runs([1, 2, 3], evidence, {1, 2, 3})
+    assert [(run.pages, run.ambiguous) for run in runs] == [([1, 2], False), ([3], False)]
+    assert "stops at page 2 of 3" in runs[0].incomplete
+
+
+def test_the_truncated_run_makes_the_packet_need_review(tmp_path):
+    large = _large_run(8)
+    result = _read_ex(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, large[:4], {"marker": "Page 1 of 3"}),
+        (LARGE_CARRIER, LARGE_HEADERS, large[4:], {"marker": "Page 2 of 3"}),
+        (SMALL_CARRIER, SMALL_HEADERS, list(SMALL_RUN), {"marker": "Page 1 of 1"}),
+    ])
+    incomplete = [f for f in result.reconciliation.findings
+                  if f.rule_id == "R-28" and f.condition == "run-1:incomplete"]
+    assert len(incomplete) == 1 and "stops at page 2 of 3" in incomplete[0].message
+    assert result.reconciliation.run_status["run-1"] is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_form_bound_inside_a_report_does_not_end_it():
+    """An ACORD form numbered "1 of 1" between the report's pages 2 and 3."""
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 3", "footer"))),
+        2: PageEvidence(2, paginations=tuple(paginations_in("Page 2 of 3", "footer"))),
+        3: PageEvidence(3, paginations=tuple(paginations_in("Page 1 of 1", "footer")),
+                        identity="acord certificate"),
+        4: PageEvidence(4, paginations=tuple(paginations_in("Page 3 of 3", "footer"))),
+    }
+    segments = plan_runs([1, 2, 3, 4], evidence, {1, 2, 4})
+    assert [(s.pages, s.ambiguous) for s in segments] == [([1, 2, 3, 4], False)]
+
+
+def test_a_packet_stamp_does_not_carry_a_finished_report_on():
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(
+            paginations_in("Page 1 of 2", "header") + paginations_in("Page 1 of 4", "footer")),
+            identity="northfield"),
+        2: PageEvidence(2, paginations=tuple(
+            paginations_in("Page 2 of 2", "header") + paginations_in("Page 2 of 4", "footer")),
+            identity="northfield"),
+        3: PageEvidence(3, paginations=tuple(paginations_in("Page 3 of 4", "footer")),
+                        identity="harbor crest"),
+        4: PageEvidence(4, paginations=tuple(paginations_in("Page 4 of 4", "footer")),
+                        identity="harbor crest"),
+    }
+    segments = plan_runs([1, 2, 3, 4], evidence, {1, 2, 3, 4})
+    assert [(s.pages, s.ambiguous) for s in segments] == [([1, 2], False), ([3, 4], False)]
+
+
+def test_two_runs_failing_alike_are_two_findings(tmp_path):
+    """Each run prints a total its claims do not reach, by the same amount. Two
+    findings, one per run -- not one finding for "the whole packet"."""
+    large, other = _large_run(8), _large_run(8, first=40200)
+    wrong = ("TOTAL", "", "", "8,000.00", "0.00", "9,000.00")
+    result = _read_ex(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, large, {"marker": "Page 1 of 1", "total": wrong}),
+        (SMALL_CARRIER, SMALL_HEADERS, other, {"marker": "Page 1 of 1", "total": wrong}),
+    ])
+    r04 = [f for f in result.reconciliation.findings if f.rule_id == "R-04"]
+    assert sorted(f.run_id for f in r04) == ["run-1", "run-2"]
+
+
+def test_a_claim_added_by_hand_joins_the_run_of_its_page(tmp_path):
+    from core.pipeline import apply_edits, to_records
+
+    result, _large, _small = _two_carrier_packet(tmp_path)
+    document = result.document
+    columns = ["claim_number", "date_of_loss", "claim_status", "paid_total",
+               "reserve_total", "incurred_total"]
+    records = to_records(document, columns)
+    records.append({"claim_number": "CR-40999", "date_of_loss": "2022-05-05",
+                    "claim_status": "OPEN", "paid_total": "0", "reserve_total": "10",
+                    "incurred_total": "10", "_page": 2})
+    edited = apply_edits(document, records)
+    added = next(claim for claim in edited.claims if claim.claim_number == "CR-40999")
+    assert edited.run_of(added.source_page).run_id == "run-2"
+    # Provenance of a read row is not editable through the page cell.
+    moved = to_records(document, columns)
+    moved[0]["_page"] = 2
+    assert apply_edits(document, moved).claims[0].source_page == 1
+
+
+def test_each_row_carries_its_runs_valuation_date(tmp_path):
+    large, small = _large_run(4), list(SMALL_RUN)
+    document = pymupdf.open()
+    from tests.test_packet_p1_regressions import _page_ex
+
+    _page_ex(document, LARGE_CARRIER, LARGE_HEADERS, large, marker="Page 1 of 1")
+    page = document.new_page(width=612, height=792)
+    page.insert_text((LEFT, 36), "Page 1 of 1", fontsize=8)
+    for y, line in ((50, SMALL_CARRIER), (64, "LOSS RUN REPORT"), (78, "Valuation Date: 06/30/2023")):
+        page.insert_text((LEFT, y), line, fontsize=9)
+    from tests.test_packet_claim_series import COLUMNS
+    for offset, label in zip(COLUMNS, SMALL_HEADERS):
+        page.insert_text((LEFT + offset, 120), label, fontsize=8.5)
+    for index, row in enumerate(small):
+        for offset, cell in zip(COLUMNS, row):
+            page.insert_text((LEFT + offset, 134 + 14 * index), cell, fontsize=8.5)
+    document.save(tmp_path / "dates.pdf")
+    document.close()
+    result = run_pipeline(tmp_path / "dates.pdf", use_vision=False,
+                          profiles_dir=tmp_path / "profiles")
+    runs = result.document.runs
+    assert [str(run.valuation_date) for run in runs] == ["2022-12-31", "2023-06-30"]
+    workbook = load_workbook(io.BytesIO(_workbook_bytes(result.document, result.reconciliation)))
+    sheet = workbook["Claim Detail"]
+    headers = [cell.value for cell in sheet[1]]
+    column = headers.index("Valuation date")
+    values = [str(row[column].value)[:10] for row in sheet.iter_rows(min_row=2)]
+    assert values == ["2022-12-31"] * len(large) + ["2023-06-30"] * len(small)
+
+
+# --------------------------------------------------------------------------
+# Page evidence: where it sits, and what it is read from
+# --------------------------------------------------------------------------
+
+
+def test_text_outside_the_crop_box_is_not_furniture(tmp_path):
+    from core.extract_digital import extract_pdf
+
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=1008)
+    page.insert_text((40, 10), "Page 9 of 9", fontsize=8)
+    page.insert_text((40, 236), "Page 1 of 2", fontsize=8)
+    page.insert_text((40, 252), LARGE_CARRIER, fontsize=9)
+    page.set_cropbox(pymupdf.Rect(0, 216, 612, 1008))
+    document.save(tmp_path / "crop.pdf")
+    document.close()
+    evidence = extract_pdf(tmp_path / "crop.pdf").page_evidence[1]
+    assert [(p.index, p.count) for p in evidence.paginations] == [(1, 2)]
+
+
+def test_the_claims_tables_own_labels_name_no_report():
+    from core.runs import identity_of
+
+    assert identity_of("Claim Number Loss Date Status", exclude=["Claim Number", "Loss Date",
+                                                                 "Status"]) is None
+    assert identity_of("NORTHFIELD AUTO Policy AU-1001 Printed March 31, 2023 10:15 AM") == \
+        identity_of("NORTHFIELD AUTO Policy AU-1002 Printed April 2, 2023 9:01 AM")
+
+
+def test_headings_are_compared_by_what_each_names():
+    from core.runs import same_heading
+
+    report = identity_of("NORTHWIND MUTUAL LOSS RUN REPORT Valuation Date")
+    assert same_heading(report, identity_of("NORTHWIND MUTUAL LOSS RUN REPORT ADDENDUM")) is False
+    assert same_heading(report, identity_of("NORTHWIND MUTUAL")) is True
+    assert same_heading(identity_of("LOSS RUN REPORT NORTHWIND MUTUAL"),
+                        identity_of("LOSS RUN REPORT HARBOR CREST")) is False
+    assert same_heading(report, None) is None
+
+
+def test_numbering_on_a_recognised_scan_is_a_reading(tmp_path):
+    """A searchable scan's page numbers come from OCR: counted, as a reading."""
+    from core.runs import OCR, Pagination, PageEvidence as Evidence, plan_packet
+
+    evidence = {
+        1: Evidence(1, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="a"),
+        2: Evidence(2, paginations=(Pagination(1, 1, OCR, "Page 1 of 1"),), identity="b"),
+    }
+    plan = plan_packet([1, 2], evidence, {1, 2})
+    assert [run.confidence for run in plan.runs] == [RunConfidence.MODEL] * 2
+
+
+def test_the_model_must_state_the_numbers_it_reports():
+    def label(text, number, of):
+        return parse_vision_response(
+            {**_payload(LARGE_HEADERS, _large_run(1)), "page_label":
+             {"text": text, "number": number, "of": of, "position": "footer"}}, 3)
+
+    assert label("Page 7 of 8", 1, 8).page_label_index is None
+    assert label("1 of 3", 1, 3).page_label_index is None     # not page numbering to the text layer either
+    assert label("Pg. 2 of 3", 2, 3).page_label_index == 2
+    assert label("Sheet 1 of 4", 1, 4).page_label_count == 4

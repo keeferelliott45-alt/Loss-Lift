@@ -1404,6 +1404,24 @@ def r28_unsettled_run_boundary(
     """
     findings: list[Finding] = []
     for run in doc.runs:
+        if run.incomplete:
+            findings.append(Finding(
+                rule_id="R-28",
+                severity=Severity.ERROR,
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition=f"{run.run_id}:incomplete",
+                run_id=run.run_id,
+                page=max(run.pages),
+                message=(
+                    f"The loss run on page(s) {run.page_range} is incomplete: "
+                    f"{run.incomplete}. Claims on its missing pages are not in this "
+                    f"reading; confirm the PDF holds the whole report before exporting."
+                ),
+                expected="every page the report numbers",
+                actual=run.incomplete,
+            ))
         if not run.ambiguous:
             continue
         refused = [row for row in doc.refused_claim_rows if run.holds(row.page)]
@@ -1443,20 +1461,18 @@ def r28_unsettled_run_boundary(
 def r29_refused_claims_on_unbounded_scans(
     doc: LossRunDocument, config: ReconcileConfig
 ) -> list[Finding]:
-    """A scan's claim-like rows refused by a vote nothing bounds are reviewed.
+    """Claim-like rows refused where another report's numbering may be why.
 
-    The claim-number vote is taken per loss run. On a scanned packet the only
-    evidence of where one run ends is what the vision model reads in each
-    page's furniture; where it read none, every scanned page is one run and
-    one vote, and a larger report outvotes a smaller one. A row carrying a
-    well-formed claim number and a loss date or status of its own, refused by
-    that vote, may be the smaller report's claim. It is not dropped quietly:
-    the document is reviewed and the rows are named.
+    The claim-number vote is taken per loss run. Where nothing printed bounds
+    the runs -- no page numbers anywhere, or pages joined to a run with nothing
+    confirming them -- one vote may pool two reports, and a larger one
+    outvotes a smaller. In a packet, another report's numbering is the
+    likeliest reason a well-formed identifier is refused at all. A row
+    carrying such an identifier and a loss date or status of its own, refused
+    there, may be another report's claim: it is not dropped quietly -- the
+    document is reviewed and the rows are named.
     """
-    refused = [
-        row for row in doc.refused_claim_rows
-        if row.method is SourceMethod.VISION and not row.bounded
-    ]
+    refused = [row for row in doc.refused_claim_rows if row.report]
     if not refused:
         return []
     listed = "; ".join(
@@ -1474,11 +1490,11 @@ def r29_refused_claims_on_unbounded_scans(
         subject="document",
         page=pages[0],
         message=(
-            f"{len(refused)} row(s) on scanned page(s) "
+            f"{len(refused)} row(s) on page(s) "
             f"{', '.join(str(page) for page in pages)} read as claims -- a claim "
             f"number and a loss date or status -- but their claim numbers were "
-            f"refused, and nothing printed on those pages bounds which loss run "
-            f"they belong to. They may be another report's claims: {listed}{more}."
+            f"refused by a vote that may have pooled more than one loss run's "
+            f"numbering. They may be another report's claims: {listed}{more}."
         ),
         expected="every claim-like row read as a claim or bounded to its run",
         actual=len(refused),
@@ -1495,6 +1511,12 @@ _SEVERITY_ORDER = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
 #: Rules about how the packet is divided, asked once of the whole document.
 _PACKET_RULES = ("R-28",)
 
+#: Rules about what the document states once for every run -- its valuation
+#: date, currency, column mapping, page accounting, split pages. Raised alike
+#: in every run, they are one fact and reported once. Every other rule checks
+#: a run against itself, and two runs failing it alike are two findings.
+_DOCUMENT_WIDE = frozenset({"R-06", "R-15", "R-16", "R-18", "R-21", "R-22", "R-24"})
+
 
 def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
     """One loss run of a packet, as a document of its own for the rules.
@@ -1506,6 +1528,7 @@ def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
     """
     return doc.model_copy(update={
         "claims": doc.run_claims(run),
+        "valuation_date": run.valuation_date or doc.valuation_date,
         "printed_totals": dict(run.printed_totals),
         "printed_claim_count": run.printed_claim_count,
         "printed_count_evidence": list(run.printed_count_evidence),
@@ -1550,7 +1573,9 @@ def reconcile(
                 str(finding.actual))
 
     everywhere = set.intersection(*(
-        {shared(f) for f in result.findings if f.scope in (FindingScope.DOCUMENT, FindingScope.COLUMN)}
+        {shared(f) for f in result.findings
+         if f.rule_id in _DOCUMENT_WIDE
+         and f.scope in (FindingScope.DOCUMENT, FindingScope.COLUMN)}
         for _run, result in per_run
     )) if per_run else set()
 
@@ -1572,6 +1597,8 @@ def reconcile(
         for finding in r28_unsettled_run_boundary(doc, config):
             findings.append(finding)
             run_status[finding.run_id] = DocumentStatus.NEEDS_REVIEW
+    if "R-11" not in config.disabled_rules:
+        findings.extend(_claims_in_two_runs(doc))
 
     keys = [finding_key(finding) for finding in findings]
     duplicates = sorted({key for key in keys if keys.count(key) > 1})
@@ -1595,6 +1622,44 @@ def reconcile(
         else DocumentStatus.CLEAN
     )
     return ReconciliationResult(status=status, findings=findings, run_status=run_status)
+
+
+def _claims_in_two_runs(doc: LossRunDocument) -> list[Finding]:
+    """The same claim -- number and date of loss -- read in two runs of a packet.
+
+    A summary page repeating a report's large losses, or one report bound in
+    twice, puts the same claim in the packet twice, and each run on its own
+    finds nothing wrong. Two carriers can share a claim number; sharing the
+    date of loss as well is the same claim counted twice.
+    """
+    seen: dict[tuple[str, object], list[tuple[str, str]]] = {}
+    for run in doc.runs:
+        for claim in doc.run_claims(run):
+            if claim.date_of_loss is None:
+                continue
+            seen.setdefault((claim.claim_number, claim.date_of_loss), []).append(
+                (run.run_id, claim.row_id))
+    findings = []
+    for (number, loss_date), places in sorted(seen.items(), key=lambda item: str(item[0])):
+        runs = sorted({run_id for run_id, _row in places})
+        if len(runs) < 2:
+            continue
+        findings.append(Finding(
+            rule_id="R-11",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"across-runs:{number}",
+            message=(
+                f"Claim {number} (loss date {loss_date}) is read in {', '.join(runs)}: "
+                f"the same claim counted twice across the packet, or two reports "
+                f"repeating it. Confirm which run it belongs to before exporting."
+            ),
+            expected="each claim in one run",
+            actual=", ".join(runs),
+        ))
+    return findings
 
 
 def _reconcile_one(

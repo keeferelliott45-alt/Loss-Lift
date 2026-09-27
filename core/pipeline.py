@@ -8,7 +8,7 @@ UI does any of this work.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field, field as dataclass_field
+from dataclasses import dataclass, field, field as dataclass_field, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -90,7 +90,7 @@ from core.schema import (
     Resolution,
     SourceMethod,
 )
-from core.runs import logical_runs, vision_evidence, vote_groups
+from core.runs import OCR, plan_packet, vision_evidence, vote_plan
 
 
 #: Labels that mark the one total covering every claim, not a section subtotal.
@@ -1068,11 +1068,17 @@ def identifier_shapes_by_run(
             if _row_establishes_claim_data(_row_values(row, table_mapping)):
                 claimed[run].append(cell)
 
+    if runs is None:
+        # One loss run: the document's vote, exactly as it always was.
+        return {run: document for run in printed} or {0: document}
     shapes: dict[int, set[str]] = {}
     for run, cells in printed.items():
         own = consensus_shapes(claimed[run])
         read = any(leading_identifier(cell, document) for cell in cells)
-        shapes[run] = own if own and not read else document
+        # A run keeps every numbering its own claims establish. The packet's
+        # vote may add the shape a stray row shares with it; it never takes
+        # the run's own series away.
+        shapes[run] = (own | document) if read else (own or document)
     return shapes
 
 
@@ -1157,9 +1163,10 @@ def build_claims(
     rules can say so.
 
     ``runs`` maps each page to the claim-number vote it takes part in (see
-    :func:`core.runs.vote_groups`). ``shapes_by_run`` is that vote, where it
-    was taken over more tables than these -- a run read partly off scans and
-    partly off a text layer votes as one run, whichever reader read it.
+    :func:`core.runs.vote_plan`). ``shapes_by_run`` is that vote, where it
+    was taken elsewhere -- an unsettled run reads under the vote of the run
+    before it. A continuation line is folded only into a claim of its own
+    run: text on one report's first line never joins another report's claim.
 
     ``refused`` collects every row that reads as a claim -- a well-formed
     identifier and a loss date or status of its own -- whose identifier the
@@ -1178,6 +1185,7 @@ def build_claims(
         shapes = shapes_by_run[_run_of(table, runs)]
         context = table_money_context(table, table_mapping, shapes)
 
+        run = _run_of(table, runs)
         for row in table.rows:
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
@@ -1228,7 +1236,8 @@ def build_claims(
                         row, table_mapping, locale, warnings, unplaced, extra,
                         context=context,
                     )
-                elif extra and claims and _continuation_text(row, table_mapping):
+                elif (extra and claims and _continuation_text(row, table_mapping)
+                      and _same_run(claims[-1], run, runs)):
                     previous = claims[-1]
                     previous.loss_description = clean_text(
                         f"{previous.loss_description or ''} {extra}"
@@ -1255,7 +1264,7 @@ def build_claims(
                 continue
 
             extra = _continuation_text(row, table_mapping)
-            if extra and claims:
+            if extra and claims and _same_run(claims[-1], run, runs):
                 previous = claims[-1]
                 previous.loss_description = clean_text(
                     f"{previous.loss_description or ''} {extra}"
@@ -1267,6 +1276,11 @@ def build_claims(
                     context=context,
                 )
     return claims, warnings, unplaced
+
+
+def _same_run(claim: Claim, run: int, runs: Mapping[int, int] | None) -> bool:
+    """Whether a claim was read in this run, so a continuation may join it."""
+    return runs is None or runs.get(claim.source_page, 0) == run
 
 
 def _note_refusal(
@@ -2154,6 +2168,15 @@ def _run_pipeline(
     # a scan as the vision model read it -- and one decision is taken over
     # the whole packet from that. A single loss run is the whole document.
     page_evidence = {**extraction.page_evidence, **vision_evidence(vision_tables)}
+    # A text layer recognised off a picture -- a scan saved as searchable --
+    # is a reading of the page like the vision model's, not a measurement of
+    # it. Numbering found there counts, as a reading.
+    for number, record in classified.items():
+        found = page_evidence.get(number)
+        if found is not None and found.paginations and record.transcribed_boxes:
+            page_evidence[number] = replace(found, paginations=tuple(
+                replace(label, source=OCR) for label in found.paginations
+            ))
     claim_table_pages = {
         table.page for table in tables
         if mapping_for(table, mapping).index_of("claim_number") is not None
@@ -2162,25 +2185,31 @@ def _run_pipeline(
         table.page: SourceMethod.VISION if table.strategy == "vision" else SourceMethod.DIGITAL
         for table in tables
     }
-    runs = logical_runs(
+    plan = plan_packet(
         range(1, classification.page_count + 1),
         page_evidence,
         claim_table_pages,
         table_methods,
     )
-    groups = vote_groups(runs)
-    # Pages bounded by what they print share one claim-number vote per run,
-    # whichever reader read them. Where nothing on any page bounds anything,
-    # each reader votes over its own pages, as it always has.
-    bounded = groups is not None or any(
-        evidence.paginations for evidence in page_evidence.values()
-    )
-    shared_shapes = identifier_shapes_by_run(tables, mapping, groups) if bounded else None
+    runs = plan.runs
+    groups, borrowed = vote_plan(runs)
+
+    def shapes_for(reader_tables: list[RawTable]) -> dict[int, set[str]] | None:
+        """Each run's claim-number vote over one reader's tables. An unsettled
+        run reads under the vote of the settled run before it."""
+        if groups is None:
+            return None
+        shapes = identifier_shapes_by_run(reader_tables, mapping, groups)
+        for index, source in borrowed.items():
+            if source in shapes:
+                shapes[index] = shapes[source]
+        return shapes
+
     refused_rows: list[RefusedClaimRow] = []
 
     claims, row_warnings, unplaced_rows = build_claims(
         digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero,
-        runs=groups, shapes_by_run=shared_shapes, refused=refused_rows,
+        runs=groups, shapes_by_run=shapes_for(digital_tables), refused=refused_rows,
     )
     warnings.extend(row_warnings)
 
@@ -2190,7 +2219,7 @@ def _run_pipeline(
             dash_means_zero=dash_means_zero,
             source_method=SourceMethod.VISION,
             confidence_cap=0.85,
-            runs=groups, shapes_by_run=shared_shapes, refused=refused_rows,
+            runs=groups, shapes_by_run=shapes_for(vision_tables), refused=refused_rows,
         )
         claims.extend(vision_claims)
         warnings.extend(vision_warnings)
@@ -2390,11 +2419,18 @@ def _run_pipeline(
                 (table.valuation_date_text for table in run_tables[run.run_id]
                  if table.valuation_date_text), None,
             )
+        if run.valuation_date_text:
+            run.valuation_date = parse_date(run.valuation_date_text, header_order).value
     for row in refused_rows:
         run = next((item for item in runs if item.holds(row.page)), None)
-        row.bounded = (
-            not run.ambiguous and run.confidence is not RunConfidence.NONE
-            if run is not None else bounded
+        row.bounded = plan.bounded and row.page not in plan.blind and (
+            run is None or (not run.ambiguous and run.confidence is not RunConfidence.NONE)
+        )
+        # A refusal is reported wherever another report's numbering may be why:
+        # in a packet, and wherever the vote was not bounded by what the pages
+        # print. An unsettled run's refusals are named by R-28 instead.
+        row.report = not (run is not None and run.ambiguous) and (
+            bool(runs) or not row.bounded
         )
 
     document = LossRunDocument(
@@ -3011,7 +3047,13 @@ def apply_edits(
             Claim(
                 claim_number=claim_number,
                 row_id=original.row_id if original else "",
-                source_page=int(record.get("_page") or (original.source_page if original else 1)),
+                # Where a row was read is provenance, not something to edit.
+                # A row added by hand takes the page it was given, which in a
+                # packet is how it joins its loss run.
+                source_page=(
+                    original.source_page if original is not None
+                    else int(record.get("_page") or 1)
+                ),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,
                 source_lines=list(original.source_lines) if original else [],

@@ -58,7 +58,9 @@ from core.schema import LogicalRun, RunBoundary, RunConfidence, SourceMethod
 #: A report numbering one of its own pages against its length. The count is
 #: what makes it pagination: "see page 1" names a page, it does not number
 #: this one.
-PAGINATION = re.compile(r"\bpage\s*:?\s*(\d{1,4})\s*(?:of|/)\s*(\d{1,4})\b", re.IGNORECASE)
+PAGINATION = re.compile(
+    r"\b(?:page|pg\.?|sheet)\s*:?\s*(\d{1,4})\s*(?:of|/)\s*(\d{1,4})\b", re.IGNORECASE
+)
 
 #: How much of the page, from the top and from the bottom, is furniture. A
 #: report's page numbering and letterhead sit there; its claims table does not.
@@ -66,13 +68,19 @@ BAND_FRACTION = 0.15
 
 #: Text that changes from page to page of one report without saying anything
 #: about which report it is: print dates and times, and the page numbering.
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
 _VOLATILE = re.compile(
-    r"\b\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}\b"      # dates
-    r"|\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?"  # times
-    , re.IGNORECASE,
+    r"\b\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}\b"                 # 03/31/2023
+    r"|\b" + _MONTH + r"\s+\d{1,2},?\s+\d{2,4}\b"          # March 31, 2023
+    r"|\b\d{1,2}[\s-]" + _MONTH + r"[\s-]\d{2,4}\b"        # 31-Mar-2023
+    r"|\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?",       # 10:15 AM
+    re.IGNORECASE,
 )
 
-HEADER, FOOTER, MODEL = "header", "footer", "model"
+#: Where a page's numbering was found. "ocr" is a text layer recognised off a
+#: picture: like the vision model's answer it is a reading, not a measurement.
+HEADER, FOOTER, MODEL, OCR = "header", "footer", "model", "ocr"
+_READ = (MODEL, OCR)
 
 
 @dataclass(frozen=True)
@@ -99,10 +107,12 @@ class PageEvidence:
     page: int
     method: SourceMethod = SourceMethod.DIGITAL
     paginations: tuple[Pagination, ...] = ()
-    #: The letterhead's top line with its numbering, dates and times taken
-    #: out: what stays the same on every page of one report and names it. A
-    #: section title or an "ADDENDUM" line lower in the band does not change
-    #: which report the page belongs to, so only the top line is used.
+    #: The header band's words, less its numbering, dates, times and the
+    #: claims table's own column labels: what stays the same on every page of
+    #: one report and names it. Compared by containment (see
+    #: :func:`same_heading`), so a heading that adds a section title or an
+    #: "ADDENDUM" line is still the report's, while two carriers sharing a
+    #: generic top line are not one report.
     identity: str | None = None
     #: The header band as printed, shortened, for display.
     heading: str | None = None
@@ -119,24 +129,44 @@ def paginations_in(text: str, source: str) -> list[Pagination]:
     return found
 
 
-def identity_of(text: str | None) -> str | None:
-    """The part of a header band that names the report, or None if nothing does."""
-    if not text:
-        return None
+def _tokens(text: str) -> list[str]:
+    """Words that name a report. Anything carrying a digit -- a policy or
+    account number, a print date, a count -- changes between sections and
+    runs of one report, and is left out."""
     stripped = _VOLATILE.sub(" ", PAGINATION.sub(" ", text))
     words = re.sub(r"[^\w#&]+", " ", stripped.lower()).split()
+    return [word for word in words if not any(ch.isdigit() for ch in word)]
+
+
+def identity_of(text: str | None, exclude: Iterable[str] = ()) -> str | None:
+    """The words of a header band that name the report, or None if none do.
+
+    ``exclude`` is text that is on the band without naming anything -- the
+    claims table's own column labels, where the table starts high enough to
+    reach the band. A band holding nothing else names no report.
+    """
+    if not text:
+        return None
+    dropped = {token for item in exclude for token in _tokens(item)}
+    words = [word for word in dict.fromkeys(_tokens(text)) if word not in dropped]
     if not any(any(ch.isalpha() for ch in word) for word in words):
         return None
     return " ".join(words)
 
 
-def letterhead_identity(lines: Sequence[str]) -> str | None:
-    """The identity of the top-most line that names anything."""
-    for line in lines:
-        identity = identity_of(line)
-        if identity is not None:
-            return identity
-    return None
+def same_heading(one: str | None, other: str | None) -> bool | None:
+    """Whether two pages' headings name the same report; None if either is unknown.
+
+    By containment of their words: one page of a report may print a section
+    title or an "ADDENDUM" line the others do not, and a scanned page's
+    heading as the model transcribes it may be shorter than the text layer's
+    band -- but two different carriers, insureds or policies each print
+    something the other does not.
+    """
+    if not one or not other:
+        return None
+    first, second = set(one.split()), set(other.split())
+    return first <= second or second <= first
 
 
 def heading_of(text: str | None, limit: int = 120) -> str | None:
@@ -156,60 +186,55 @@ class _Segment:
     pages: list[int]
     confidence: RunConfidence
     evidence: list[RunBoundary]
-    #: count -> last index seen, for each numbering the segment follows.
-    tracks: dict[int, int] = field(default_factory=dict)
+    #: The report's own numbering: (last index seen, count). A packet-wide
+    #: stamp beside it is not tracked here -- it numbers the packet, not the
+    #: report, and continuing it says nothing about where the report ends.
+    track: tuple[int, int] | None = None
     ambiguous: bool = False
     ambiguity: str | None = None
+    #: The report stopped before its own last page and another began.
+    incomplete: str | None = None
     identity: str | None = None
     numbered: bool = False
+    tables: bool = False
+    #: Pages joined to the segment without a heading confirming it: its
+    #: claim-number vote may be pooling two reports.
+    blind: set[int] = field(default_factory=set)
 
     @property
     def exhausted(self) -> bool:
         """Whether the report printed its own last page."""
-        if not self.tracks:
-            return False
-        count = min(self.tracks)  # the report's numbering, not a packet stamp
-        return self.tracks[count] >= count
+        return self.track is not None and self.track[0] >= self.track[1]
 
-    def last(self) -> tuple[int, int] | None:
-        if not self.tracks:
+    def continued_by(self, labels: Sequence[Pagination]) -> Pagination | None:
+        if self.track is None:
             return None
-        count = min(self.tracks)
-        return self.tracks[count], count
+        index, count = self.track
+        return next((label for label in labels
+                     if label.count == count and label.index == index + 1), None)
+
+    def span(self) -> str:
+        return _span(self.pages)
+
+
+def _span(pages: Sequence[int]) -> str:
+    pages = sorted(pages)
+    return f"{pages[0]}" if len(pages) == 1 else f"{pages[0]}-{pages[-1]}"
 
 
 def _describe(label: Pagination, page: int) -> str:
-    where = "the vision model read" if label.source == MODEL else f"the {label.source} of page {page} prints"
-    return f"{where} “{label.text.strip()}”"
+    where = {
+        MODEL: "the vision model read",
+        OCR: f"the recognised text of page {page} reads",
+    }.get(label.source, f"the {label.source} of page {page} prints")
+    return f"{where} \u201c{label.text.strip()}\u201d"
 
 
-def _continues(segment: _Segment, labels: Sequence[Pagination]) -> list[Pagination]:
-    return [label for label in labels
-            if segment.tracks.get(label.count) == label.index - 1]
-
-
-def _bridged(
-    segment: _Segment,
-    position: int,
-    pages: Sequence[int],
-    evidence: Mapping[int, PageEvidence],
-) -> bool:
-    """Whether a later page's numbering accounts for this unnumbered page exactly.
-
-    A report's page whose footer did not read still sits inside its count: page
-    2 of 4 followed by an unnumbered page and then page 4 of 4 leaves no doubt
-    what the unnumbered page is. Only an exact fit bridges the gap.
-    """
-    last = segment.last()
-    if last is None:
-        return False
-    index, count = last
-    for ahead, page in enumerate(pages[position:], start=1):
-        labels = evidence.get(page, PageEvidence(page)).paginations
-        if not labels:
-            continue
-        return any(label.count == count and label.index == index + ahead for label in labels)
-    return False
+def _confidence(labels: Iterable[Pagination]) -> RunConfidence:
+    labels = list(labels)
+    if labels and all(label.source in _READ for label in labels):
+        return RunConfidence.MODEL
+    return RunConfidence.PRINTED
 
 
 def _one_number_per_count(
@@ -226,191 +251,284 @@ def _one_number_per_count(
     for label in labels:
         by_count.setdefault(label.count, []).append(label)
     kept: list[Pagination] = []
-    for count, group in by_count.items():
-        indices = {label.index for label in group}
-        if len(indices) == 1:
+    for group in by_count.values():
+        if len({label.index for label in group}) == 1:
             kept.append(group[0])
             continue
-        continuing = [
-            label for label in group
-            if current is not None and current.tracks.get(count) == label.index - 1
-        ]
-        if continuing:
-            kept.append(continuing[0])
+        continuing = current.continued_by(group) if current is not None else None
+        if continuing is not None:
+            kept.append(continuing)
             continue
-        shown = " and ".join(f"“{label.text.strip()}”" for label in group)
+        shown = " and ".join(f"\u201c{label.text.strip()}\u201d" for label in group)
         return [], f"the page's furniture prints {shown}, and neither follows the page before"
     return kept, None
 
 
-def _confidence(labels: Iterable[Pagination]) -> RunConfidence:
-    labels = list(labels)
-    if labels and all(label.source == MODEL for label in labels):
-        return RunConfidence.MODEL
-    return RunConfidence.PRINTED
+class _Planner:
+    """Walks the pages in order and cuts them into segments by their furniture."""
 
+    def __init__(self, pages: Sequence[int], evidence: Mapping[int, PageEvidence],
+                 tables: set[int]) -> None:
+        self.pages = list(pages)
+        self.evidence = evidence
+        self.tables = tables
+        self.segments: list[_Segment] = []
+        self.current: _Segment | None = None
+        #: Packet-wide numbering printed beside a report's own: count -> last index.
+        self.stamps: dict[int, int] = {}
 
-def _segments(
-    pages: Sequence[int], evidence: Mapping[int, PageEvidence]
-) -> list[_Segment]:
-    segments: list[_Segment] = []
-    current: _Segment | None = None
-    for position, page in enumerate(pages):
-        page_evidence = evidence.get(page, PageEvidence(page))
-        labels, conflict = _one_number_per_count(page_evidence.paginations, current)
+    # -- helpers -----------------------------------------------------------
+
+    def page_evidence(self, page: int) -> PageEvidence:
+        return self.evidence.get(page) or PageEvidence(page)
+
+    def own_labels(self, page: int, *, record: bool = False) -> list[Pagination]:
+        """The page's numbering less any packet-wide stamp it continues."""
+        labels = list(self.page_evidence(page).paginations)
+        stamped = [label for label in labels
+                   if self.stamps.get(label.count) == label.index - 1
+                   and (self.current is None or self.current.continued_by([label]) is None)]
+        if record:
+            for label in stamped:
+                self.stamps[label.count] = label.index
+        return [label for label in labels if label not in stamped]
+
+    def start(self, page: int, **fields) -> _Segment:
+        segment = _Segment(pages=[page], identity=self.page_evidence(page).identity,
+                           tables=page in self.tables, **fields)
+        self.segments.append(segment)
+        self.current = segment
+        return segment
+
+    def add(self, segment: _Segment, page: int) -> None:
+        segment.pages.append(page)
+        segment.tables = segment.tables or page in self.tables
+        self.current = segment
+
+    def close_short(self, page: int) -> None:
+        """A new report begins while the current one has not printed its last page."""
+        current = self.current
+        if current is None or not current.numbered or current.exhausted or not current.tables:
+            return
+        if current.track is not None and current.track[1] in self.stamps:
+            return  # it was following the packet's numbering, not a report's
+        index, count = current.track  # type: ignore[misc]
+        current.incomplete = (
+            f"the report on pages {current.span()} stops at page {index} of {count}: "
+            f"its remaining page(s) are not in this PDF, or were not read as its own"
+        )
+
+    def unnumbered_run_ahead(self, position: int) -> tuple[int, Pagination | None]:
+        """How many pages from here print no numbering of their own, and the
+        first numbering after them."""
+        count = 0
+        for page in self.pages[position:]:
+            labels = [label for label in self.page_evidence(page).paginations
+                      if label.count not in self.stamps]
+            if labels:
+                return count, labels[0]
+            count += 1
+        return count, None
+
+    def interrupted(self, labels: Sequence[Pagination]) -> _Segment | None:
+        """The report a run of pages without claims tables interrupted, if this
+        page continues its numbering -- an ACORD form bound inside a report
+        numbers itself "1 of 1" and does not end the report around it."""
+        if self.current is None or self.current.tables:
+            return None
+        for segment in reversed(self.segments):
+            if segment is self.current or not segment.tables:
+                continue
+            if segment.numbered and segment.continued_by(labels) is not None:
+                return segment
+            return None
+        return None
+
+    # -- the walk ----------------------------------------------------------
+
+    def run(self) -> list[_Segment]:
+        for position, page in enumerate(self.pages):
+            self.step(position, page)
+        return self.segments
+
+    def step(self, position: int, page: int) -> None:
+        page_evidence = self.page_evidence(page)
+        labels, conflict = _one_number_per_count(self.own_labels(page, record=True), self.current)
         if conflict is not None:
             why = f"page {page}: {conflict}"
-            current = _Segment(
-                pages=[page], confidence=_confidence(page_evidence.paginations),
-                evidence=[RunBoundary(page=page, kind="break", source="none", text=why)],
-                ambiguous=True, ambiguity=why, identity=page_evidence.identity,
-                numbered=True,
-            )
-            segments.append(current)
-            continue
-        openers = [label for label in labels if label.index == 1]
-        continuing = _continues(current, labels) if current is not None else []
+            self.close_short(page)
+            self.start(page, confidence=_confidence(page_evidence.paginations),
+                       evidence=[RunBoundary(page=page, kind="break", source="none", text=why)],
+                       ambiguous=True, ambiguity=why, numbered=True)
+            return
 
+        current = self.current
+        continuing = current.continued_by(labels) if current is not None else None
+        openers = [label for label in labels if label.index == 1]
+        if (continuing is not None and not current.tables
+                and any(label.count < continuing.count for label in openers)):
+            # Pages carrying no claims table, numbered only by a packet-wide
+            # stamp, and then a report's own page 1 inside that stamp: the
+            # numbering followed so far was the packet's.
+            self.stamps[continuing.count] = continuing.index
+            labels = [label for label in labels if label is not continuing]
+            continuing = None
+        if continuing is not None:
+            self.add(current, page)
+            current.track = (continuing.index, continuing.count)
+            return
+
+        resumed = self.interrupted(labels)
+        if resumed is not None:
+            label = resumed.continued_by(labels)
+            self.add(resumed, page)
+            resumed.track = (label.index, label.count)
+            resumed.evidence.append(RunBoundary(
+                page=page, kind="continued", source=label.source,
+                text=f"{_describe(label, page)}: the report resumes after pages that "
+                     f"carry no claims table",
+            ))
+            return
+
+        if openers and current is not None and current.numbered and not current.exhausted:
+            # "Page 1 of N" again while the report on the pages before has not
+            # printed its own last page of that count, and nothing says this
+            # is another report: a back-reference ("continued from Page 1 of
+            # 2"), not this page's number. The page is read as unnumbered.
+            index, count = current.track  # type: ignore[misc]
+            repeated = [label for label in openers if label.count == count]
+            if repeated and same_heading(page_evidence.identity, current.identity) is not False:
+                labels = [label for label in labels if label not in repeated]
+                openers = [label for label in openers if label not in repeated]
+            elif repeated:
+                # Under another heading it may be another report of the same
+                # length -- or the same back-reference. Nothing settles it.
+                label = repeated[0]
+                why = (f"page {page} prints \u201c{label.text.strip()}\u201d while the "
+                       f"report on pages {current.span()} has printed only page {index} "
+                       f"of {count}: another report, or a reference to that one")
+                self.start(page, confidence=_confidence(repeated),
+                           evidence=[RunBoundary(page=page, kind="break",
+                                                 source=label.source, text=why)],
+                           track=(label.index, label.count), ambiguous=True,
+                           ambiguity=why, numbered=True)
+                return
         if openers:
             opener = min(openers, key=lambda label: label.count)
-            current = _Segment(
-                pages=[page],
-                confidence=_confidence(openers),
-                evidence=[RunBoundary(
-                    page=page, kind="opened", source=opener.source,
-                    text=f"{_describe(opener, page)}: a report begins here",
-                )],
-                tracks={label.count: label.index for label in labels},
-                identity=page_evidence.identity,
-                numbered=True,
-            )
-            segments.append(current)
-            continue
-
-        if current is not None and continuing:
-            current.pages.append(page)
-            for label in continuing:
-                current.tracks[label.count] = label.index
-            continue
+            for label in labels:
+                if label is not opener:
+                    self.stamps[label.count] = label.index
+            self.close_short(page)
+            self.start(page, confidence=_confidence([opener]),
+                       evidence=[RunBoundary(
+                           page=page, kind="opened", source=opener.source,
+                           text=f"{_describe(opener, page)}: a report begins here")],
+                       track=(1, opener.count), numbered=True)
+            return
 
         if labels and current is not None and not current.numbered:
-            # A report need not print its first page's number. "Page 3 of 5"
-            # after unnumbered pages says its report began two pages earlier;
-            # where those pages are here, unnumbered, they are its pages 1-2.
-            adopted = next(
-                (label for label in sorted(labels, key=lambda item: item.count)
-                 if 1 <= label.index - 1 <= len(current.pages)),
-                None,
-            )
-            if adopted is not None:
-                back = adopted.index - 1
-                moved = current.pages[-back:]
-                current.pages = current.pages[:-back]
-                if not current.pages:
-                    segments.remove(current)
-                opened = RunBoundary(
-                    page=moved[0], kind="opened", source=adopted.source,
-                    text=f"{_describe(adopted, page)}: its report began {back} page(s) "
-                         f"earlier, on page {moved[0]}",
-                )
-                prior = [] if current.pages else list(current.evidence)
-                current = _Segment(
-                    pages=[*moved, page], confidence=_confidence([adopted]),
-                    evidence=[opened, *prior],
-                    tracks={label.count: label.index for label in labels},
-                    identity=evidence.get(moved[0], page_evidence).identity
-                    or page_evidence.identity,
-                    numbered=True,
-                )
-                segments.append(current)
-                continue
+            if self.adopt(page, labels):
+                return
 
         if labels:
-            # Numbered, but neither opening a report nor continuing the one
-            # before it: pages are missing, out of order, or from elsewhere.
-            label = labels[0]
-            before = current.last() if current is not None else None
+            label = min(labels, key=lambda item: item.count)
+            before = current.track if current is not None else None
             why = (
-                f"page {page} prints “{label.text.strip()}”, which does not "
+                f"page {page} prints \u201c{label.text.strip()}\u201d, which does not "
                 + (f"follow page {before[0]} of {before[1]}" if before else "begin a report")
             )
-            current = _Segment(
-                pages=[page], confidence=_confidence(labels),
-                evidence=[RunBoundary(page=page, kind="break", source=label.source, text=why)],
-                tracks={item.count: item.index for item in labels},
-                ambiguous=True, ambiguity=why,
-                identity=page_evidence.identity, numbered=True,
-            )
-            segments.append(current)
-            continue
+            self.close_short(page)
+            self.start(page, confidence=_confidence(labels),
+                       evidence=[RunBoundary(page=page, kind="break", source=label.source, text=why)],
+                       track=(label.index, label.count), ambiguous=True, ambiguity=why,
+                       numbered=True)
+            return
 
-        # No numbering on this page.
+        self.unnumbered(position, page, page_evidence)
+
+    def adopt(self, page: int, labels: Sequence[Pagination]) -> bool:
+        """"Page k of N" after unnumbered pages: its report began k-1 pages back."""
+        current = self.current
+        assert current is not None
+        label = next((item for item in sorted(labels, key=lambda item: item.count)
+                      if 1 <= item.index - 1 <= len(current.pages)), None)
+        if label is None:
+            return False
+        back = label.index - 1
+        moved = current.pages[-back:]
+        current.pages = current.pages[:-back]
+        current.tables = bool(self.tables & set(current.pages))
+        prior = [] if current.pages else list(current.evidence)
+        if not current.pages:
+            self.segments.remove(current)
+        segment = _Segment(
+            pages=[*moved, page], confidence=_confidence([label]),
+            evidence=[RunBoundary(
+                page=moved[0], kind="opened", source=label.source,
+                text=f"{_describe(label, page)}: its report began {back} page(s) earlier, "
+                     f"on page {moved[0]}"), *prior],
+            track=(label.index, label.count),
+            identity=self.page_evidence(moved[0]).identity or self.page_evidence(page).identity,
+            numbered=True, tables=bool(self.tables & {*moved, page}),
+        )
+        self.segments.append(segment)
+        self.current = segment
+        return True
+
+    def unnumbered(self, position: int, page: int, page_evidence: PageEvidence) -> None:
+        current = self.current
         if current is None:
-            current = _Segment(
-                pages=[page], confidence=RunConfidence.NONE,
-                evidence=[RunBoundary(
-                    page=page, kind="leading", source="none",
-                    text=f"page {page} prints no page number",
-                )],
-                identity=page_evidence.identity,
-            )
-            segments.append(current)
-        elif not current.numbered:
-            current.pages.append(page)
-        elif current.exhausted:
-            index, count = current.last()  # type: ignore[misc]
-            ended = (
-                f"the report on pages {current.pages[0]}-{current.pages[-1]} printed "
-                f"its last page ({index} of {count}); page {page} prints no page number"
-            )
-            other = (
-                page_evidence.identity is not None and current.identity is not None
-                and page_evidence.identity != current.identity
-            )
-            if other:
-                current = _Segment(
-                    pages=[page], confidence=RunConfidence.INFERRED,
-                    evidence=[RunBoundary(
-                        page=page, kind="unnumbered", source="none",
-                        text=f"{ended} under a different heading, so it begins another report",
-                    )],
-                    identity=page_evidence.identity,
-                )
+            self.start(page, confidence=RunConfidence.NONE, evidence=[RunBoundary(
+                page=page, kind="leading", source="none",
+                text=f"page {page} prints no page number")])
+            return
+        if not current.numbered:
+            self.add(current, page)
+            return
+
+        index, count = current.track  # type: ignore[misc]
+        heading = same_heading(page_evidence.identity, current.identity)
+        if current.exhausted:
+            ended = (f"the report on pages {current.span()} printed its last page "
+                     f"({index} of {count}); page {page} prints no page number")
+            if heading is False:
+                self.start(page, confidence=RunConfidence.INFERRED, evidence=[RunBoundary(
+                    page=page, kind="unnumbered", source="none",
+                    text=f"{ended} under a different heading, so it begins another report")])
             else:
-                heading = "the same heading" if page_evidence.identity else "no heading"
-                why = (
-                    f"{ended} under {heading}: it may be an addendum to that report "
-                    f"or another report"
-                )
-                current = _Segment(
-                    pages=[page], confidence=RunConfidence.NONE,
-                    evidence=[RunBoundary(page=page, kind="unnumbered", source="none", text=why)],
-                    ambiguous=True, ambiguity=why, identity=page_evidence.identity,
-                )
-            segments.append(current)
-        elif _bridged(current, position, pages, evidence):
-            current.pages.append(page)
+                why = (f"{ended} under {'the same heading' if heading else 'no heading'}: "
+                       f"it may be an addendum to that report or another report")
+                self.start(page, confidence=RunConfidence.NONE, evidence=[RunBoundary(
+                    page=page, kind="unnumbered", source="none", text=why)],
+                    ambiguous=True, ambiguity=why)
+            return
+
+        # The report has not printed its last page. An unnumbered page inside
+        # its count is its own page with the number unread -- when the pages
+        # after it account for it exactly, or when nothing after it contradicts
+        # that and it is not under another report's heading.
+        ahead, next_label = self.unnumbered_run_ahead(position)
+        exact = (next_label is not None and next_label.count == count
+                 and next_label.index == index + ahead + 1)
+        fits = (heading is not False and index + ahead <= count
+                and (next_label is None or next_label.index == 1))
+        if exact or fits:
+            self.add(current, page)
+            if not exact and heading is None:
+                current.blind.add(page)
+            current.track = (index + 1, count)
             current.evidence.append(RunBoundary(
                 page=page, kind="continued", source="none",
-                text=f"page {page} prints no page number; the report's numbering "
-                     f"continues across it",
+                text=f"page {page} prints no page number; it is within the report's own "
+                     f"count as page {index + 1} of {count}",
             ))
-            index, count = current.last()  # type: ignore[misc]
-            current.tracks[count] = index + 1
-        else:
-            index, count = current.last()  # type: ignore[misc]
-            why = (
-                f"the report on pages {current.pages[0]}-{current.pages[-1]} stopped at "
-                f"page {index} of {count}, and page {page} prints no page number: it may "
-                f"continue that report or begin another"
-            )
-            current = _Segment(
-                pages=[page], confidence=RunConfidence.NONE,
-                evidence=[RunBoundary(page=page, kind="unnumbered", source="none", text=why)],
-                ambiguous=True, ambiguity=why, identity=page_evidence.identity,
-            )
-            segments.append(current)
-    return segments
+            return
+        why = (f"the report on pages {current.span()} stopped at page {index} of {count}, "
+               f"and page {page} prints no page number: it may continue that report or "
+               f"begin another")
+        self.start(page, confidence=RunConfidence.NONE, evidence=[RunBoundary(
+            page=page, kind="unnumbered", source="none", text=why)],
+            ambiguous=True, ambiguity=why)
 
 
 def _merge(into: _Segment, other: _Segment, boundary: RunBoundary | None = None) -> None:
@@ -419,10 +537,24 @@ def _merge(into: _Segment, other: _Segment, boundary: RunBoundary | None = None)
     into.evidence.extend(other.evidence)
     if boundary is not None:
         into.evidence.append(boundary)
-    into.tracks = other.tracks or into.tracks
+    into.track = other.track or into.track
     into.numbered = into.numbered or other.numbered
+    into.tables = into.tables or other.tables
+    into.incomplete = other.incomplete
+    into.blind |= other.blind
     if other.ambiguous and not into.ambiguous:
         into.ambiguous, into.ambiguity = True, other.ambiguity
+
+
+def _merge_quietly(into: _Segment, other: _Segment) -> None:
+    """Attach pages that carry no claims table; their numbering settles nothing."""
+    into.pages.extend(other.pages)
+    into.pages.sort()
+    if other.pages:
+        into.evidence.append(RunBoundary(
+            page=min(other.pages), kind="attached", source="none",
+            text=f"page(s) {_span(other.pages)} carry no claims table and join this run",
+        ))
 
 
 def plan_runs(
@@ -438,7 +570,10 @@ def plan_runs(
     """
     pages = sorted(pages)
     tables = set(table_pages)
-    segments = _segments(pages, evidence)
+    segments = _Planner(pages, evidence, tables).run()
+    for segment in segments:
+        segment.pages.sort()
+        segment.tables = bool(tables & set(segment.pages))
     if len(segments) > 1 and segments[0].confidence is RunConfidence.NONE \
             and not segments[0].ambiguous:
         # Pages ahead of a report's own page 1 cannot be part of that report.
@@ -455,24 +590,31 @@ def plan_runs(
     for segment in segments:
         previous = merged[-1] if merged else None
         opened = segment.evidence and segment.evidence[0].kind == "opened"
+        heading = same_heading(segment.identity, previous.identity) if previous else None
         if (
             previous is not None and opened and previous.numbered
-            and previous.exhausted and not segment.ambiguous
-            and segment.identity is not None and segment.identity == previous.identity
+            and previous.exhausted and not segment.ambiguous and heading is not False
         ):
+            # A restart alone is not a new report -- sections restart too.
+            # Only a heading naming something else makes one.
             _merge(previous, segment, RunBoundary(
                 page=segment.pages[0], kind="section", source=segment.evidence[0].source,
-                text=f"numbering restarts on page {segment.pages[0]} under the same "
-                     f"heading: a section of the same report",
+                text=(f"numbering restarts on page {segment.pages[0]} under the same "
+                      f"heading: a section of the same report") if heading else
+                     (f"numbering restarts on page {segment.pages[0]} and nothing on it "
+                      f"names another report: read as a section of the same report"),
             ))
+            if heading is None:
+                previous.blind.update(segment.pages)
             continue
         merged.append(segment)
 
-    # Pages with no claims table are not a run of their own.
+    # Pages with no claims table are not a run of their own, and nothing
+    # unsettled about them puts a claim at risk.
     runs: list[_Segment] = []
     pending: list[_Segment] = []
     for segment in merged:
-        if tables & set(segment.pages):
+        if segment.tables:
             for held in pending:
                 _merge_quietly(segment, held)
             pending = []
@@ -493,20 +635,32 @@ def plan_runs(
     return runs
 
 
-def _merge_quietly(into: _Segment, other: _Segment) -> None:
-    """Attach pages that carry no claims table; their numbering settles nothing."""
-    into.pages.extend(other.pages)
-    into.pages.sort()
-    if other.pages:
-        into.evidence.append(RunBoundary(
-            page=min(other.pages), kind="attached", source="none",
-            text=f"page(s) {_span(other.pages)} carry no claims table and join this run",
-        ))
+@dataclass
+class Plan:
+    """What the pages settle about the runs a document binds."""
+
+    #: The logical runs; empty for a single loss run.
+    runs: list[LogicalRun]
+    #: Whether any page prints numbering in its furniture. Without it, the
+    #: claim-number vote was taken over pages nothing bounds.
+    bounded: bool
+    #: Pages joined to a run with nothing confirming they belong to it.
+    blind: set[int]
 
 
-def _span(pages: Sequence[int]) -> str:
-    pages = sorted(pages)
-    return f"{pages[0]}" if len(pages) == 1 else f"{pages[0]}-{pages[-1]}"
+def plan_packet(
+    pages: Sequence[int],
+    evidence: Mapping[int, PageEvidence],
+    table_pages: Iterable[int],
+    methods: Mapping[int, SourceMethod] | None = None,
+) -> Plan:
+    table_pages = set(table_pages)
+    segments = plan_runs(pages, evidence, table_pages)
+    return Plan(
+        runs=_as_runs(segments, table_pages, methods),
+        bounded=any(item.paginations for item in evidence.values()),
+        blind={page for segment in segments for page in segment.blind},
+    )
 
 
 def logical_runs(
@@ -516,7 +670,15 @@ def logical_runs(
     methods: Mapping[int, SourceMethod] | None = None,
 ) -> list[LogicalRun]:
     """The document's logical runs; empty when it is a single loss run."""
-    segments = plan_runs(pages, evidence, table_pages)
+    table_pages = set(table_pages)
+    return _as_runs(plan_runs(pages, evidence, table_pages), table_pages, methods)
+
+
+def _as_runs(
+    segments: Sequence[_Segment],
+    table_pages: set[int],
+    methods: Mapping[int, SourceMethod] | None,
+) -> list[LogicalRun]:
     if len(segments) < 2:
         return []
     tables = set(table_pages)
@@ -531,30 +693,42 @@ def logical_runs(
             confidence=segment.confidence,
             ambiguous=segment.ambiguous,
             ambiguity=segment.ambiguity,
+            incomplete=segment.incomplete,
             evidence=segment.evidence,
             source_methods=used,
             table_pages=sorted(tables & set(segment.pages)),
         ))
+    if runs[-1].incomplete is None:
+        last = segments[-1]
+        if last.numbered and not last.exhausted and last.track is not None:
+            index, count = last.track
+            runs[-1].incomplete = (
+                f"the report on pages {runs[-1].page_range} stops at page {index} of "
+                f"{count}: its remaining page(s) are not in this PDF"
+            )
     return runs
 
 
-def vote_groups(runs: Sequence[LogicalRun]) -> dict[int, int] | None:
-    """Page -> the claim-number vote it takes part in; None for a single run.
+def vote_plan(runs: Sequence[LogicalRun]) -> tuple[dict[int, int] | None, dict[int, int]]:
+    """Page -> run index for the claim-number vote, and which runs borrow a vote.
 
-    Every settled run votes on its own claim numbers. An unsettled run votes
-    with the run before it: nothing printed says it is a separate report, and
-    a vote of its own would say exactly that.
+    Every settled run votes on its own claim numbers, and on nothing else's.
+    An unsettled run takes the vote of the settled run before it: nothing
+    printed says it is a separate report, and a vote of its own would say
+    exactly that -- while pooling its rows into that run's vote would let it
+    outvote the run it follows. Returns ``(None, {})`` for a single run.
     """
     if len(runs) < 2:
-        return None
-    groups: dict[int, int] = {}
-    group = -1
-    for run in runs:
-        if not run.ambiguous or group < 0:
-            group += 1
-        for page in run.pages:
-            groups[page] = group
-    return groups
+        return None, {}
+    groups = {page: index for index, run in enumerate(runs) for page in run.pages}
+    borrowed: dict[int, int] = {}
+    settled = None
+    for index, run in enumerate(runs):
+        if run.ambiguous and settled is not None:
+            borrowed[index] = settled
+        elif not run.ambiguous:
+            settled = index
+    return groups, borrowed
 
 
 def vision_evidence(tables: Iterable) -> dict[int, PageEvidence]:
@@ -573,7 +747,7 @@ def vision_evidence(tables: Iterable) -> dict[int, PageEvidence]:
             page=table.page,
             method=SourceMethod.VISION,
             paginations=labels,
-            identity=letterhead_identity((table.heading or "").splitlines()),
+            identity=identity_of(table.heading, exclude=table.headers),
             heading=heading_of(table.heading),
         )
     return evidence

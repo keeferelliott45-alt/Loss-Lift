@@ -39,7 +39,7 @@ from core.runs import (
     PAGINATION,
     PageEvidence,
     heading_of,
-    letterhead_identity,
+    identity_of,
     paginations_in,
 )
 from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable, SourceMethod
@@ -1760,11 +1760,14 @@ def page_evidence(
     landscape report stored as a rotated portrait page reports its words
     turned upright, so its header is at the top here too.
     """
-    bbox = getattr(page, "bbox", None)
-    if bbox is None:
+    # The visible page is the crop box; text outside it is not printed on
+    # the page anyone sees. pdfplumber gives the crop box in the words' own
+    # top-left space.
+    box = getattr(page, "cropbox", None) or getattr(page, "bbox", None)
+    if box is None:
         # No geometry, no furniture: nothing here can say where a report is.
         return PageEvidence(page=number, method=SourceMethod.DIGITAL)
-    x0, top, x1, bottom = bbox
+    x0, top, x1, bottom = box
     band = (bottom - top) * BAND_FRACTION
     regions: list[tuple[float, float, float, float]] = []
     if table is not None:
@@ -1778,14 +1781,33 @@ def page_evidence(
             for left, upper, right, lower in regions
         )
 
-    head = [w for w in words if w.centre <= top + band and not inside_table(w)]
-    foot = [w for w in words if w.centre >= bottom - band and not inside_table(w)]
-    head_lines, foot_lines = cluster_lines(head), cluster_lines(foot)
+    visible = [w for w in words if x0 <= w.middle <= x1 and top <= w.centre <= bottom]
+    head_lines = cluster_lines([w for w in visible if w.centre <= top + band])
+    foot_lines = cluster_lines([w for w in visible if w.centre >= bottom - band])
+
+    def furniture(line: Line) -> bool:
+        """A band line outside the claims table -- or one saying nothing but
+        its page number, which a table can swallow as its last row."""
+        if not any(inside_table(word) for word in line.words):
+            return True
+        rest = PAGINATION.sub(" ", line.text)
+        return bool(PAGINATION.search(line.text)) and not any(ch.isdigit() for ch in rest)
+
+    head_lines = [line for line in head_lines if furniture(line)]
+    foot_lines = [line for line in foot_lines if furniture(line)]
     paginations = [
         *(found for line in head_lines for found in paginations_in(line.text, HEADER)),
         *(found for line in foot_lines for found in paginations_in(line.text, FOOTER)),
     ]
     heading = " ".join(line.text for line in head_lines)
+    # A page whose text runs sideways has no header band to speak of: its
+    # "top" is one edge of a turned table.
+    chars = getattr(page, "chars", None) or []
+    upright = sum(1 for char in chars if char.get("upright", True))
+    sideways = bool(chars) and upright * 2 < len(chars)
+    identity = None if sideways else identity_of(
+        heading, exclude=table.headers if table is not None else ()
+    )
 
     # Everything the page text calls a page number, less what the bands hold.
     seen = [" ".join(match.group(0).split()).lower() for match in PAGINATION.finditer(text)]
@@ -1797,7 +1819,7 @@ def page_evidence(
         page=number,
         method=SourceMethod.DIGITAL,
         paginations=tuple(paginations),
-        identity=letterhead_identity([line.text for line in head_lines]),
+        identity=identity,
         heading=heading_of(heading),
         ignored=tuple(seen),
     )

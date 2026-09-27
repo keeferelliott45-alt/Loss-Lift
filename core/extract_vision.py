@@ -27,6 +27,7 @@ from typing import Any, Iterator, Sequence
 import pymupdf
 
 from core.normalize import clean_text
+from core.runs import paginations_in
 from core.schema import RawRow, RawTable
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "extract_vision.md"
@@ -179,7 +180,13 @@ def _page_label(value: object) -> tuple[str, int, int, str] | None:
         return None
     if position not in ("header", "footer"):
         return None
-    text = clean_text(str(value.get("text") or "")) or f"Page {number} of {count}"
+    # The words must say what the numbers say, in the form the text layer's
+    # reader accepts: a label the digital path would not take as page
+    # numbering is not taken off a scan either.
+    text = clean_text(str(value.get("text") or ""))
+    stated = [(found.index, found.count) for found in paginations_in(text, "model")]
+    if (number, count) not in stated:
+        return None
     return text, number, count, position
 
 

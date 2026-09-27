@@ -552,6 +552,9 @@ class LogicalRun(BaseModel):
     #: claims are neither dropped nor handed to a neighbour -- and reviewed.
     ambiguous: bool = False
     ambiguity: str | None = None
+    #: The report stopped before its own last page ("2 of 3") and another
+    #: began, or the PDF ended: pages of it -- and their claims -- are missing.
+    incomplete: str | None = None
     evidence: list[RunBoundary] = Field(default_factory=list)
     source_methods: list[SourceMethod] = Field(default_factory=list)
     #: Pages carrying a claims table the run's claims were read from.
@@ -561,6 +564,7 @@ class LogicalRun(BaseModel):
     named_insured: str | None = None
     policy_number: str | None = None
     valuation_date_text: str | None = None
+    valuation_date: date | None = None
 
     #: What this run printed about itself, read from its own pages only.
     printed_totals: dict[str, Money | None] = Field(default_factory=dict)
@@ -609,6 +613,10 @@ class RefusedClaimRow(BaseModel):
     #: Whether the row's run is bounded by what its pages print. Unbounded,
     #: the vote that refused it may have pooled two reports' claim numbers.
     bounded: bool = True
+    #: Whether a reviewer must be told (R-29): in a packet, where another
+    #: report's numbering is the likeliest reason for a refusal, or on a scan
+    #: nothing bounds. Rows in an unsettled run are named by R-28 instead.
+    report: bool = False
 
 
 class LossRunDocument(BaseModel):

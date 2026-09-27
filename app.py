@@ -1414,7 +1414,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         num_rows="dynamic",
         width="stretch",
         hide_index=True,
-        column_config=_column_config(columns),
+        column_config=_column_config(columns, packet=result.document.is_packet),
         column_order=list(columns) + list(PROVENANCE_COLUMNS),
     )
 
@@ -1430,7 +1430,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
                 st.rerun()
 
 
-def _column_config(columns: list[str]) -> dict[str, Any]:
+def _column_config(columns: list[str], *, packet: bool = False) -> dict[str, Any]:
     config: dict[str, Any] = {}
     for name in columns:
         label = _FIELD_LABELS.get(name, name)
@@ -1450,7 +1450,14 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
         else:
             config[name] = st.column_config.TextColumn(label)
 
-    config["_page"] = st.column_config.NumberColumn("Page", disabled=True, width="small")
+    # In a packet the page decides which loss run a claim belongs to, so a row
+    # added by hand takes the page the reviewer gives it. A row read off the
+    # document keeps the page it was read from, whatever is typed here.
+    config["_page"] = st.column_config.NumberColumn(
+        "Page", disabled=not packet, width="small", min_value=1, step=1,
+        help=("For a claim you add, the page of the loss run it belongs to."
+              if packet else None),
+    )
     config["_row"] = st.column_config.NumberColumn("Line", disabled=True, width="small")
     config["_method"] = st.column_config.TextColumn(
         "Read by", disabled=True, width="small"
