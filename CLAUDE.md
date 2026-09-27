@@ -2,6 +2,8 @@
 
 Drop this in the repo root as `CLAUDE.md`. Claude Code reads it automatically on every session.
 
+> **Coding agents:** start with `AGENTS.md` (rules, reading order, checks). This file is the product spec.
+
 ---
 
 **Companion repo:** the marketing/front-end site is separate from this repo, at `keeferelliott45-alt/LostLift-Front-page` (private GitHub repo — note the name is spelled "LostLift", not "LossLift"). React + Vite + TypeScript + Tailwind, built with Bolt.new; includes a Supabase migration for pilot-signup inquiries. Different stack, not part of the Streamlit app below — access it with `add_repo` when needed.
