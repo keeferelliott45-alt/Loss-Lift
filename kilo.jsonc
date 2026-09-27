@@ -1,0 +1,11 @@
+// Kilo project configuration for LossLift.
+//
+// CLAUDE.md is the authoritative product spec and is loaded automatically.
+// AGENTS.md is the agent entry point. The rules below add LossLift-specific
+// guardrails; they must never duplicate or contradict CLAUDE.md.
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "instructions": [
+    ".kilo/rules/*.md"
+  ]
+}
