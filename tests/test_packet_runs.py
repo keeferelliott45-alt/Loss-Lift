@@ -636,3 +636,41 @@ def test_numbering_that_cannot_account_for_the_pages_before_it_is_unsettled():
     }
     assert [(s.pages, s.ambiguous) for s in plan_runs([1, 2], evidence, {1, 2})] == [
         ([1], False), ([2], True)]
+
+
+def test_numbering_restarts_are_not_run_boundaries(tmp_path):
+    """A packet shaped like a board submission: a cover, policy forms and
+    schedules each numbering their own pages, one carrier's report restarting
+    its numbering by section, and a second carrier's one-claim report. Seven
+    page-1s, two loss runs -- and every claim read."""
+    from tests.test_packet_p1_regressions import _page_ex
+
+    document = pymupdf.open()
+
+    def forms(title, count):
+        for index in range(count):
+            page = document.new_page(width=612, height=792)
+            page.insert_text((40, 36), f"{title}   Page {index + 1} of {count}", fontsize=8)
+            page.insert_text((40, 120), "This form describes coverage. See Page 1 of 3 "
+                             "of the declarations.", fontsize=9)
+
+    forms("RFP COVER", 1)
+    forms("POLICY DECLARATIONS", 3)
+    forms("ENDORSEMENTS", 2)
+    large = _large_run(24)
+    _page_ex(document, LARGE_CARRIER, LARGE_HEADERS, large[:8], marker="Page 1 of 2")
+    _page_ex(document, LARGE_CARRIER, LARGE_HEADERS, large[8:16], marker="Page 2 of 2")
+    _page_ex(document, LARGE_CARRIER, LARGE_HEADERS, large[16:], marker="Page 1 of 1")
+    forms("SCHEDULE OF LOCATIONS", 2)
+    _page_ex(document, SMALL_CARRIER, SMALL_HEADERS, list(SMALL_RUN[:1]), marker="Page 1 of 1")
+    forms("TERMS AND CONDITIONS", 4)
+    document.save(tmp_path / "board.pdf")
+    document.close()
+
+    result = run_pipeline(tmp_path / "board.pdf", use_vision=False,
+                          profiles_dir=tmp_path / "profiles")
+    runs = result.document.runs
+    assert [(run.page_range, run.ambiguous) for run in runs] == [("1-11", False), ("12-16", False)]
+    assert [len(result.document.run_claims(run)) for run in runs] == [24, 1]
+    assert _numbers(result) == [row[0] for row in large] + [SMALL_RUN[0][0]]
+    assert result.reconciliation.status is DocumentStatus.CLEAN
