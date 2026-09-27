@@ -41,6 +41,16 @@ ALLOWLIST_VERSION = 1
 _FIELD_PATH = re.compile(r"[A-Za-z0-9_.:/<>-]{1,240}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _GROUP = re.compile(r"[a-z][a-z_]{0,31}")
+_ERROR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _error_name(value: Any) -> str:
+    """An exception's type name as the collector wrote it, or a placeholder.
+
+    The collector is started by the gate but runs beside the revision's own
+    code, so what it wrote is checked here before any of it reaches a report.
+    """
+    return value if isinstance(value, str) and _ERROR_NAME.fullmatch(value) else "UnnamedError"
 _ENTRY_KEYS = {
     "document_id",
     "document_sha256",
@@ -126,7 +136,7 @@ def read_run(path: Path, run: RevisionRun) -> RevisionRun:
             break
         kind = record.get("kind")
         if kind == "fatal":
-            run.fatal = str(record.get("error_type", "UnnamedError"))
+            run.fatal = _error_name(record.get("error_type"))
         elif kind == "document":
             run.records[str(record.get("id"))] = record
         elif kind == "complete":
@@ -246,7 +256,7 @@ def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
 
 
 def _failure(doc_id: str, label: str, record: dict[str, Any]) -> str:
-    error = record.get("error_type", "UnnamedError")
+    error = _error_name(record.get("error_type"))
     group = record.get("unmeasured")
     if group is None:
         return f"{doc_id}: {label} raised {error}"

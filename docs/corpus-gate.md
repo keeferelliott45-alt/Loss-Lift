@@ -67,6 +67,12 @@ measured part of the corpus has not passed. Nor has one whose measurement
 raised: a document is measured completely or not at all, and two commits
 failing the same way have measured nothing, not the same thing.
 
+**From the browser**, with no local terminal: the *Corpus gate* GitHub
+workflow runs this same command on a private corpus release, with each
+commit's collector in a container that has no network and no credentials.
+New documents join the corpus through the *Corpus update* workflow. See
+[cloud-corpus-gate.md](cloud-corpus-gate.md).
+
 ## One-time setup
 
 Keep the real documents **outside the repository**, anywhere on local disk.
@@ -154,8 +160,12 @@ output, even by accident:
   written, or a keyed digest. Amounts, dates, names, claim numbers, finding
   messages, warnings and the pipeline's own reasons are only ever digested,
   because a message can quote the document it is about.
-* **Digests are keyed.** Every digest is HMAC-SHA256 under the salt in the
-  local manifest. A digest shows *that* a value changed between two commits,
+* **Digests are keyed, outside the revision's process.** Every digest is
+  HMAC-SHA256 under the salt in the local manifest. A collector runs the
+  revision's code, so it is never given the salt: it writes the text of each
+  digest slot, and the gate's own process checks the whole output against a
+  strict schema and keys the digests itself. Output outside the schema fails
+  the run (exit 4). A digest shows *that* a value changed between two commits,
   never *what* it was. Even a short value such as one printed total cannot
   be recovered by guessing without the manifest.
 * **Documents are named by id.** Reports and results name documents by

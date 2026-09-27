@@ -428,7 +428,10 @@ allowlist entry that names the document's manifest id and hash, the field and
 both values. Both commits read a private copy of each document, verified by
 hash as it is copied. The corpus and its manifest live outside the repository.
 The gate's output carries ids, counts and keyed digests, never document text.
-See `docs/corpus-gate.md`.
+See `docs/corpus-gate.md`. Without a local terminal, dispatch the *Corpus
+gate* workflow from `main` instead (exact SHAs, corpus release tag, optional PR
+number); the corpus grows only through the *Corpus update* workflow's
+propose → approve → publish steps. See `docs/cloud-corpus-gate.md`.
 
 **Thresholds before charging anyone:**
 - Money fields: ≥ 99.5% on digital PDFs
