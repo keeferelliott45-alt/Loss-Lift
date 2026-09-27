@@ -1285,14 +1285,16 @@ def _accounts_panel() -> None:
     since merging one run with nothing is the review screen again.
     """
     state = _state()
-    documents = [
-        state["documents"][did].document
+    results = [
+        state["documents"][did]
         for did in state["order"]
         if not state["documents"][did].needs_mapping
     ]
+    documents = [result.document for result in results]
+    reconciliations = {result.document.document_id: result.reconciliation for result in results}
     accounts = [
         account
-        for account in build_accounts(documents)
+        for account in build_accounts(documents, reconciliations)
         if len(account.documents) > 1 and account.name != UNNAMED_ACCOUNT
     ]
     if not accounts:
@@ -1304,15 +1306,25 @@ def _accounts_panel() -> None:
         "in more than one run, the newest valuation is the one carried forward."
     )
     for account in accounts:
+        clean = account.status is DocumentStatus.CLEAN
         with st.expander(
-            f"{account.name} — {len(account.documents)} loss runs, "
+            f"{'✓' if clean else '⚠'} {account.name} — {len(account.sources)} loss runs, "
             f"{len(account.histories)} claims"
+            + ("" if clean else " — needs review")
         ):
+            if not clean:
+                st.warning(
+                    "This merged history is not reconciled. "
+                    + "; ".join(account.reasons()[:6])
+                    + ". Claims from those runs are included and marked; resolve "
+                    "them before relying on the totals."
+                )
             st.caption(
                 "Valued at "
                 + ", ".join(d.isoformat() for d in account.valuation_dates)
                 + " · " + ", ".join(
-                    d.source_filename for d in account.documents
+                    s.source_filename + (f" ({s.run_id})" if s.run_id else "")
+                    for s in account.sources
                 )
             )
             st.dataframe(
@@ -1343,6 +1355,8 @@ def _accounts_panel() -> None:
                             "Incurred now": _money(history.current.incurred_total),
                             "Movement": _money(history.development),
                             "Runs": len(history.appearances),
+                            "Review": history.uncertain
+                            or ("" if history.trusted else "run needs review"),
                         }
                         for history in account.developed
                     ],

@@ -805,7 +805,8 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     claims_sheet = workbook.active
     claims_sheet.title = "Claims"
     headers = ["Claim number", "Date of loss", "Status", "Carrier", "Valued at",
-               "Paid", "Reserve", "Recovery", "Incurred", "Development", "Runs seen in"]
+               "Paid", "Reserve", "Recovery", "Incurred", "Development", "Runs seen in",
+               "Review"]
     if not redact:
         headers.insert(3, "Claimant")
     widths = _header_row(claims_sheet, headers)
@@ -828,10 +829,14 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             _float(claim.incurred_total),
             _float(history.development),
             len(history.appearances),
+            (history.uncertain
+             or ("" if history.trusted else "read from a run that needs review")),
         ]
         _fill_row(claims_sheet, row_index, values, widths)
         if history.development and history.development > 0:
-            claims_sheet.cell(row=row_index, column=len(headers) - 1).fill = _FINDING_FILL
+            claims_sheet.cell(row=row_index, column=len(headers) - 2).fill = _FINDING_FILL
+        if not history.trusted:
+            claims_sheet.cell(row=row_index, column=len(headers)).fill = _FINDING_FILL
     claims_sheet.freeze_panes = "A2"
     _autosize(claims_sheet, widths)
 
@@ -852,17 +857,34 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     _autosize(summary_sheet, widths)
 
     sources_sheet = workbook.create_sheet("Sources")
-    widths = _header_row(sources_sheet, ["File", "Carrier", "Valuation date",
-                                         "Claims", "SHA-256"])
-    for row_index, document in enumerate(account.documents, start=2):
+    widths = _header_row(sources_sheet, ["File", "Run ID", "Carrier", "Policy number",
+                                         "Valuation date", "Claims", "Status", "SHA-256"])
+    for row_index, source in enumerate(account.sources, start=2):
         _fill_row(sources_sheet, row_index, [
-            document.source_filename,
-            document.carrier,
-            document.valuation_date,
-            len(document.claims),
-            document.file_sha256,
+            source.source_filename,
+            source.run_id,
+            source.carrier,
+            source.policy_number,
+            source.valuation_date,
+            len(source.claims),
+            source.status.value if source.status is not None else "NOT RECONCILED",
+            source.file_sha256,
         ], widths)
     _autosize(sources_sheet, widths)
+
+    # Said once, where a recipient opening the workbook looks first after the
+    # claims: whether the merged history can be used as it stands.
+    status_sheet = workbook.create_sheet("Account Status", 0)
+    widths = _header_row(status_sheet, ["Account", "Status", "Why"])
+    reasons = account.reasons() or [""]
+    for row_index, reason in enumerate(reasons, start=2):
+        _fill_row(status_sheet, row_index, [
+            account.name if row_index == 2 else None,
+            ("Reconciled" if account.status is DocumentStatus.CLEAN else "Needs review")
+            if row_index == 2 else None,
+            reason,
+        ], widths)
+    _autosize(status_sheet, widths)
     return workbook
 
 
