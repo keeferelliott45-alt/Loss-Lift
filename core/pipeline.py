@@ -1857,6 +1857,58 @@ _LOB_WORDS: tuple[tuple[str, LineOfBusiness], ...] = (
 )
 
 
+def _ambiguous_date(token: str) -> bool:
+    """A numeric date whose day and month could be read either way."""
+    parts = re.split(r"[\-/.\s]+", clean_text(token))
+    if len(parts) != 3 or not all(part.isdigit() for part in parts) or len(parts[0]) == 4:
+        return False
+    first, second = int(parts[0]), int(parts[1])
+    return 1 <= first <= 12 and 1 <= second <= 12 and first != second
+
+
+def _borrowed_conventions(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale_inference: LocaleInference,
+    date_inference: DateOrderInference,
+    profile: CarrierProfile | None,
+    carrier: str | None,
+) -> list[str]:
+    """Where one run of a packet was read under a convention its pages do not prove.
+
+    Number format and date order are settled once for the whole document. A
+    run whose own values are ambiguous and carry no evidence either way has
+    been read under whatever another report in the packet proved -- right
+    when the reports share a convention, a wrong answer that looks right when
+    they do not. A saved profile matched on the packet's first page carries
+    one carrier's conventions to every run.
+    """
+    reasons: list[str] = []
+    money = _money_tokens(tables, mapping)
+    own_locale = infer_locale(money)
+    if (locale_inference.confident and not (own_locale.us_votes or own_locale.eu_votes)
+            and any(parse_money(token, None).reason is NullReason.AMBIGUOUS_SEPARATOR
+                    for token in money)):
+        reasons.append(
+            f"its amounts could be read either way and were read as "
+            f"{'European' if locale_inference.locale == 'eu' else 'US'} numbers "
+            f"on another report's evidence"
+        )
+    dates = _table_date_tokens(tables, mapping)
+    own_order = infer_date_order(dates)
+    if (date_inference.confident and not (own_order.mdy_votes or own_order.dmy_votes)
+            and any(_ambiguous_date(token) for token in dates)):
+        reasons.append(
+            f"its dates could be read either way and were read "
+            f"{'day-first' if date_inference.order == 'dmy' else 'month-first'} "
+            f"on another report's evidence"
+        )
+    if (profile is not None and profile.carrier and carrier
+            and " ".join(profile.carrier.upper().split()) != " ".join(carrier.upper().split())):
+        reasons.append("it was read with a saved profile made for another carrier")
+    return reasons
+
+
 def _period_of(
     metadata: DocumentMetadata, order: str | None
 ) -> tuple[date | None, date | None]:
@@ -2471,6 +2523,10 @@ def _run_pipeline(
             )
         if run.valuation_date_text:
             run.valuation_date = parse_date(run.valuation_date_text, header_order).value
+        run.borrowed_conventions = _borrowed_conventions(
+            run_tables[run.run_id], mapping, locale_inference, date_inference,
+            profile, run.carrier,
+        )
     for row in refused_rows:
         run = next((item for item in runs if item.holds(row.page)), None)
         row.bounded = plan.bounded and row.page not in plan.blind and (

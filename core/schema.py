@@ -570,6 +570,12 @@ class LogicalRun(BaseModel):
     line_of_business: LineOfBusiness | None = None
     valuation_date_text: str | None = None
     valuation_date: date | None = None
+    #: Conventions this run's values were read under that its own pages do not
+    #: establish -- a number format or date order proven only by another
+    #: report in the packet, or a saved profile made for another carrier.
+    #: Conventions are still inferred once per document; this is where that
+    #: assumption could be wrong for this run, and it is reported (R-15).
+    borrowed_conventions: list[str] = Field(default_factory=list)
 
     #: What this run printed about itself, read from its own pages only.
     printed_totals: dict[str, Money | None] = Field(default_factory=dict)

@@ -111,3 +111,64 @@ def test_a_run_that_prints_no_carrier_is_not_given_another_runs(tmp_path):
     result = _packet(tmp_path, second_carrier=False)
     assert result.document.runs[1].carrier != LARGE_CARRIER
     assert _claim_rows(result)["CR-50001"]["Carrier"] != LARGE_CARRIER
+
+
+# --- conventions a run does not prove for itself ---------------------------
+
+US_RUN = [
+    ("71004410", "03/15/2022", "CLOSED", "1,500.00", "0.00", "1,500.00"),
+    ("71004411", "07/22/2022", "CLOSED", "2,250.00", "0.00", "2,250.00"),
+]
+#: Amounts with one separator and three digits after it, and dates whose day
+#: and month could swap: nothing on these pages says which convention they use.
+AMBIGUOUS_RUN = [
+    ("CR-60001", "03/04/2022", "CLOSED", "1.500", "0", "1.500"),
+    ("CR-60002", "05/06/2022", "CLOSED", "2.250", "0", "2.250"),
+]
+
+
+def _mixed_packet(tmp_path, second_rows):
+    return _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", "Valuation Date: 12/31/2022"),
+         "rows": US_RUN},
+        {"top": ("Page 1 of 1", SMALL_CARRIER, "LOSS RUN REPORT", "Valuation Date: 12/31/2022"),
+         "headers": SMALL_HEADERS, "rows": second_rows},
+    ], name="mixed.pdf")
+
+
+def test_a_run_read_under_another_reports_conventions_is_reported(tmp_path):
+    """Run 1 proves US numbers and month-first dates; run 2 proves neither. Its
+    "1.500" is read as one and a half on run 1's evidence -- reported against
+    run 2, which then needs review; run 1 does not."""
+    result = _mixed_packet(tmp_path, AMBIGUOUS_RUN)
+    one, two = result.document.runs
+    assert one.borrowed_conventions == []
+    assert len(two.borrowed_conventions) == 2
+    borrowed = [f for f in result.reconciliation.findings
+                if f.rule_id == "R-15" and f.condition.startswith("borrowed-convention:")]
+    assert [f.run_id for f in borrowed] == ["run-2"]
+    assert canonical_run_status(result.reconciliation, "run-2") is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_run_that_proves_its_own_conventions_borrows_nothing(tmp_path):
+    result = _mixed_packet(tmp_path, [
+        ("CR-60001", "03/14/2022", "CLOSED", "1,500.00", "0.00", "1,500.00"),
+    ])
+    assert [run.borrowed_conventions for run in result.document.runs] == [[], []]
+    assert not [f for f in result.reconciliation.findings
+                if f.condition.startswith("borrowed-convention:")]
+
+
+def test_a_saved_profile_for_another_carrier_is_a_borrowed_convention():
+    from types import SimpleNamespace
+
+    from core.normalize import DateOrderInference, LocaleInference
+    from core.pipeline import ColumnMapping, _borrowed_conventions
+
+    reasons = _borrowed_conventions([], ColumnMapping(headers=[], fields={}), LocaleInference(),
+                                    DateOrderInference(),
+                                    SimpleNamespace(carrier="Northfield Auto"), "Harbor Crest")
+    assert reasons == ["it was read with a saved profile made for another carrier"]
+    assert _borrowed_conventions([], ColumnMapping(headers=[], fields={}), LocaleInference(),
+                                 DateOrderInference(),
+                                 SimpleNamespace(carrier="Harbor  crest"), "HARBOR CREST") == []

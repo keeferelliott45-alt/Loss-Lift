@@ -1609,6 +1609,8 @@ def reconcile(
             run_status[finding.run_id] = DocumentStatus.NEEDS_REVIEW
     if "R-11" not in config.disabled_rules:
         findings.extend(_claims_in_two_runs(doc))
+    if "R-15" not in config.disabled_rules:
+        findings.extend(_borrowed_conventions(doc))
 
     keys = [finding_key(finding) for finding in findings]
     duplicates = sorted({key for key in keys if keys.count(key) > 1})
@@ -1670,6 +1672,33 @@ def _claims_in_two_runs(doc: LossRunDocument) -> list[Finding]:
             actual=", ".join(runs),
         ))
     return findings
+
+
+def _borrowed_conventions(doc: LossRunDocument) -> list[Finding]:
+    """A run read under a number format, date order or profile it does not prove.
+
+    Reported under R-15, beside the values that could not be read at all: these
+    were read, but only by assuming another report's convention. A WARN that
+    blocks trust -- the figures may be right, and nothing on the run says so.
+    """
+    return [
+        Finding(
+            rule_id="R-15",
+            severity=Severity.WARN,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"borrowed-convention:{run.run_id}",
+            run_id=run.run_id,
+            message=(
+                f"{run.run_id} (pages {run.page_range}): " + "; ".join(run.borrowed_conventions)
+                + ". Check a few of its values against the PDF before relying on them."
+            ),
+            expected="conventions proven on the run's own pages",
+            actual="; ".join(run.borrowed_conventions),
+        )
+        for run in doc.runs if run.borrowed_conventions
+    ]
 
 
 def _reconcile_one(
