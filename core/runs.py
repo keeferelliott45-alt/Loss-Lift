@@ -180,30 +180,34 @@ def naming_words(identity: str | None) -> set[str]:
 
 
 def same_heading(one: str | None, other: str | None) -> bool | None:
-    """Whether two pages' headings name the same report; None if either names nothing.
+    """Whether two pages' headings name the same report: True when they name
+    exactly the same, False when they share no naming word, None otherwise.
 
-    A report's pages share the words that name it -- its carrier, its insured
-    -- whatever section title, "ADDENDUM" or "CONTINUED" line one of them
-    adds, and a scanned page's heading as the model transcribes it may be
-    shorter than the text layer's band. Two carriers' reports share none of
-    those words, however alike their generic lines ("LOSS RUN REPORT").
+    A report's pages repeat the words that name it -- its carrier, its insured
+    -- whatever generic "ADDENDUM", "CONTINUED" or line-of-business title one
+    of them adds. Two carriers' reports share none of those words, however
+    alike their generic lines ("LOSS RUN REPORT"). Anything between settles
+    nothing: a name made only of generic words ("NATIONAL INDEMNITY COMPANY")
+    names nothing here, and one shared word ("ALPHA MUTUAL" beside "ALPHA
+    HARBOR") may be two carriers as easily as one report with an extra line.
     """
     first, second = naming_words(one), naming_words(other)
     if not first or not second:
         return None
-    return bool(first & second)
+    if first == second:
+        return True
+    return False if not first & second else None
 
 
 def confirms(page: str | None, report: str | None) -> bool:
-    """Whether a page's heading carries everything the report's heading does.
+    """Whether a page's heading names exactly what the report's heading does.
 
-    It may add to it -- a section title, an "ADDENDUM" line -- but a heading
-    that drops words the report prints on its pages (its carrier's name, with
-    only a generic "Loss Run Report" left) does not confirm the page is that
-    report's: it may be another report whose name is only in its logo.
+    A heading that drops words the report prints (its carrier's name, with
+    only a generic "Loss Run Report" left) may be another report whose name is
+    only in its logo; one that adds a naming word may be another carrier
+    sharing part of the name. Neither confirms the page is that report's.
     """
-    wanted, printed = naming_words(report), naming_words(page)
-    return bool(wanted) and wanted <= printed
+    return same_heading(page, report) is True
 
 
 def heading_of(text: str | None, limit: int = 120) -> str | None:
@@ -429,6 +433,9 @@ class _Planner:
             label = resumed.continued_by(labels)
             self.add(resumed, page)
             resumed.track = (label.index, label.count)
+            # It stopped short only until now; if it stops short again, the
+            # next report to open marks it again.
+            resumed.incomplete = None
             resumed.evidence.append(RunBoundary(
                 page=page, kind="continued", source=label.source,
                 text=f"{_describe(label, page)}: the report resumes after pages that "
@@ -546,7 +553,8 @@ class _Planner:
                     page=page, kind="unnumbered", source="none",
                     text=f"{ended} under a different heading, so it begins another report")])
             else:
-                why = (f"{ended} under {'the same heading' if heading else 'no heading'}: "
+                why = (f"{ended} under "
+                       f"{'the same heading' if heading else 'a heading that does not say'}: "
                        f"it may be an addendum to that report or another report")
                 self.start(page, confidence=RunConfidence.NONE, evidence=[RunBoundary(
                     page=page, kind="unnumbered", source="none", text=why)],
@@ -641,22 +649,27 @@ def plan_runs(
         previous = merged[-1] if merged else None
         opened = segment.evidence and segment.evidence[0].kind == "opened"
         heading = same_heading(segment.identity, previous.identity) if previous else None
-        if (
-            previous is not None and opened and previous.numbered
-            and previous.exhausted and not segment.ambiguous and heading is not False
-        ):
-            # A restart alone is not a new report -- sections restart too.
-            # Only a heading naming something else makes one.
+        restart = (previous is not None and opened and previous.numbered
+                   and previous.exhausted and not segment.ambiguous)
+        if restart and heading:
+            # Sections of one report restart their numbering under its heading.
             _merge(previous, segment, RunBoundary(
                 page=segment.pages[0], kind="section", source=segment.evidence[0].source,
-                text=(f"numbering restarts on page {segment.pages[0]} under the same "
-                      f"heading: a section of the same report") if heading else
-                     (f"numbering restarts on page {segment.pages[0]} and nothing on it "
-                      f"names another report: read as a section of the same report"),
+                text=f"numbering restarts on page {segment.pages[0]} under the same "
+                     f"heading: a section of the same report",
             ))
-            if not confirms(segment.identity, previous.identity):
-                previous.blind.update(segment.pages)
             continue
+        if restart and heading is None:
+            # A restart is a section or another report, and the heading does
+            # not say which: reported, never settled either way unseen.
+            why = (f"numbering restarts on page {segment.pages[0]} after the report on "
+                   f"pages {previous.span()} printed its last page, under a heading that "
+                   f"neither names the same report nor another: a section of that report "
+                   f"or another report")
+            segment.ambiguous, segment.ambiguity = True, why
+            segment.evidence.append(RunBoundary(
+                page=segment.pages[0], kind="break", source=segment.evidence[0].source,
+                text=why))
         merged.append(segment)
 
     # Pages with no claims table are not a run of their own, and nothing

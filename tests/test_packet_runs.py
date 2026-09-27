@@ -979,7 +979,9 @@ def test_a_generic_heading_does_not_confirm_a_page_belongs_to_the_report():
     assert plan.runs == [] and plan.blind == {3, 4}
 
 
-def test_a_restart_under_a_generic_heading_is_an_unconfirmed_section():
+def test_a_restart_under_a_generic_heading_is_an_ambiguous_boundary():
+    """A restart whose heading names nothing is a section or another report:
+    kept apart and reported, never merged unseen."""
     from core.runs import plan_packet
 
     evidence = {
@@ -989,7 +991,29 @@ def test_a_restart_under_a_generic_heading_is_an_unconfirmed_section():
                         identity=identity_of("Loss Run Report")),
     }
     plan = plan_packet([1, 2], evidence, {1, 2})
-    assert plan.runs == [] and plan.blind == {2}
+    assert [(run.pages, run.ambiguous) for run in plan.runs] == [([1], False), ([2], True)]
+
+
+def test_a_restart_under_the_same_naming_words_is_a_section():
+    from core.runs import plan_packet
+
+    evidence = {
+        n: PageEvidence(n, paginations=tuple(paginations_in("Page 1 of 1", "footer")),
+                        identity=identity_of(f"ACME Insurance Loss Run Report {line}"))
+        for n, line in ((1, "General Liability"), (2, "Commercial Auto"))
+    }
+    assert plan_packet([1, 2], evidence, {1, 2}).runs == []
+
+
+def test_headings_sharing_only_part_of_a_name_settle_nothing():
+    from core.runs import confirms, same_heading
+
+    alpha = identity_of("ALPHA MUTUAL INSURANCE")
+    harbor = identity_of("ALPHA HARBOR INSURANCE")
+    assert same_heading(alpha, harbor) is None
+    assert not confirms(harbor, alpha) and not confirms(alpha, harbor)
+    assert same_heading(identity_of("NATIONAL INDEMNITY COMPANY"),
+                        identity_of("GENERAL CASUALTY COMPANY")) is None
 
 
 def test_a_heading_change_under_continuing_numbering_is_unconfirmed():

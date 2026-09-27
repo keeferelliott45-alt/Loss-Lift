@@ -469,16 +469,18 @@ def test_e5_one_claim_on_the_last_page_hides_its_own_footer(tmp_path):
 
 def test_e6_every_page_prints_page_1_of_1_letterhead_on_page_one_only(tmp_path):
     """Pages exported one at a time and combined: each prints "Page 1 of 1";
-    only page 1 carries the letterhead, so page 2's identity is its
-    column-label row. A restart under a different top line is a new report:
-    the grand total on page 2 is checked against page 2's claims alone."""
+    only page 1 carries the letterhead. Nothing on page 2 says whether it is
+    the same report or another, so the restart is reported (R-28) with every
+    claim read -- never merged unseen into a packet that reads CLEAN."""
     large = _large_run(8)
     result = _read(tmp_path, [
         {"top": ("Page 1 of 1", LARGE_CARRIER, *LETTER), "rows": large[:4]},
         {"top": ("Page 1 of 1",), "rows": large[4:], "total": _total(large)},
     ])
-    assert result.reconciliation.status is DocumentStatus.CLEAN, (
-        f"runs={_runs(result)} rules={_rules(result)}")
+    assert _numbers(result) == [row[0] for row in large]
+    assert _runs(result) == [([1], False), ([2], True)]
+    assert "R-28" in _rules(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
 # Round 3: headings that name nothing (a logo letterhead) and interleaved reports.
@@ -612,3 +614,47 @@ def test_r3_8_blind_page_inside_the_count_is_named(tmp_path):
     seen = _named_or_read(result, BARE[:1])
     assert all(ok for ok, _ in seen.values()), _msg(result)
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
+# Codex review of 17e704e: headings that share or lack naming words, and a
+# report resumed after another report interrupted it.
+
+@pytest.mark.parametrize("first, second", [
+    ("NATIONAL INDEMNITY COMPANY", "GENERAL CASUALTY COMPANY"),   # names made of generic words
+    ("ALPHA MUTUAL INSURANCE", "ALPHA HARBOR INSURANCE"),         # one shared naming word
+], ids=["generic-words", "shared-word"])
+def test_codex_restart_under_an_undiscriminating_heading_is_not_a_quiet_section(
+        tmp_path, first, second):
+    """Two "Page 1 of 1" reports, same claim-number shape, each with its own
+    total. Nothing on the second heading settles whether it is a section of
+    the first report or another report, so the packet cannot read CLEAN as one
+    report: either the runs are kept apart or the boundary is reported."""
+    large = _large_run(16)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", first, *LETTER), "rows": large[:8], "total": _total(large[:8])},
+        {"top": ("Page 1 of 1", second, *LETTER), "rows": large[8:], "total": _total(large[8:])},
+    ])
+    runs = result.document.runs
+    assert len(runs) == 2, _runs(result)
+    assert runs[1].ambiguous, _runs(result)
+    assert "R-28" in _rules(result), _rules(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert _numbers(result) == [row[0] for row in large]
+
+
+def test_codex_a_report_resumed_after_an_interruption_is_complete(tmp_path):
+    """A "Page 1 of 2", a complete one-page report B, then A "Page 2 of 2":
+    A printed every page it counts and is not incomplete."""
+    large = _large_run(12)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 2", LARGE_CARRIER, *LETTER), "rows": large[:6]},
+        {"top": ("Page 1 of 1", "HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+         "headers": SMALL_HEADERS, "rows": list(SMALL_RUN[:2]),
+         "total": _total(SMALL_RUN[:2])},
+        {"top": ("Page 2 of 2", LARGE_CARRIER, *LETTER), "rows": large[6:],
+         "total": _total(large)},
+    ])
+    runs = result.document.runs
+    assert [run.pages for run in runs] == [[1, 3], [2]], _runs(result)
+    assert [run.incomplete for run in runs] == [None, None]
+    assert "R-28" not in _rules(result), _rules(result)
