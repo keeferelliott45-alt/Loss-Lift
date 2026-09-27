@@ -6,6 +6,7 @@
 # main worktree's checkout.
 #
 #   scripts/agent_worktree.sh create <task-slug> [--agent <name>] [--base <ref>]
+#                                   (base default: origin/main, else main)
 #   scripts/agent_worktree.sh check
 #   scripts/agent_worktree.sh list
 #   scripts/agent_worktree.sh remove <task-slug> [--agent <name>]
@@ -35,7 +36,8 @@ parse_names() {
   SLUG="${1:-}"
   shift || true
   AGENT="${LOSSLIFT_AGENT:-agent}"
-  BASE="main"
+  # origin/main, not a possibly stale local main, unless told otherwise.
+  if git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null; then BASE="origin/main"; else BASE="main"; fi
   while [ $# -gt 0 ]; do
     case "$1" in
       --agent) AGENT="${2:-}"; shift 2 ;;

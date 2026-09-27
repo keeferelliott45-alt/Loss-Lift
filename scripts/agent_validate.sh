@@ -9,7 +9,7 @@
 #   --tests      targeted tests to run first (quoted, passed to pytest)
 #   --quick      skip the full suite and the golden ratchet (not for handoff)
 #   --base       what the branch is compared with (default: the base recorded
-#                when the worktree was created, else main)
+#                when the worktree was created, else origin/main, else main)
 #   --allow-main run outside an agent worktree (maintainers only)
 #   --allow-dirty do not fail on uncommitted changes
 #   --corpus/--manifest  run the private corpus gate locally, baseline -> HEAD
@@ -63,7 +63,9 @@ fi
 BRANCH=$(git symbolic-ref --short -q HEAD || echo "")
 if [ -z "$BASE" ]; then
   BASE=$( [ -n "$BRANCH" ] && git config --get "branch.$BRANCH.agentbase" || true )
-  BASE=${BASE:-main}
+  if [ -z "$BASE" ]; then
+    if git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null; then BASE=origin/main; else BASE=main; fi
+  fi
 fi
 if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
   record FAIL base "base '$BASE' is not a commit here"
