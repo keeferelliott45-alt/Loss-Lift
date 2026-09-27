@@ -6,3 +6,24 @@ data/profiles/
 uploads/
 *.pdf
 .streamlit/secrets.toml
+
+# Generated synthetic fixtures (see README)
+samples/
+
+# Kilo Code local state and worktrees — never committed
+.kilo/worktrees/
+.kilo/agent-manager.json
+.kilo/setup-script
+.kilo/setup-script.sh
+.kilo/setup-script.ps1
+.kilo/setup-script.cmd
+.kilo/setup-script.bat
+.kilo/run-script
+.kilo/run-script.sh
+.kilo/run-script.ps1
+.kilo/run-script.cmd
+.kilo/run-script.bat
+
+# Kilo Code legacy state and worktrees — never committed
+.kilocode/worktrees/
+.kilocode/agent-manager.json
