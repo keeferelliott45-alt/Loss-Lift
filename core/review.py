@@ -95,14 +95,24 @@ def bucket_of(finding: Finding) -> str:
 # --------------------------------------------------------------------------
 
 
+#: Rules that say something may not be accounted for at all -- claims or
+#: pages the reading could not place, rather than values that need a check:
+#: rows lost in stitching, no claims, unread source pages, money on a row no
+#: claim took, an unsettled run boundary, claim-like rows the vote refused.
+UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
+
 def blocks_trust(finding: Finding) -> bool:
     """Whether this finding alone stops the document being trusted unreviewed.
 
     Financial and extraction findings do, at any severity; an underwriting
     observation never does. An ERROR always does -- the schema forbids an
-    underwriting ERROR, and this holds even if that ever changes.
+    underwriting ERROR, and this holds even if that ever changes. So does any
+    finding saying a claim or page may not be accounted for at all, whatever
+    its category and severity: R-19 stays the spec's WARN, but rows seen on a
+    page and not read are a missing claim, not an underwriting observation.
     """
-    return bucket_of(finding) != UNDERWRITING or finding.severity.value == "ERROR"
+    return (bucket_of(finding) != UNDERWRITING or finding.severity.value == "ERROR"
+            or finding.rule_id in UNACCOUNTED_RULES)
 
 
 def canonical_status(
@@ -124,12 +134,6 @@ def canonical_status(
         return DocumentStatus.NEEDS_REVIEW
     return DocumentStatus.CLEAN
 
-
-#: Rules that say something may not be accounted for at all -- claims or
-#: pages the reading could not place, rather than values that need a check:
-#: rows lost in stitching, no claims, unread source pages, money on a row no
-#: claim took, an unsettled run boundary, claim-like rows the vote refused.
-UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
 
 AUTO_SAFE = "auto_safe"
 NEEDS_REVIEW = "needs_review"

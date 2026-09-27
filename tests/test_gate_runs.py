@@ -137,7 +137,8 @@ def _flag(rule, category, severity, run_id=None, n=0):
 
 
 KINDS = [("R-15", "extraction", Severity.WARN), ("R-04", "financial", Severity.ERROR),
-         ("R-13", "underwriting", Severity.WARN), ("R-14", "underwriting", Severity.INFO)]
+         ("R-13", "underwriting", Severity.WARN), ("R-14", "underwriting", Severity.INFO),
+         ("R-19", "underwriting", Severity.WARN)]
 
 
 @pytest.mark.parametrize("combo, run_status", [
@@ -197,3 +198,8 @@ def test_a_trust_status_change_is_critical_and_published():
     assert published["documents"]["doc-a"]["review_status"] \
         == {"baseline": "CLEAN", "candidate": "NEEDS_REVIEW"}
     assert "review_status" in seal.render_public(published)
+
+
+def test_the_collectors_unaccounted_rules_are_the_canonical_ones():
+    from core.review import UNACCOUNTED_RULES
+    assert collect._UNACCOUNTED_RULES == UNACCOUNTED_RULES

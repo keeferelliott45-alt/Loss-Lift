@@ -19,6 +19,7 @@ import pytest
 from openpyxl import load_workbook
 
 from core.export import to_bytes
+from core.reconcile import reconcile
 from core.review import blocks_trust, canonical_run_status, canonical_status
 from core.runs import runs_overview
 from core.schema import (
@@ -161,3 +162,36 @@ def test_a_finding_raised_about_the_whole_packet_applies_to_every_run():
                      {"run-1": DocumentStatus.CLEAN, "run-2": DocumentStatus.CLEAN})
     assert {canonical_run_status(result, run) for run in ("run-1", "run-2")} \
         == {DocumentStatus.NEEDS_REVIEW}
+
+
+def _row_gap_document(seen: int) -> LossRunDocument:
+    claims = [Claim(claim_number=f"C-{n}", date_of_loss=date(2023, 1, 10 + n),
+                    claim_status=ClaimStatus.CLOSED, paid_total=Decimal("10"),
+                    reserve_total=Decimal("0"), incurred_total=Decimal("10"),
+                    source_page=1)
+              for n in range(2)]
+    return LossRunDocument(source_filename="s.pdf", file_sha256="0" * 64, page_count=1,
+                           valuation_date=date(2023, 12, 31), claims=claims,
+                           rows_seen_per_page={1: seen}, processed_pages=[1])
+
+
+def test_a_row_count_gap_blocks_trust_without_changing_its_severity():
+    """Codex P1 on 2e62e69: R-19 says a claim row was seen and not read.
+
+    It stays the spec's WARN, but a document missing a claim row is not
+    reconciled, so every canonical-status consumer reads NEEDS_REVIEW.
+    """
+    from core.review import trust_class
+
+    result = reconcile(_row_gap_document(seen=3))
+    gap = [f for f in result.findings if f.rule_id == "R-19"]
+    assert gap and all(f.severity is Severity.WARN for f in gap)
+    assert all(blocks_trust(f) for f in gap)
+    assert canonical_status(result) is DocumentStatus.NEEDS_REVIEW
+    assert trust_class(result) == "unresolved"
+
+
+def test_without_a_row_count_gap_the_same_document_is_clean():
+    result = reconcile(_row_gap_document(seen=2))
+    assert not [f for f in result.findings if f.rule_id == "R-19"]
+    assert canonical_status(result) is DocumentStatus.CLEAN

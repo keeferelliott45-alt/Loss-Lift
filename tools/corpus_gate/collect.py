@@ -402,10 +402,15 @@ def _warnings(result: Any, digest: Digest) -> dict[str, Any] | None:
 # never a change in how a revision represents the same thing.
 
 
+#: ``core.review.UNACCOUNTED_RULES``, mirrored for a revision that predates it.
+_UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
+
+
 def _blocks_trust(finding: Any) -> bool:
     """``core.review.blocks_trust``, for a revision that predates it."""
     return (plain(getattr(finding, "category", None)) != "underwriting"
-            or plain(getattr(finding, "severity", None)) == "ERROR")
+            or plain(getattr(finding, "severity", None)) == "ERROR"
+            or getattr(finding, "rule_id", None) in _UNACCOUNTED_RULES)
 
 
 def _canonical_status(result: Any, reconciliation: Any) -> Any:
