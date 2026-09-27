@@ -153,6 +153,39 @@ A field one commit reports and the other does not is a change. Values are
 compared as JSON values, type included: `true` is not `1`, and `1` is not
 `1.0`, at any depth. Timing is recorded and never compared.
 
+## Scanned pages: recorded vision answers
+
+By default the collector runs with vision off, so a scanned page is measured
+as unread on both sides. To protect the scanned path too, record the model's
+answer for each scanned page once, against the live model, and replay it:
+
+```
+python - <<'PY'
+from pathlib import Path
+from core.extract_vision import recording_extractor
+from core.pipeline import run_pipeline
+for pdf in sorted(Path("<corpus directory>").glob("*.pdf")):
+    run_pipeline(pdf, vision_extractor=recording_extractor("<recordings directory>"))
+PY
+python -m tools.corpus_gate run ... --vision-replay <recordings directory>
+```
+
+A recording is keyed by the document's SHA-256, the page, the render DPI, the
+model, the prompt and the response schema (`core.extract_vision.recording_key`).
+Replay never renders, needs no key and reaches no network. A page with no
+recording for the current prompt and model is a failed page, named in the
+warnings, so a prompt change shows up as a change until it is recorded again --
+never as a page silently read empty. A recording holds what the model
+transcribed off a real document: it lives outside the repository beside the
+corpus (the gate refuses one inside the working tree) under the same
+protections. A revision that cannot replay fails to start rather than being
+measured without its scanned pages.
+
+Not yet done: the cloud workflow does not carry recordings, so the browser
+gate still measures scanned pages as unread. Adding them means shipping the
+recordings in the private corpus release and mounting them read-only into
+the sandbox, which the local sandboxed run already does.
+
 ## Privacy
 
 Real loss runs carry claimant names, injury descriptions and claim numbers

@@ -51,6 +51,13 @@ def _parser() -> argparse.ArgumentParser:
         help="write only the publishable result: states, changed fields, claim count and status",
     )
     run.add_argument(
+        "--vision-replay",
+        type=Path,
+        default=None,
+        help="replay recorded vision answers from this directory (outside the repository) "
+             "so scanned pages are measured too; no live model is ever called",
+    )
+    run.add_argument(
         "--sandbox-image",
         default=None,
         help="run each collector in this local container image, with no network and no credentials",
@@ -93,6 +100,7 @@ def _run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             sandbox=sandbox,
             public=args.public_output,
+            vision_replay=args.vision_replay,
         )
     except SetupError as error:
         print(f"LossLift real-corpus gate: FAIL (exit 3)\n\n{error}")

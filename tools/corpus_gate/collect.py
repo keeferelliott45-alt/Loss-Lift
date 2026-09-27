@@ -588,6 +588,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--documents", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--vision-replay", type=Path, default=None,
+        help="replay recorded vision answers from this directory instead of "
+             "skipping scanned pages; never calls a live model",
+    )
     args = parser.parse_args(argv)
 
     first = sys.stdin.readline().strip()
@@ -601,6 +606,17 @@ def main(argv: list[str] | None = None) -> int:
                 _write(handle, {"kind": "fatal", "error_type": "IsolationError"})
                 return 3
             from core.pipeline import run_pipeline
+
+            vision: dict[str, Any] = {"use_vision": False}
+            if args.vision_replay is not None:
+                try:
+                    from core.extract_vision import replay_extractor
+                except ImportError:
+                    # A revision that cannot replay would be measured without
+                    # its scanned pages while the other is measured with them.
+                    raise NotImplementedError("vision replay") from None
+                vision = {"use_vision": True,
+                          "vision_extractor": replay_extractor(args.vision_replay)}
         except Exception as error:  # noqa: BLE001 - the revision cannot start
             _write(handle, {"kind": "fatal", "error_type": error_name(error)})
             return 3
@@ -618,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
         for entry in documents:
             record: dict[str, Any] = {"kind": "document", "id": entry["id"]}
             try:
-                result = run_pipeline(Path(entry["path"]), use_vision=False)
+                result = run_pipeline(Path(entry["path"]), **vision)
             except Exception as error:  # noqa: BLE001 - recorded as a failure
                 record.update(ok=False, error_type=error_name(error))
             else:
