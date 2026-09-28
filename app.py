@@ -13,8 +13,6 @@ person running this will have dozens of reports in flight at once.
 
 from __future__ import annotations
 
-import io
-import zipfile
 from pathlib import Path
 from decimal import Decimal
 from typing import Any
@@ -35,7 +33,14 @@ from core.evidence import (
     finding_evidence,
     render_evidence,
 )
-from core.ingest import IngestError, discard, ingest
+from core.ingest import (
+    DiscardResult,
+    IngestError,
+    discard,
+    run_or_discard,
+    stage_and_run,
+    sweep_orphaned_staging,
+)
 from core.pipeline import (
     resolve_finding,
     ColumnMapping,
@@ -54,6 +59,7 @@ from core.pipeline import (
 from core.profiles import list_profiles, llm_enabled
 from core.account import UNNAMED_ACCOUNT, build_accounts
 from core.summary import summarise_by_period
+from core.xlsx_safety import safe_member_name
 from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
@@ -659,8 +665,12 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs — one or a hundred at once. Files are held in "
-        "memory for this session and deleted after you export."
+        "Drop in carrier PDFs — one or a hundred at once. Each uploaded file is "
+        "staged in a temporary directory for this session. It is deleted after "
+        "you export it, when you press Delete, or when you remove it from the "
+        "queue. Temporary files left behind by an interrupted session are swept "
+        "after 24 hours. LossLift cannot delete a file when a session ends "
+        "unexpectedly — closing the tab does not by itself remove staged files."
     )
 
     state.setdefault("uploader_generation", 0)
@@ -694,6 +704,19 @@ def screen_queue() -> None:
     _profile_library()
 
 
+def _discard_staged(document_id: str) -> "DiscardResult | None":
+    """Discard one document's staged upload, if it has one.
+
+    Pops the entry first so a refusal cannot leave a dangling reference; the
+    caller reports "deleted" only when the outcome says the file is gone.
+    """
+    state = _state()
+    staged = state["staged"].pop(document_id, None)
+    if staged is None:
+        return None
+    return discard(staged)
+
+
 def _extract_uploads(uploads: list[Any]) -> None:
     """Process every upload and land back on the queue with all of them
     visible. Never guess which one the user wants to see next — that guess is
@@ -706,8 +729,13 @@ def _extract_uploads(uploads: list[Any]) -> None:
 
     for index, upload in enumerate(uploads, start=1):
         try:
-            staged = ingest(upload.getvalue(), upload.name)
-            result = run_pipeline(staged, use_llm=llm_enabled())
+            # Extract or discard: a failure after ingest never leaves the
+            # staged copy behind (spec section 9).
+            staged, result = stage_and_run(
+                upload.getvalue(),
+                upload.name,
+                lambda source: run_pipeline(source, use_llm=llm_enabled()),
+            )
             # The same file read a second time is a second document, with none
             # of the first one's corrections or review history: nothing is kept
             # between uploads (spec section 13). Said out loud, because the
@@ -923,7 +951,27 @@ def _queue_row(document_id: str) -> None:
         if action.button("Open", key=f"open-{document_id}"):
             _open(document_id)
             st.rerun(scope="app")
+        if action.button(
+            "Remove",
+            key=f"remove-{document_id}",
+            help="Take this document out of the queue and delete its staged file.",
+        ):
+            _remove_from_queue(document_id)
+            st.rerun(scope="app")
         st.markdown('<div class="ll-row"></div>', unsafe_allow_html=True)
+
+
+def _remove_from_queue(document_id: str) -> None:
+    """Forget one document and delete the file staged for it."""
+    state = _state()
+    _discard_staged(document_id)
+    state["documents"].pop(document_id, None)
+    if document_id in state["order"]:
+        state["order"].remove(document_id)
+    if state.get("open_document") == document_id:
+        state["open_document"] = None
+    for key in (f"select-{document_id}", f"reviewed-{document_id}"):
+        st.session_state.pop(key, None)
 
 
 def _batch_export_bar(visible_ids: list[str]) -> None:
@@ -963,8 +1011,13 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
             st.caption("Applied the same way to every selected report.")
 
             if st.button(f"Prepare {len(selected_ids)} report(s)", type="primary"):
-                state["batch_zip"] = _build_batch_zip(selected_ids, template, redact)
-                state["batch_zip_count"] = len(selected_ids)
+                payload, failed = _build_batch_zip(selected_ids, template, redact)
+                state["batch_zip"] = payload
+                state["batch_zip_count"] = len(selected_ids) - len(failed)
+                state["batch_zip_failed"] = failed
+
+            for failure in state.get("batch_zip_failed", []):
+                st.warning(failure)
 
             if state.get("batch_zip"):
                 st.download_button(
@@ -973,29 +1026,39 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
                     file_name="losslift-export.zip",
                     mime="application/zip",
                     type="primary",
+                    # The payload is already in memory; once it has been handed
+                    # over the staged sources are no longer needed, so the
+                    # no-retention promise holds without a session-end hook.
+                    on_click=_discard_selected_after_batch,
+                    args=(list(selected_ids),),
                 )
 
+            if state.get("deleted_notice"):
+                st.success(state.pop("deleted_notice"))
 
-def _build_batch_zip(document_ids: list[str], template: str, redact: bool) -> bytes:
-    buffer = io.BytesIO()
-    used_names: set[str] = set()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for document_id in document_ids:
-            result = _result(document_id)
-            if result is None:
-                continue
-            payload = export_module.to_bytes(
-                result.document, result.reconciliation,
-                template=template, redact=redact,
-                source_path=result.source_path,
-            )
-            name = export_module.suggested_filename(result.document)
-            if name in used_names:
-                stem, _, ext = name.rpartition(".")
-                name = f"{stem} ({document_id[:8]}).{ext}"
-            used_names.add(name)
-            archive.writestr(name, payload)
-    return buffer.getvalue()
+
+def _discard_selected_after_batch(document_ids: list[str]) -> None:
+    """Discard the staged uploads behind a batch once its ZIP was downloaded."""
+    gone = 0
+    for document_id in document_ids:
+        outcome = _discard_staged(document_id)
+        if outcome is not None and outcome.gone:
+            gone += 1
+    state = _state()
+    state["deleted_notice"] = f"Deleted {gone} staged file(s) after download."
+
+
+def _build_batch_zip(
+    document_ids: list[str], template: str, redact: bool
+) -> tuple[bytes, list[str]]:
+    """Gather the selected documents and hand them to the core builder."""
+    items = []
+    for document_id in document_ids:
+        result = _result(document_id)
+        if result is None:
+            continue
+        items.append((result.document, result.reconciliation, result.source_path))
+    return export_module.build_batch_zip(items, template=template, redact=redact)
 
 
 # --------------------------------------------------------------------------
@@ -1119,9 +1182,20 @@ def _apply_mapping(
         return
 
     try:
-        updated = run_pipeline(staged, mapping_override=mapping, use_vision=True)
+        updated = run_or_discard(
+            staged,
+            lambda source: run_pipeline(
+                source, mapping_override=mapping, use_vision=True
+            ),
+        )
     except Exception as error:  # noqa: BLE001
-        st.error(f"The document could not be re-read with that mapping ({error}).")
+        # The re-read failed, so the staged bytes were discarded by
+        # run_or_discard; drop the session reference with them.
+        _state()["staged"].pop(document_id, None)
+        st.error(
+            f"The document could not be re-read with that mapping ({error}). "
+            f"The uploaded file has been deleted; upload it again to retry."
+        )
         return
 
     save_confirmed_mapping(updated, mapping, confirmed_by_human=True)
@@ -1323,10 +1397,19 @@ def _accounts_panel() -> None:
                     + ". Confirm they were closed and purged rather than left out."
                 )
 
+            account_redact = st.toggle(
+                "Remove claimant names from this workbook",
+                key=f"account-redact-{account.name}",
+                help="The account workbook is redacted the same way as a "
+                     "single-document export: the claimant column is dropped "
+                     "and the sensitive values are scrubbed from the rest.",
+            )
             st.download_button(
                 "Download account workbook",
-                data=export_module.account_to_bytes(account),
-                file_name=f"{account.name.replace(' ', '_')}_loss_history.xlsx",
+                data=export_module.account_to_bytes(account, redact=account_redact),
+                file_name=safe_member_name(
+                    f"{account.name.replace(' ', '_')}_loss_history.xlsx"
+                ),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"account-dl-{account.name}",
             )
@@ -1457,39 +1540,66 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
             f"workbook exports either way — the Exceptions sheet lists them."
         )
 
-    payload = export_module.to_bytes(
-        result.document,
-        result.reconciliation,
-        template=template,
-        redact=redact,
-        include_provenance=provenance,
-        # The file, so the workbook can read its own evidence back before it
-        # writes it down — the same check the review screen makes before it
-        # draws a highlight.
-        source_path=result.source_path,
-    )
+    try:
+        payload = export_module.to_bytes(
+            result.document,
+            result.reconciliation,
+            template=template,
+            redact=redact,
+            include_provenance=provenance,
+            # The file, so the workbook can read its own evidence back before it
+            # writes it down — the same check the review screen makes before it
+            # draws a highlight.
+            source_path=result.source_path,
+        )
+    except Exception as error:  # noqa: BLE001 - report, and never keep the file
+        # A failed export is a failure after ingest, so the staged copy goes:
+        # it is not kept in the hope a retry will want a file the user was told
+        # was temporary.
+        _discard_staged(document_id)
+        st.error(
+            f"The workbook could not be built ({error}). The uploaded file has "
+            f"been deleted; upload it again to try once more."
+        )
+        return
+
     st.download_button(
         "Download Excel",
         data=payload,
-        file_name=export_module.suggested_filename(result.document),
+        file_name=export_module.suggested_filename(
+            result.document,
+            needs_review=bool(result.reconciliation.errors),
+            redact=redact,
+        ),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         key=f"download-{document_id}",
+        # The payload is already built. Deleting the staged source in the click
+        # callback is what makes "deleted after you export" true without a
+        # session-end hook Streamlit does not provide.
+        on_click=_discard_staged,
+        args=(document_id,),
     )
     st.caption(
-        "Three sheets: Claims, Exceptions, and Source Info with the file hash "
-        "and valuation date. For many reports at once, use Export from the queue."
+        "Sheets: "
+        + ", ".join(export_module.WORKBOOK_SHEETS)
+        + ". Source Info carries the file hash and valuation date. For many "
+        "reports at once, use Export from the queue."
     )
 
     st.divider()
     if st.button("Delete the uploaded file now", key=f"delete-{document_id}"):
-        staged = _state()["staged"].pop(document_id, None)
-        if staged is not None:
-            discard(staged)
-        st.success(
-            "Deleted. The extracted table stays in this session until you close "
-            "the tab."
-        )
+        outcome = _discard_staged(document_id)
+        if outcome is None or outcome.gone:
+            st.success(
+                "Deleted. The extracted table stays in this session until you "
+                "close the tab."
+            )
+        else:
+            st.error(
+                "The file was not deleted: "
+                f"{outcome.reason or outcome.outcome}. It was left where it was."
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1500,6 +1610,16 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
 def main() -> None:
     st.markdown(_STYLE, unsafe_allow_html=True)
     state = _state()
+
+    # Best-effort once per session: clear staging directories a previous run
+    # left behind. Streamlit has no reliable session-end hook, so this is the
+    # honest alternative to promising a deletion that never happens.
+    if not state.get("staging_swept"):
+        state["staging_swept"] = True
+        try:
+            sweep_orphaned_staging()
+        except Exception:  # noqa: BLE001 - best effort, never block the page
+            pass
 
     with st.sidebar:
         st.markdown("### LossLift")
