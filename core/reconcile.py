@@ -1609,6 +1609,7 @@ def reconcile(
             run_status[finding.run_id] = DocumentStatus.NEEDS_REVIEW
     if "R-11" not in config.disabled_rules:
         findings.extend(_claims_in_two_runs(doc))
+        findings.extend(_claims_in_no_run(doc))
     if "R-15" not in config.disabled_rules:
         findings.extend(_borrowed_conventions(doc))
 
@@ -1670,6 +1671,39 @@ def _claims_in_two_runs(doc: LossRunDocument) -> list[Finding]:
             ),
             expected="each claim in one run",
             actual=", ".join(runs),
+        ))
+    return findings
+
+
+def _claims_in_no_run(doc: LossRunDocument) -> list[Finding]:
+    """A claim the packet holds but no loss run does.
+
+    In a packet the page ties a claim to its run. A row a person adds on the
+    review screen carries no page of its own unless the reviewer gives one, and
+    defaulting it to page 1 would count it into the first run -- which can leave
+    the whole packet reading CLEAN while a claim belonging to no report sits in
+    it. That row is kept out of every run and named here, so the packet is
+    reviewed until the reviewer places it.
+    """
+    findings: list[Finding] = []
+    for claim in doc.claims:
+        if doc.run_of(claim.source_page) is not None:
+            continue
+        findings.append(Finding(
+            rule_id="R-11",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"no-run:{claim.row_id}",
+            message=(
+                f"Claim {claim.claim_number} was added on the review screen "
+                f"without a page, so it belongs to no loss run of this packet. "
+                f"Give it the page of the run it belongs to before exporting: it "
+                f"is counted into no run until then."
+            ),
+            expected="each claim in one run",
+            actual="no run",
         ))
     return findings
 

@@ -3032,6 +3032,22 @@ def _audit_value(claim: Claim, field_name: str) -> str:
     return f"null ({reason.value})"
 
 
+def _added_page(document: LossRunDocument, record: dict[str, Any]) -> int | None:
+    """The page a hand-added claim takes, or None when it names no run.
+
+    In a document binding more than one loss run the page is what ties a claim
+    to its run. A row a person adds without giving a page has none: it must not
+    default to page 1 and be counted into the first run, which can leave the
+    packet reading CLEAN. It is kept out of every run and named by R-11 until
+    the reviewer says which run it belongs to. A single loss run needs no page
+    to place a claim, so it stays page 1 as before.
+    """
+    page = record.get("_page")
+    if page not in (None, ""):
+        return int(page)
+    return None if document.runs else 1
+
+
 def apply_edits(
     document: LossRunDocument,
     records: Sequence[dict[str, Any]],
@@ -3180,7 +3196,7 @@ def apply_edits(
                 # packet is how it joins its loss run.
                 source_page=(
                     original.source_page if original is not None
-                    else int(record.get("_page") or 1)
+                    else _added_page(document, record)
                 ),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,
