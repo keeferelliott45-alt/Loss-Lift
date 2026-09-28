@@ -73,7 +73,35 @@ model families remains available for mode-B/C items if budget allows.
 2. Whether a foreign page joined blind should be kept in the run (current) or
    split into its own settled run when its heading names another carrier.
 
+### P0-2 — Hand-added packet row (held-out H1) — FIXED (draft PR)
+
+- Base `230c0fc`, head `6f75cb1d2faac1791212bf8ea422cb2243fa90f8`, branch
+  `agent/lead/p0-2-hand-row`.
+- Draft PR: https://github.com/keeferelliott45-alt/Loss-Lift/pull/13 (stacked on
+  PR #9; not ready, not merged).
+- Change: `Claim.source_page` is `int | None` (default 1); a hand-added row with
+  no page in a packet gets `None`, belongs to no run, and `_claims_in_no_run`
+  (R-11) makes the packet NEEDS_REVIEW. A page the reviewer gives, and a read
+  row's page, are unchanged.
+- Tests: 1 added, red at base (`source_page == 1`, status CLEAN), green at head.
+- Full suite: 27 failed — all `test_cloud_gate*`, identical on base, 0 non-cloud,
+  0 errors. Ratchet exit 0 (108/108). compileall 0, `git diff --check` 0.
+- Corpus gate: **NOT RUN** (no local corpus). Expected: no real-corpus change
+  (extraction output has no review-added claims).
+- Retires held-out benchmark H1 (record at retirement time).
+- DEFERRED: none.
+
+## Budget after 2026-09-28
+
+- Recon/setup $0.50, P0-1 $2.00, P0-2 $2.00 = **$4.50 / $5.00** for the day,
+  **$4.50 / $25.00** total. No further item fits the day's headroom (a
+  conservative item costs $2.00), so the campaign **pauses until the next UTC
+  day** per the owner's rule.
+- At 12 items total this pacing lands at ~$24 and ~6 days, inside both caps.
+
 ## Next action
 
-Checkpoint. Next item: P0-2 (hand-added packet row, `pipeline.apply_edits`
-`record["_page"] or 1`), base `230c0fc`, own branch + draft PR stacked on #9.
+Resume 2026-09-29 (UTC). Next item: **P0-3** (refused rows on a bounded single
+report are recorded but named by no rule; decide the rule behaviour under
+invariant 2, fail closed), base `230c0fc`, own branch + draft PR stacked on #9.
+Then P1-4 (recovery sign per run).
