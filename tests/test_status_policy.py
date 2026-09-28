@@ -266,8 +266,9 @@ def test_a_single_report_source_info_still_shows_its_own_facts():
 def test_every_summary_of_a_row_count_gap_agrees_with_the_policy():
     """Codex P2 on 67e7624: the headline and the card follow blocks_trust.
 
-    R-19 keeps its underwriting category, but no summary may call a document
-    missing a claim row reconciled.
+    R-19 keeps the spec's WARN severity and is categorised ``extraction`` --
+    rows seen on a page and not read are a missing claim -- so it blocks trust
+    as a reading problem and no summary may call such a document reconciled.
     """
     from core.review import review_bucket, summarise_review
 
@@ -275,7 +276,8 @@ def test_every_summary_of_a_row_count_gap_agrees_with_the_policy():
     summary = summarise_review(result.findings)
     assert summary.headline() == "not read cleanly"
     gap = [f for f in result.findings if f.rule_id == "R-19"]
+    assert all(f.severity is Severity.WARN for f in gap)
+    assert all(f.category.value == "extraction" for f in gap)
     assert all(review_bucket(f) == "extraction" for f in gap)
     assert all(f in summary.extraction.findings for f in gap)
     assert not any(f in summary.underwriting.findings for f in gap)
-    assert all(f.category.value == "underwriting" for f in gap)

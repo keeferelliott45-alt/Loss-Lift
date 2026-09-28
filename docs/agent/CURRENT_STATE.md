@@ -66,7 +66,9 @@ Catastrophic blind spots found:
 1. ~~A claim row can vanish into another claim's description and the
    document reads CLEAN.~~ Closed after `2e62e69` (Codex P1s): a refused row
    is judged under the settled date order (either order when none is
-   settled), recorded and never folded; R-19 blocks trust.
+   settled), recorded and never folded; R-19 blocks trust. R-19 is now
+   categorised `extraction` (spec WARN severity unchanged), so it blocks under
+   the one policy for reading problems instead of through a category carve-out.
 2. ~~Per-run R-05 (printed count per run) works but no test pins it; one
    changed line in `run_view` would disable it silently.~~ Closed on this
    branch: `tests/test_run_view_pinned.py` pins R-04/05/06/09/19/29 per run
@@ -106,8 +108,6 @@ Catastrophic blind spots found:
   when every run agrees (`_agreed`), otherwise "differs by run — see Runs
   sheet", with the printed claim count summed only when every run printed one
   (`_printed_claim_count`).
-- R-19 (row-count gap) is categorised underwriting (spec WARN) but blocks
-  trust through `UNACCOUNTED_RULES`.
 
 ## Intentional limitations
 

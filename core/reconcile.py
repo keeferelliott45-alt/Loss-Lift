@@ -817,6 +817,13 @@ def r19_stitching_row_count(
     Multi-page tables are stitched into one before validation, dropping
     repeated headers and per-page subtotals. If that drops more than it should,
     the count is the first place it shows.
+
+    It is a reading gap, not an underwriting observation: a claim row the pages
+    held did not come through, which is the same question R-20 and R-22 answer.
+    It stays the spec's WARN severity -- nothing here is a wrong figure, only a
+    row that needs finding -- and it is categorised ``extraction`` so it blocks
+    trust under the one policy for reading problems rather than through a
+    category carve-out.
     """
     seen = doc.rows_seen_per_page
     if not seen:
@@ -828,7 +835,7 @@ def r19_stitching_row_count(
     return [
         Finding(
             rule_id="R-19",
-            category=FindingCategory.UNDERWRITING,
+            category=FindingCategory.EXTRACTION,
             scope=FindingScope.DOCUMENT,
             subject="document",
             severity=Severity.WARN,

@@ -108,8 +108,10 @@ def blocks_trust(finding: Finding) -> bool:
     observation never does. An ERROR always does -- the schema forbids an
     underwriting ERROR, and this holds even if that ever changes. So does any
     finding saying a claim or page may not be accounted for at all, whatever
-    its category and severity: R-19 stays the spec's WARN, but rows seen on a
-    page and not read are a missing claim, not an underwriting observation.
+    its category and severity. R-19 is the example: the spec gives it WARN
+    severity and it is categorised ``extraction``, so it blocks as every other
+    reading problem does -- rows seen on a page and not read are a missing
+    claim, never an underwriting observation.
     """
     return (bucket_of(finding) != UNDERWRITING or finding.severity.value == "ERROR"
             or finding.rule_id in UNACCOUNTED_RULES)
@@ -249,8 +251,8 @@ def review_bucket(finding: Finding) -> str:
 
     A finding's category is what the spec made it and is never rewritten. But
     a summary must never call reconciled what :func:`blocks_trust` does not:
-    an underwriting-category finding that says a claim or page may be
-    unaccounted for (R-19) is shown with the reading problems, not the flags.
+    an accountability finding (``UNACCOUNTED_RULES``) is shown with the reading
+    problems, not the underwriting flags, whatever category it carries.
     """
     bucket = bucket_of(finding)
     if bucket == UNDERWRITING and finding.rule_id in UNACCOUNTED_RULES:
