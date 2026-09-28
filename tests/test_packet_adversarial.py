@@ -175,6 +175,24 @@ def test_a1_unnumbered_digital_packet_claim_without_amounts_is_not_silent(tmp_pa
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
+def test_a1b_a_bounded_single_report_refusal_is_named(tmp_path):
+    """A lone report bounds itself with its own page numbering but refuses a
+    claim-like row: R-23 needs money on the row, R-28 needs an unsettled run,
+    and R-29 used to report only packets and unbounded scans, so the row was
+    named by no rule and the report read CLEAN. It is reported under R-29 now."""
+    large = _large_run(8)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, *LETTER), "rows": [*large, DATED_CODE]},
+    ], name="single.pdf")
+    assert result.document.runs == []
+    assert [(r.identifier, r.report) for r in result.document.refused_claim_rows] == [
+        (DATED_CODE[0], True)
+    ]
+    assert any(f.rule_id == "R-29" and DATED_CODE[0] in f.message
+               for f in result.reconciliation.findings)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+
+
 @pytest.mark.parametrize("amounts", [True, False], ids=["amounts", "no-amounts"])
 def test_a2_packet_stamp_carries_an_unnumbered_report_into_the_previous_run(
     tmp_path, amounts

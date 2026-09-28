@@ -1477,19 +1477,19 @@ def r28_unsettled_run_boundary(
 
 
 @rule("R-29")
-def r29_refused_claims_on_unbounded_scans(
+def r29_refused_claims(
     doc: LossRunDocument, config: ReconcileConfig
 ) -> list[Finding]:
-    """Claim-like rows refused where another report's numbering may be why.
+    """Claim-like rows refused and named by no other rule.
 
     The claim-number vote is taken per loss run. Where nothing printed bounds
     the runs -- no page numbers anywhere, or pages joined to a run with nothing
-    confirming them -- one vote may pool two reports, and a larger one
-    outvotes a smaller. In a packet, another report's numbering is the
-    likeliest reason a well-formed identifier is refused at all. A row
-    carrying such an identifier and a loss date or status of its own, refused
-    there, may be another report's claim: it is not dropped quietly -- the
-    document is reviewed and the rows are named.
+    confirming them -- one vote may pool two reports, and a larger one outvotes
+    a smaller; in a packet, another report's numbering is the likeliest reason a
+    well-formed identifier is refused. A bounded single report can refuse a row
+    too. Either way, a row carrying a claim number and a loss date or status of
+    its own is not dropped quietly -- the document is reviewed and the rows are
+    named.
     """
     refused = [row for row in doc.refused_claim_rows if row.report]
     if not refused:
@@ -1512,8 +1512,9 @@ def r29_refused_claims_on_unbounded_scans(
             f"{len(refused)} row(s) on page(s) "
             f"{', '.join(str(page) for page in pages)} read as claims -- a claim "
             f"number and a loss date or status -- but their claim numbers were "
-            f"refused by a vote that may have pooled more than one loss run's "
-            f"numbering. They may be another report's claims: {listed}{more}."
+            f"refused by the claim-number vote. They may be claims of another "
+            f"report, or of this one read under the wrong numbering: "
+            f"{listed}{more}."
         ),
         expected="every claim-like row read as a claim or bounded to its run",
         actual=len(refused),
