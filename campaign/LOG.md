@@ -99,9 +99,46 @@ model families remains available for mode-B/C items if budget allows.
   day** per the owner's rule.
 - At 12 items total this pacing lands at ~$24 and ~6 days, inside both caps.
 
+### Base movement (2026-09-28T11:20Z)
+
+- `origin/main` unchanged `7f86de8a`. PR #9 head moved `230c0fcd` -> `4ca0d41`
+  (fast-forward, 230c0fc an ancestor; commit "Name an incomplete single report
+  instead of reading it clean", author Claude). No rewrite/force-push. The peer
+  campaign `kilo/silent-clean-hunt` (PR #16) logged the same move and stopped.
+- Concurrent peer PRs: #14 export-privacy-hardening (P3-10, base main),
+  #15 packet-aware summary (base main), #16 silent-clean fuzz (harness only).
+- Action: new items serialize from the new head `4ca0d41`, per the conflict rule.
+
+### P0-3 — Refused row on a bounded single report — FIXED (draft PR)
+
+- Base `4ca0d41`, head `59fe42a75ced62eab2a66cbd1c557b3ebfc29f9b`, branch
+  `agent/lead/p0-3-refused-single`.
+- Draft PR: https://github.com/keeferelliott45-alt/Loss-Lift/pull/17 (stacked on
+  PR #9; not ready, not merged).
+- Decision (settles the open rule behaviour): fail closed; `row.report =
+  not (run is not None and run.ambiguous)`. R-28 keeps the ambiguous run's
+  refusals; R-29 names every other refusal, including a bounded single report.
+  Rule id R-29 unchanged; message generalised; function renamed.
+- Tests: 1 added, red at base (`report=False`, CLEAN), green at head.
+- Full suite: 27 failed, all `test_cloud_gate*`, identical on base, 0 non-cloud,
+  0 errors. Ratchet 108/108. compileall 0, diff-check 0.
+- Corpus gate: **NOT RUN** (no local corpus). Effect: a bounded single report
+  that refuses a claim-like row moves CLEAN -> NEEDS_REVIEW; every affected
+  document needs owner approval. Marked awaiting approval.
+
+## Budget note (2026-09-28)
+
+- No OpenRouter key is available to this session, so actual spend is
+  unobservable here (the peer campaign could read `GET /api/v1/key`; I cannot).
+- Owner directed continuation at 11:20Z, over the earlier placeholder pause.
+  Placeholder accounting: recon $0.50 + P0-1 $2.00 + P0-2 $2.00 + P0-3 $2.00 =
+  **$6.50 total**, nominally above the $5/day placeholder. The caps govern actual
+  OpenRouter spend, which is likely far below this; owner should reconcile.
+- Total placeholder: **$6.50 / $25.00**.
+
 ## Next action
 
-Resume 2026-09-29 (UTC). Next item: **P0-3** (refused rows on a bounded single
-report are recorded but named by no rule; decide the rule behaviour under
-invariant 2, fail closed), base `230c0fc`, own branch + draft PR stacked on #9.
-Then P1-4 (recovery sign per run).
+P1-4 (recovery sign per run: `normalize.infer_recovery_sign` runs once per
+document, so a packet mixing credit and positive-recovery runs raises a false
+R-01 on one run; infer per run, single reports unchanged), base `4ca0d41`, own
+branch + draft PR stacked on #9.
