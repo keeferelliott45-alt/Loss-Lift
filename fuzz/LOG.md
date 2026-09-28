@@ -87,6 +87,25 @@ claims that survived). No product change.
 No product code was changed (harness and docs only), so the corpus gate is not
 triggered by this campaign. Gate run: none.
 
+### Checkpoint 1
+
+- Commits: `1f43b07` (harness + docs + log), `ad26f7d` (whitespace).
+- `git rev-parse origin/main` = `7f86de8a0314ccff28d80c06b86f046381f584d7` (unchanged).
+- PR #9 head = `230c0fcd404385fc3ed2e6f9ac6c614ea9429886` (unchanged, open, draft).
+- Branch `kilo/silent-clean-hunt`; working tree clean before the whitespace fix.
+- OpenRouter usage unchanged from preflight (no campaign model calls).
+- `scripts/agent_validate.sh --base 230c0fc --tests tests/test_fuzz_smoke.py`:
+  - PASS targeted, private-data, compile, golden (108/108).
+  - FAIL full-suite: only `tests/test_cloud_gate*.py`, which need POSIX
+    symlink privilege, `os.mkfifo` and container tooling absent on Windows.
+    They are unrelated to this change (harness + docs only) and fail at the
+    base too. Same file set passes when those two files are excluded (exit 0).
+  - FAIL worktree: the project script requires branch `agent/<agent>/<task>`;
+    this campaign's branch is mandated as `kilo/silent-clean-hunt`, so the
+    convention check cannot pass. The worktree is isolated (Kilo managed).
+  - NOT RUN corpus-gate: no product code changed, so no extraction or
+    reconciliation behaviour moved.
+
 ### Next action
 
 Campaign 1 closed PASS: harness delivered, no silent failure found within
