@@ -5,11 +5,12 @@ in `Remember.md`).
 
 ## Where the code is
 
-- Branch `claude/packet-series-and-signed-totals` (PR #9, **draft, unmerged**),
-  product code at `470b883`; agent docs/tooling committed on top. `main` is
-  `7f86de8` (cloud corpus gate, PR #10).
-- Tests: 2,594 collected — 2,581 pass, 7 skipped, 6 strict xfail (known gaps).
-  Golden ratchet: 108/108 rows, money and text 100%.
+- Branch `claude/beautiful-cray-np1b28` (draft PR, builds on PR #9
+  `claude/packet-series-and-signed-totals` @ `4ca0d41`). `main` is `7f86de8`
+  (cloud corpus gate, PR #10).
+- Tests: 2,727 collected. Golden ratchet: 108/108 rows, money and text 100%.
+  (The cloud-gate suite needs Docker and POSIX file types and does not run
+  under Windows.)
 
 ## Recently completed (logical-run propagation cycle)
 
@@ -100,7 +101,11 @@ Catastrophic blind spots found:
 
 - Number format, date order, recovery sign, saved profile and column mapping
   are per document; per run they are only *checked* (borrowed-convention R-15).
-- Packet document header, Source Info and Loss Summary show page 1's facts.
+- Packet document header and the claim rows' denormalised document facts still
+  show page 1's. Loss Summary is per run, and Source Info now shows a fact only
+  when every run agrees (`_agreed`), otherwise "differs by run — see Runs
+  sheet", with the printed claim count summed only when every run printed one
+  (`_printed_claim_count`).
 - R-19 (row-count gap) is categorised underwriting (spec WARN) but blocks
   trust through `UNACCOUNTED_RULES`.
 

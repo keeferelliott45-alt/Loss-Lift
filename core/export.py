@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -652,12 +653,13 @@ def _write_source_sheet(
     rows: list[tuple[str, Any]] = [
         ("Source file", document.source_filename),
         ("SHA-256", document.file_sha256),
-        ("Carrier", document.carrier or "not found"),
-        ("Named insured", document.named_insured or "not found"),
-        ("Policy number", document.policy_number or "not found"),
-        ("Policy period", _period(document)),
-        ("Line of business", document.line_of_business.value if document.line_of_business else "not found"),
-        ("Valuation date", document.valuation_date or "MISSING — see exceptions"),
+        ("Carrier", _shown(_agreed(document, lambda run: run.carrier))),
+        ("Named insured", _shown(_agreed(document, lambda run: run.named_insured))),
+        ("Policy number", _shown(_agreed(document, lambda run: run.policy_number))),
+        ("Policy period", _shown(_agreed(document, _period))),
+        ("Line of business", _shown(_agreed(document, lambda run: run.line_of_business))),
+        ("Valuation date", _shown(_agreed(document, lambda run: run.valuation_date),
+                                  "MISSING — see exceptions")),
         ("Currency", document.currency),
         ("Number format", "European (1.234,56)" if document.locale_hint == "eu" else "US (1,234.56)"),
         ("Number format proven", "yes" if document.locale_confident else "no — assumed"),
@@ -669,7 +671,7 @@ def _write_source_sheet(
         ("Scanned pages", ", ".join(str(p) for p in document.scanned_pages) or "none"),
         ("Carrier profile", document.profile_name or "none saved"),
         ("Claims extracted", len(document.claims)),
-        ("Claim count printed on document", document.printed_claim_count if document.printed_claim_count is not None else "not printed"),
+        ("Claim count printed on document", _printed_claim_count(document)),
         ("Reconciliation status", "Reconciled" if status is DocumentStatus.CLEAN else "Needs review"),
         ("Errors", error_count),
         ("Warnings", warn_count),
@@ -714,11 +716,62 @@ def _write_source_sheet(
     _autosize(sheet, {1: 34, 2: 46, 3: 20, 4: 18})
 
 
-def _period(document: LossRunDocument) -> str:
-    start, end = document.policy_period_start, document.policy_period_end
+def _period(entity: Any) -> str:
+    start, end = entity.policy_period_start, entity.policy_period_end
     if not start and not end:
         return "not found"
     return f"{start or '?'} to {end or '?'}"
+
+
+_DIFFERS_TEXT = "differs by run — see Runs sheet"
+
+
+class _Differs:
+    """Sentinel: a packet's runs disagree, so no one value answers."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return _DIFFERS_TEXT
+
+
+_DIFFERS = _Differs()
+
+
+def _agreed(document: LossRunDocument, getter) -> Any:
+    """What a packet's runs share for one fact, else the differs sentinel.
+
+    A packet's page-1 fields answer only for page 1. Source Info shows a fact
+    for the whole packet only when every run states the same one; a fact they
+    disagree on, or that only some state, is not one value and is not shown as
+    if it were. A single report is its own whole document, so its own value
+    stands.
+    """
+    if not document.is_packet:
+        return getter(document)
+    values = [getter(run) for run in document.runs]
+    return values[0] if all(value == values[0] for value in values) else _DIFFERS
+
+
+def _shown(value: Any, missing: str = "not found") -> Any:
+    if value is _DIFFERS:
+        return _DIFFERS_TEXT
+    if value is None:
+        return missing
+    return value.value if isinstance(value, Enum) else value
+
+
+def _printed_claim_count(document: LossRunDocument) -> Any:
+    """The packet's printed claim count when every run printed one; else none.
+
+    Adding the runs' counts is the only honest total, so a run that printed no
+    count makes the packet's count unprinted rather than partly summed.
+    """
+    if not document.is_packet:
+        return (document.printed_claim_count
+                if document.printed_claim_count is not None else "not printed")
+    counts = [run.printed_claim_count for run in document.runs]
+    if all(count is not None for count in counts):
+        return sum(counts)
+    return "not printed"
 
 
 def build_workbook(
