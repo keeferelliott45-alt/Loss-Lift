@@ -572,7 +572,11 @@ class _Planner:
                 and (next_label is None or next_label.index == 1))
         if exact or fits:
             self.add(current, page)
-            if not exact and not confirms(page_evidence.identity, current.identity):
+            if not confirms(page_evidence.identity, current.identity):
+                # The page fits the report's count, but nothing on it names the
+                # report: it may be another carrier's page filling the gap, so
+                # its claim-number vote may be pooling two reports. Joined
+                # blind, its refused rows are named by R-29 rather than lost.
                 current.blind.add(page)
             current.track = (index + 1, count)
             current.evidence.append(RunBoundary(
