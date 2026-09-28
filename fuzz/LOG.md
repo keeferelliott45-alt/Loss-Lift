@@ -111,3 +111,26 @@ triggered by this campaign. Gate run: none.
 Campaign 1 closed PASS: harness delivered, no silent failure found within
 budget. Resume by seeding new operator families from a real silent report if one
 appears, and by extending the scanned family once R-27 adopts the model count.
+
+## STOP — PR #9 head moved
+
+Observed after PR #16 was opened:
+
+| Ref | At preflight | Now |
+|---|---|---|
+| `refs/heads/claude/packet-series-and-signed-totals` | `230c0fcd404385fc3ed2e6f9ac6c614ea9429886` | `4ca0d414dc8ef94b526014af11b650e56392b2a1` |
+| `refs/heads/main` | `7f86de8a0314ccff28d80c06b86f046381f584d7` | `7f86de8a0314ccff28d80c06b86f046381f584d7` (unchanged) |
+| `refs/heads/kilo/silent-clean-hunt` | — | `b7fc0b1f6a53f90f84673462e9d80109d352f9bf` |
+
+PR #9 is still OPEN and draft, updated `2026-09-28T01:08:25Z`. No push, rebase,
+merge or edit was made to PR #9's branch by this campaign.
+
+Effect: every validation in this log was run at base `230c0fc`. The branch that
+PR #16 targets has advanced, so the validated base is no longer the branch tip.
+The cluster is stopped: no further fuzzing or commits are made against a moving
+base.
+
+Next safe action (owner): decide whether to re-validate this harness against
+`4ca0d41` (a fresh worktree from that SHA), or pin PR #16's base to `230c0fc`.
+Do not rebase PR #9's branch.
+
