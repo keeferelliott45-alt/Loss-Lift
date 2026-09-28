@@ -170,6 +170,25 @@ def _write_owner_marker(
     os.replace(temporary, marker)
 
 
+def _forget_owner_marker(directory: Path, staged_name: str) -> None:
+    """Best-effort removal of one entry a failed stage left behind."""
+    try:
+        owned = _read_owner_marker(directory)
+        if staged_name not in owned:
+            return
+        del owned[staged_name]
+        marker = directory / OWNER_MARKER_NAME
+        if owned:
+            payload = json.dumps({"files": owned}, indent=2, sort_keys=True)
+        else:
+            payload = json.dumps({"files": {}}, indent=2, sort_keys=True)
+        temporary = marker.with_suffix(".json.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, marker)
+    except OSError:  # pragma: no cover - best effort
+        pass
+
+
 def _inside_tempdir(path: Path) -> bool:
     """Whether a path resolves inside the system temporary directory."""
     try:
@@ -399,16 +418,17 @@ def ingest(
     digest = sha256_bytes(data)
     safe_name = Path(filename).name or "upload.pdf"
     target = directory / f".upload-{uuid4().hex}.pdf"
-    created = False
+    document_id = str(uuid4())
     try:
-        with target.open("xb") as handle:
-            created = True
-            handle.write(data)
-        document_id = str(uuid4())
+        # The marker is written before the bytes: a process killed between the
+        # two leaves no staged file, never an unmarked one that cleanup cannot
+        # see. If the write below fails, the entry is removed again.
         _write_owner_marker(directory, target, document_id, digest)
+        with target.open("xb") as handle:
+            handle.write(data)
     except BaseException:
-        if created:
-            target.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        _forget_owner_marker(directory, target.name)
         if owns_directory:
             shutil.rmtree(directory, ignore_errors=True)
         raise
@@ -453,6 +473,11 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             )
             directory.mkdir(parents=True, exist_ok=True)
             temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
+            document_id = str(uuid4())
+            # Provisional marker before the bytes, so a kill during the copy
+            # leaves a marker-bearing directory the startup sweep can find
+            # rather than an invisible staged file.
+            _write_owner_marker(directory, temporary_target, document_id, "")
             with temporary_target.open("xb") as target_handle:
                 temporary_target_created = True
                 digest = _copy_and_hash(source_handle, target_handle)
@@ -471,9 +496,8 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                     "Run the extraction again."
                 )
 
+        _write_owner_marker(directory, temporary_target, document_id, digest)
         target = temporary_target
-        document_id = str(uuid4())
-        _write_owner_marker(directory, target, document_id, digest)
         temporary_target = None
         return IngestedFile(
             document_id=document_id,
@@ -488,6 +512,8 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     except BaseException:
         if temporary_target is not None and temporary_target_created:
             temporary_target.unlink(missing_ok=True)
+        if temporary_target is not None and directory is not None:
+            _forget_owner_marker(directory, temporary_target.name)
         if owns_directory and directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
         raise

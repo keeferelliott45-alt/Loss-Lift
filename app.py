@@ -717,6 +717,19 @@ def _discard_staged(document_id: str) -> "DiscardResult | None":
     return discard(staged)
 
 
+def _discard_after_download(document_id: str) -> None:
+    """Run from the download button's click callback, after the payload exists."""
+    result = _discard_staged(document_id)
+    state = _state()
+    if result is not None and not result.gone:
+        state["staged_error"] = (
+            "A staged upload could not be deleted and was left in place: "
+            f"{result.reason or result.outcome}."
+        )
+    else:
+        state["staged_error"] = ""
+
+
 def _extract_uploads(uploads: list[Any]) -> None:
     """Process every upload and land back on the queue with all of them
     visible. Never guess which one the user wants to see next — that guess is
@@ -1035,17 +1048,28 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
 
             if state.get("deleted_notice"):
                 st.success(state.pop("deleted_notice"))
+            if state.get("staged_error"):
+                st.warning(state.pop("staged_error"))
 
 
 def _discard_selected_after_batch(document_ids: list[str]) -> None:
     """Discard the staged uploads behind a batch once its ZIP was downloaded."""
     gone = 0
+    refused = 0
     for document_id in document_ids:
         outcome = _discard_staged(document_id)
-        if outcome is not None and outcome.gone:
-            gone += 1
+        if outcome is not None:
+            if outcome.gone:
+                gone += 1
+            else:
+                refused += 1
     state = _state()
     state["deleted_notice"] = f"Deleted {gone} staged file(s) after download."
+    state["staged_error"] = (
+        f"{refused} staged file(s) were not deleted and were left in place."
+        if refused
+        else ""
+    )
 
 
 def _build_batch_zip(
@@ -1513,6 +1537,9 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
 
 def screen_export(document_id: str, result: ExtractionResult) -> None:
     _reconciliation_card(result)
+    state = _state()
+    if state.get("staged_error"):
+        st.warning(state.pop("staged_error"))
 
     left, right = st.columns(2)
     template = left.selectbox(
@@ -1577,7 +1604,7 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
         # The payload is already built. Deleting the staged source in the click
         # callback is what makes "deleted after you export" true without a
         # session-end hook Streamlit does not provide.
-        on_click=_discard_staged,
+        on_click=_discard_after_download,
         args=(document_id,),
     )
     st.caption(

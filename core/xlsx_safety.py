@@ -104,7 +104,9 @@ def _name_tokens(value: str) -> set[str]:
     return {
         token
         for token in re.split(r"[^0-9A-Za-z\u00c0-\u024f]+", value)
-        if len(token) >= 3
+        # Alphabetic only, so a name that contains a number does not make the
+        # scrub redact every year or claim number it appears in.
+        if len(token) >= 3 and token.isalpha()
     }
 
 

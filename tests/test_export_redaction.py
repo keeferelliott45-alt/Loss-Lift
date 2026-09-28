@@ -152,6 +152,30 @@ def test_unredacted_workbook_keeps_the_sentinels():
         assert sentinel.encode() in body, f"{sentinel!r} missing with redaction off"
 
 
+def test_redacted_package_has_no_other_data_surfaces():
+    """We add no comments, hyperlinks, headers/footers or dynamic sheet names."""
+    from openpyxl import load_workbook
+
+    document, result = sentinel_document()
+    payload = to_bytes(document, result, template="Full detail", redact=True)
+    members = _members(payload)
+    assert not [n for n in members if "comment" in n.lower()]
+    assert not [n for n in members if "vmlDrawing" in n]
+    joined = b"\n".join(members.values())
+    assert b"<hyperlink" not in joined
+    assert b"<headerFooter" not in joined
+
+    workbook = load_workbook(io.BytesIO(payload))
+    assert workbook.sheetnames == [
+        "Claim Detail",
+        "Loss Summary",
+        "Large Loss",
+        "Exceptions",
+        "Review History",
+        "Source Info",
+    ]
+
+
 def test_reviewer_note_is_withheld_whole_not_scrubbed():
     document, result = sentinel_document()
     workbook = build_workbook(document, result, template="Full detail", redact=True)

@@ -50,6 +50,37 @@ def test_ingest_writes_a_marker_recording_the_hash():
         discard(staged)
 
 
+def test_marker_exists_before_the_staged_bytes_are_copied(tmp_path, monkeypatch):
+    """A kill during the copy must not leave a staged file cleanup cannot see."""
+    from core import ingest as ingest_module
+    from core.ingest import ingest_path
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    observed: dict[str, str] = {}
+    real_copy = ingest_module._copy_and_hash
+
+    def watching_copy(handle, target):
+        directory = Path(target.name).parent
+        observed["marker"] = (directory / OWNER_MARKER_NAME).read_text(
+            encoding="utf-8"
+        )
+        return real_copy(handle, target)
+
+    monkeypatch.setattr(ingest_module, "_copy_and_hash", watching_copy)
+    staged = ingest_path(source)
+    try:
+        assert observed.get("marker"), "no marker before the copy began"
+        # Provisional entry first (empty digest), final entry once the copy is
+        # done; either way the directory is marker-bearing and sweepable.
+        assert '"sha256": ""' in observed["marker"]
+        assert staged.sha256 in (
+            staged.path.parent / OWNER_MARKER_NAME
+        ).read_text(encoding="utf-8")
+    finally:
+        discard(staged)
+
+
 def test_discard_outcomes_are_verified_and_idempotent():
     staged = ingest(PDF, "claims.pdf")
     first = discard(staged)
