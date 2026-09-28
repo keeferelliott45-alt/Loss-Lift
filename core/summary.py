@@ -135,7 +135,7 @@ def summarise_by_period(document: LossRunDocument) -> list[PeriodSummary]:
     claims, under its own term and its own printed sections, and every row
     says which run it is.
     """
-    if not document.is_packet:
+    if not getattr(document, "is_packet", False):
         return summarise_periods(
             document.claims, document.policy_periods, document.printed_sections
         )
