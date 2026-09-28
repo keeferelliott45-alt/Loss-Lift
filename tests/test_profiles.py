@@ -624,3 +624,34 @@ def test_a_profile_forces_its_own_number_locale(golden_dir, profiles_dir):
     assert again.locale.locale == "eu"
     assert again.locale.confident is True
     assert again.mapping.source == "profile"
+
+
+# --------------------------------------------------------------------------
+# A page without a letterhead starts with its table
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "Claim No Date of Loss Status Paid Total Total Incurred\nCN-1 01/01/2023",
+    "LOSS RUN REPORT\nClaim # Loss Date Status Incurred",
+    "Claim Number   Loss Date   Claimant   Paid   Reserve   Incurred",
+    "CN-1001 03/12/2024 OPEN 1,200.00 5,000.00",
+])
+def test_a_column_header_or_claim_row_is_never_the_carrier(text):
+    from core.profiles import detect_carrier
+
+    assert detect_carrier(text) is None
+
+
+@pytest.mark.parametrize("text, carrier", [
+    ("Meridian Casualty Company\nClaim No Date of Loss Status Incurred",
+     "Meridian Casualty Company"),
+    ("STATE AUTO - HISTORICAL LOSS REPORT", "STATE AUTO"),
+    ("Great Basin Indemnity  Printed: 3/1/24", "Great Basin Indemnity"),
+    ("Workers Compensation Fund", "Workers Compensation Fund"),
+    ("Atlantic States Ins Co", "Atlantic States Ins Co"),
+])
+def test_a_letterhead_is_still_read_above_its_table(text, carrier):
+    from core.profiles import detect_carrier
+
+    assert detect_carrier(text) == carrier

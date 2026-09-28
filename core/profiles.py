@@ -338,13 +338,55 @@ def _before_label(line: str) -> str:
     return " ".join(words)
 
 
+#: A date or an amount. A carrier's name holds neither; a line that does is a
+#: claim row or a metadata line that has lost its label.
+_DATA_TOKEN = re.compile(
+    r"\b\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}\b|\d{1,3}(?:[,.]\d{3})+[.,]\d{2}\b"
+)
+
+
+def _column_labels_named(line: str, longest: int = 4) -> int:
+    """How many distinct canonical fields a line's words name as column labels.
+
+    A letterhead-less page starts with its column header, and "Claim No Date
+    of Loss Status Paid Total Total Incurred" is then the first line on it --
+    one run of words, no gutters to split on. Reading the words as the most
+    labels they can be split into says whether they are a row of column
+    labels.
+    """
+    cells = [cell for cell in re.split(r"\s{2,}", line.strip()) if cell]
+    if len(cells) >= 3:
+        return len({guess_field(cell).field for cell in cells} - {None})
+    words = line.split()
+    # best[i]: the most labels words[i:] can be read as, and their fields.
+    best: list[tuple[int, frozenset[str]]] = [(0, frozenset())] * (len(words) + 1)
+    for index in range(len(words) - 1, -1, -1):
+        choice = best[index + 1]
+        for size in range(1, min(longest, len(words) - index) + 1):
+            field_name = guess_field(" ".join(words[index:index + size])).field
+            if field_name is None:
+                continue
+            count, fields = best[index + size]
+            if count + 1 > choice[0]:
+                choice = (count + 1, fields | {field_name})
+        best[index] = choice
+    return len(best[0][1])
+
+
+def _not_a_letterhead(line: str) -> bool:
+    """A line that is table, not letterhead: column labels, or claim data."""
+    return bool(_DATA_TOKEN.search(line)) or _column_labels_named(line) >= 3
+
+
 def detect_carrier(text: str) -> str | None:
     """Best-effort carrier name from the letterhead.
 
     Lines carrying a label are skipped entirely. "Named Insured: Whitfield
     Engineering Ltd" ends in a company suffix but names the *customer*, and
     mistaking it for the carrier would file every customer under its own
-    carrier profile.
+    carrier profile. So are lines that belong to the table: a row of column
+    labels or a claim row is what a page without a letterhead starts with,
+    and no carrier is better than a column header wearing the carrier's name.
     """
     lines = text.splitlines()[:8]
 
@@ -361,6 +403,11 @@ def detect_carrier(text: str) -> str | None:
         if not candidate or len(candidate) > 120:
             continue
         if _NOT_A_CARRIER.match(candidate) or _CRITERIA_PROSE.search(candidate):
+            continue
+        if _not_a_letterhead(candidate):
+            # The column header, or the first claim, of a page with no
+            # letterhead above it. Filed as the carrier, it would name the
+            # profile and split one carrier's claims across accounts.
             continue
         candidate = _strip_document_title(candidate)
         if candidate:

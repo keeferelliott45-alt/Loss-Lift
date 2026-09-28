@@ -31,6 +31,7 @@ from core.records import (
     is_identifier_candidate,
     leading_identifier,
     push_qualifiers,
+    strip_identifier_label,
 )
 from core.runs import (
     BAND_FRACTION,
@@ -1162,7 +1163,7 @@ def _extract_record_table(
         [
             text
             for line in body
-            for text in (identifier_cell(line),)
+            for text in (strip_identifier_label(identifier_cell(line)),)
             if text and is_identifier_candidate(text)
         ]
     )
