@@ -1454,6 +1454,25 @@ def r28_unsettled_run_boundary(
             expected="page furniture settling where the run begins",
             actual=run.ambiguity or "unsettled",
         ))
+    if doc.incomplete_report and not doc.runs:
+        # A lone report carries no run, so its own numbering stopping short is
+        # held on the document and named here instead.
+        findings.append(Finding(
+            rule_id="R-28",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition="incomplete",
+            page=doc.page_count or None,
+            message=(
+                f"The loss run is incomplete: {doc.incomplete_report}. Claims on "
+                f"its missing pages are not in this reading; confirm the PDF holds "
+                f"the whole report before exporting."
+            ),
+            expected="every page the report numbers",
+            actual=doc.incomplete_report,
+        ))
     return findings
 
 
@@ -1554,6 +1573,7 @@ def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
             row for row in doc.refused_claim_rows if run.holds(row.page)
         ],
         "runs": [],
+        "incomplete_report": None,
     })
 
 

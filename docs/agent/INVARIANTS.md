@@ -43,7 +43,11 @@ Coverage grades and blind spots per invariant: the coverage audit in
   R-28 (ERROR) names it and the refused rows on it. A numbering restart is a
   section only when the naming words are equal; a heading that settles
   nothing is ambiguous, never a silent section.
-- A single report has `runs == []` and behaves as before logical runs.
+- A single report has `runs == []` and is reconciled as one loss run. If its
+  own numbering stops before its declared last page, the pages it says it has
+  and the PDF lacks are recorded on the document (`incomplete_report`) and
+  R-28 (ERROR) names them, so it no longer reads clean with part of its table
+  absent (`test_packet_runs.py::test_a_lone_report_that_stops_before_its_last_page_is_not_clean`).
 - Run facts (carrier, insured, policy, term, line, valuation, printed totals
   and count) come from the run's own pages; `run_view` never falls back to
   another run's letterhead (`test_run_metadata.py`).

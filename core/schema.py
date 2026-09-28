@@ -683,6 +683,11 @@ class LossRunDocument(BaseModel):
     #: a single loss run, which is the whole document. Each run is reconciled
     #: on its own against what it printed; see :class:`LogicalRun`.
     runs: list[LogicalRun] = Field(default_factory=list)
+    #: A lone report whose own numbering stops before its declared last page:
+    #: pages it holds are absent from the PDF. None for a packet, whose
+    #: incompleteness lives on the run, and for a report that prints no
+    #: numbering or printed its own last page. R-28 reads it.
+    incomplete_report: str | None = None
     #: Rows that read as claims but whose claim number was refused. Recorded,
     #: never silently absorbed; see :class:`RefusedClaimRow`.
     refused_claim_rows: list[RefusedClaimRow] = Field(default_factory=list)

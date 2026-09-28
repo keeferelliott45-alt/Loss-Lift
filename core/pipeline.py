@@ -2613,6 +2613,7 @@ def _run_pipeline(
         column_mapping=mapping.decisions,
         printed_sections=printed_sections,
         runs=runs,
+        incomplete_report=plan.incomplete,
         refused_claim_rows=refused_rows,
         claims=claims,
         currencies_seen=currencies_seen,
