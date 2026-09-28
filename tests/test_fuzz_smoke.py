@@ -94,7 +94,7 @@ def test_scanned_family_has_no_silent_clean(workdir):
     assert loud <= SCANNED_LOUD_BASELINE, f"scanned LOUD rose to {loud}"
 
 
-def test_operators_are_known_and_mutations_import(): 
+def test_operators_are_known_and_mutations_import():
     assert mutations.ALL_OPERATOR_NAMES
     assert set(mutations.OPERATORS) == set(mutations.ALL_OPERATOR_NAMES)
 

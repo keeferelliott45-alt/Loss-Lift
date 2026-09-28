@@ -253,7 +253,7 @@ def render(case: Case, path: Path | str) -> Path:
 
 
 def _amounts(rng: random.Random) -> tuple[Decimal, Decimal]:
-    paid = Decimal(rng.choice([0, 250, 500, 1000, 1800, 5000, 12345])) 
+    paid = Decimal(rng.choice([0, 250, 500, 1000, 1800, 5000, 12345]))
     reserve = Decimal(rng.choice([0, 0, 750, 1000, 2500]))
     if paid == 0 and reserve == 0:
         reserve = Decimal("1000")
