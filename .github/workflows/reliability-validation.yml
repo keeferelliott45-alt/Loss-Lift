@@ -1,41 +1,39 @@
 name: Reliability batch validation
 
+# Dispatched by hand on the ref to validate. Never on push or pull_request:
+# the repository's workflow rules (tests/test_cloud_gate.py) keep every
+# workflow off code that has not been chosen deliberately, and pin every
+# action to a full commit SHA.
 on:
-  push:
-    branches:
-      - agent/lead/reliability-phase-1
-  pull_request:
-    branches:
-      - main
-      - agent/lead/reliability-phase-1
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: reliability-validation-${{ github.event.pull_request.number || github.ref }}
+  group: reliability-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Install declared dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -r requirements.txt
       - name: Validate exact head in an isolated worktree
         env:
           BATCH_BASE: 0f13c5c90a66621774000c6eb368df82b10e95cd
         run: |
           set -euo pipefail
+          export PATH="$RUNNER_TEMP/venv/bin:$PATH"
           HEAD_SHA=$(git rev-parse HEAD)
           export LOSSLIFT_WORKTREES="$RUNNER_TEMP/losslift-validation-worktrees"
           bash scripts/agent_worktree.sh create validation --agent ci --base "$HEAD_SHA"
