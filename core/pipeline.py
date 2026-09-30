@@ -1253,9 +1253,13 @@ def build_claims(
                         f"{previous.loss_description or ''} {extra}"
                     )
                 elif extra:
+                    held_back = bool(
+                        claims and not refusal
+                        and _continuation_text(row, table_mapping)
+                    )
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context,
+                        context=context, whole=held_back,
                     )
                 continue
 
@@ -1283,7 +1287,7 @@ def build_claims(
                 preview = " ".join(cell for cell in row.cells if cell)
                 _record_discard(
                     row, table_mapping, locale, warnings, unplaced, preview,
-                    context=context,
+                    context=context, whole=bool(extra and claims),
                 )
     return claims, warnings, unplaced
 
@@ -1358,8 +1362,15 @@ def _record_discard(
     preview: str,
     *,
     context: str = "unknown",
+    whole: bool = False,
 ) -> None:
     """Note a row nothing could take, and keep any numeric evidence on it.
+
+    ``whole`` keeps the row's text entire in its warning. A line that would
+    once have been folded into the claim above, and is now held back because
+    that claim was read in another run, is text the reading used to keep; cut
+    to a preview it would be kept nowhere, and a line nothing reads must never
+    be lost silently.
 
     A text-only row stays a warning: nothing measurable was lost, and raising
     a finding for every stray line would bury the ones that matter. A row
@@ -1396,7 +1407,8 @@ def _record_discard(
         )
         return
     warnings.append(
-        f"Page {row.page}: skipped a row with no claim number ({preview[:60]})."
+        f"Page {row.page}: skipped a row with no claim number "
+        f"({preview if whole else preview[:60]})."
     )
 
 
