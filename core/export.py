@@ -22,10 +22,11 @@ section 9).
 from __future__ import annotations
 
 import io
+import zipfile
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -56,6 +57,38 @@ from core.schema import (
     Severity,
     SourceMethod,
     sum_present,
+)
+from core.xlsx_safety import (
+    REDACTED_VALUE,
+    WITHHELD_NOTE,
+    RedactionPolicy,
+    TextPolicy,
+    safe_member_name,
+    sanitize_control_characters,
+)
+
+#: Every sheet a single-document workbook contains, in order. The export screen
+#: names these rather than guessing a count.
+WORKBOOK_SHEETS: tuple[str, ...] = (
+    "Claim Detail",
+    "Loss Summary",
+    "Large Loss",
+    "Exceptions",
+    "Review History",
+    "Source Info",
+)
+
+
+def workbook_sheets(document: LossRunDocument) -> tuple[str, ...]:
+    """List the actual sheets for a single report or a packet."""
+    if document.is_packet:
+        return WORKBOOK_SHEETS[:2] + ("Runs",) + WORKBOOK_SHEETS[2:]
+    return WORKBOOK_SHEETS
+
+#: One line naming exactly what redaction withheld, for Source Info.
+WITHHELD_LIST = (
+    "claimant names, loss descriptions, reviewer notes, and the before/after "
+    "values of corrections on those fields"
 )
 
 #: Column-order templates offered on the export screen.
@@ -201,6 +234,12 @@ def _title(field_name: str) -> str:
     return COLUMN_TITLES.get(field_name, field_name.replace("_", " ").capitalize())
 
 
+def _put(sheet: Worksheet, row: int, column: int, value: Any, policy: TextPolicy) -> Any:
+    """Write one cell through the workbook's single text policy."""
+    cell = sheet.cell(row=row, column=column)
+    return policy.write(cell, value)
+
+
 def resolve_columns(
     template: str | Sequence[str] = DEFAULT_TEMPLATE,
     *,
@@ -292,7 +331,9 @@ def _write_claims_sheet(
     columns: Sequence[str],
     result: ReconciliationResult | None,
     source_path: Any = None,
+    policy: TextPolicy | None = None,
 ) -> None:
+    policy = policy or TextPolicy()
     findings = _findings_index(result)
     widths: dict[int, int] = {}
     packet = document.is_packet
@@ -303,7 +344,8 @@ def _write_claims_sheet(
         title for title, _ in _DOCUMENT_COLUMNS
     ]
     for column_index, title in enumerate(titles, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell = sheet.cell(row=1, column=column_index)
+        policy.write(cell, title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -316,7 +358,8 @@ def _write_claims_sheet(
         run_id = run.run_id if run is not None else None
         for column_index, field_name in enumerate(columns, start=1):
             value = _cell_value(claim, field_name, source_path)
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell = sheet.cell(row=row_index, column=column_index)
+            value = policy.write(cell, value)
 
             if field_name in MONEY_FIELDS:
                 cell.number_format = MONEY_FORMAT
@@ -349,7 +392,8 @@ def _write_claims_sheet(
             trailing.insert(0, run_id or "unassigned")
         for offset, value in enumerate(trailing):
             column_index = len(columns) + 1 + offset
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell = sheet.cell(row=row_index, column=column_index)
+            value = policy.write(cell, value)
             if isinstance(value, date):
                 cell.number_format = DATE_FORMAT
             if value is not None:
@@ -367,6 +411,8 @@ def _write_exceptions_sheet(
     sheet: Worksheet,
     result: ReconciliationResult | None,
     log: ReviewLog | None = None,
+    policy: TextPolicy | None = None,
+    redaction: RedactionPolicy | None = None,
 ) -> None:
     """Every finding as raised, and what a reviewer decided about it.
 
@@ -374,6 +420,7 @@ def _write_exceptions_sheet(
     to be able to see both what was flagged and what was done, and a sheet that
     quietly dropped the resolved ones would answer only half of that.
     """
+    policy = policy or TextPolicy(redaction=redaction)
     headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
                "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note",
                "Subject", "Condition", "Category"]
@@ -382,13 +429,24 @@ def _write_exceptions_sheet(
         headers.append("Run ID")
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell = sheet.cell(row=1, column=column_index)
+        policy.write(cell, title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         widths[column_index] = len(title) + 2
 
     findings = result.findings if result else []
     for row_index, finding in enumerate(findings, start=2):
+        note = ""
+        if log:
+            entry = log.latest_for(finding_key(finding))
+            if entry is not None and entry.still_applies_to(finding):
+                note = entry.note
+        # A reviewer's free text can quote the claimant or describe the loss.
+        # Under redaction the note is withheld whole; the rule id, time, status
+        # and page that make the decision auditable are not.
+        if redaction is not None and note:
+            note = WITHHELD_NOTE
         values = [
             finding.rule_id,
             finding.severity.value,
@@ -400,16 +458,22 @@ def _write_exceptions_sheet(
             float(finding.delta) if finding.delta is not None else None,
             finding.page,
             (log.action_for(finding).value if log else ReviewAction.OPEN.value),
-            (entry.note if log and (entry := log.latest_for(finding_key(finding)))
-             and entry.still_applies_to(finding) else ""),
+            note,
             finding.subject,
             finding.condition,
             finding.category.value,
         ]
+        if redaction is not None:
+            # A finding message, or an expected/actual value, transcribes the
+            # document's own words and can quote part of a claimant's name.
+            for offset in (4, 5, 6):
+                if isinstance(values[offset], str):
+                    values[offset] = redaction.scrub_name_tokens(values[offset])
         if packet:
             values.append(finding.run_id or "whole packet")
         for column_index, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell = sheet.cell(row=row_index, column=column_index)
+            value = policy.write(cell, value)
             if column_index in (6, 7, 8) and isinstance(value, float):
                 cell.number_format = MONEY_FORMAT
             if finding.severity is Severity.ERROR:
@@ -420,7 +484,7 @@ def _write_exceptions_sheet(
                 widths[column_index] = max(widths[column_index], len(str(value)) + 2)
 
     if not findings:
-        sheet.cell(row=2, column=1, value="No exceptions. Every check passed.")
+        _put(sheet, 2, 1, "No exceptions. Every check passed.", policy)
 
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
@@ -430,6 +494,7 @@ def _write_runs_sheet(
     sheet: Worksheet,
     document: LossRunDocument,
     result: ReconciliationResult | None,
+    policy: TextPolicy | None = None,
 ) -> None:
     """One row per loss run the packet binds: where it is, how that is known,
     what it printed about itself, and whether it reconciles.
@@ -443,12 +508,8 @@ def _write_runs_sheet(
         "Claims read", "Printed claim count", "Printed incurred total",
         "Extracted incurred total", "Status", "Policy term",
     ]
-    widths: dict[int, int] = {}
-    for column_index, title in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=title)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        widths[column_index] = len(title) + 2
+    policy = policy or TextPolicy()
+    widths = _header_row(sheet, headers, policy)
     for row_index, run in enumerate(document.runs, start=2):
         claims = document.run_claims(run)
         printed = run.printed_totals.get("incurred_total")
@@ -474,7 +535,8 @@ def _write_runs_sheet(
              if run.policy_period_start or run.policy_period_end else "not printed"),
         ]
         for column_index, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell = sheet.cell(row=row_index, column=column_index)
+            value = policy.write(cell, value)
             if column_index in (13, 14) and isinstance(value, float):
                 cell.number_format = MONEY_FORMAT
             if run.ambiguous or status is DocumentStatus.NEEDS_REVIEW:
@@ -485,18 +547,22 @@ def _write_runs_sheet(
     _autosize(sheet, widths)
 
 
-def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
+def _write_summary_sheet(
+    sheet: Worksheet, document: LossRunDocument, policy: TextPolicy | None = None
+) -> None:
     """Claims by policy term — the loss history a submission asks for.
 
     "Ties to carrier" is the column that matters: it says, per term, whether
     these numbers match the subtotal the carrier printed for that term.
     """
+    policy = policy or TextPolicy()
     headers = ["Policy term", "Claims", "Open", "Closed", "Paid", "Reserves",
                "Recoveries", "Incurred", "Frequency", "Severity",
                "Largest loss", "Carrier printed", "Ties to carrier"]
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell = sheet.cell(row=1, column=column_index)
+        policy.write(cell, title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         widths[column_index] = len(title) + 2
@@ -529,7 +595,8 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
             "not printed" if ties is None else "yes" if ties else "no",
         ]
         for column_index, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell = sheet.cell(row=row_index, column=column_index)
+            value = policy.write(cell, value)
             if isinstance(value, float):
                 cell.number_format = MONEY_FORMAT
             if ties is False:
@@ -538,7 +605,7 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
                 widths[column_index] = max(widths[column_index], len(str(value)) + 2)
 
     if not periods:
-        sheet.cell(row=2, column=1, value="No claims to summarise.")
+        _put(sheet, 2, 1, "No claims to summarise.", policy)
 
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
@@ -548,15 +615,17 @@ def _write_large_loss_sheet(
     sheet: Worksheet,
     document: LossRunDocument,
     threshold: Decimal,
+    policy: TextPolicy | None = None,
 ) -> None:
     """Claims at or above the threshold, worst first.
 
     The shock losses drive the price, so they get their own sheet rather than
     being found by sorting the detail tab.
     """
+    policy = policy or TextPolicy()
     headers = ["Claim number", "Date of loss", "Status", "Cause of loss",
                "Paid", "Reserve", "Recovery", "Incurred", "Source page"]
-    widths = _header_row(sheet, headers)
+    widths = _header_row(sheet, headers, policy)
 
     large = sorted(
         (c for c in document.claims
@@ -575,17 +644,21 @@ def _write_large_loss_sheet(
             _float(claim.recovery_total),
             _float(claim.incurred_total),
             claim.source_page,
-        ], widths)
+        ], widths, policy)
 
     if not large:
-        sheet.cell(row=2, column=1,
-                   value=f"No claim reaches {threshold:,.0f}.")
+        _put(sheet, 2, 1, f"No claim reaches {threshold:,.0f}.", policy)
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
 
 
 
-def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
+def _write_review_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    policy: TextPolicy | None = None,
+    redaction: RedactionPolicy | None = None,
+) -> None:
     """Every decision a reviewer took, oldest first.
 
     This is the sheet that keeps the three kinds of fact apart once the
@@ -593,7 +666,13 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     extracted", what LossLift made of it is in the finding, and what a person
     decided is here. A recipient who only has the file can still tell which is
     which, which is the whole point of writing it down.
+
+    Under redaction the *decision* survives — rule, time, reviewer, action,
+    status and page — but a correction's before/after on a redacted field is
+    replaced whole and the reviewer's free-text note is withheld, because
+    either can quote the claimant.
     """
+    policy = policy or TextPolicy(redaction=redaction)
     # "Document status", not "Reconciliation": the headline says the worst true
     # thing about the document, and dismissing the last flag moves it without
     # anything having reconciled. Naming the column for the stronger of the two
@@ -603,10 +682,24 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
                "Value after", "Document status before", "Document status after",
                "Reviewer note", "Finding identity", "Physical row",
                "Expected", "Actual", "Delta"]
-    widths = _header_row(sheet, headers)
+    widths = _header_row(sheet, headers, policy)
+
+    def _correction_value(entry: Any, value: str | None) -> Any:
+        if value is None:
+            return ""
+        if redaction is not None and entry.field in REDACTED_FIELDS:
+            return REDACTED_VALUE
+        return value
 
     entries = document.review_log.entries
     for row_index, entry in enumerate(entries, start=2):
+        note = entry.note
+        if redaction is not None and note:
+            note = WITHHELD_NOTE
+        message = entry.message
+        if redaction is not None and isinstance(message, str):
+            # The finding's own words can quote part of a claimant's name.
+            message = redaction.scrub_name_tokens(message)
         _fill_row(sheet, row_index, [
             entry.at.isoformat(timespec="microseconds"),
             entry.reviewer,
@@ -615,22 +708,23 @@ def _write_review_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
             entry.claim_number or "",
             entry.where,
             _title(entry.field) if entry.field else "",
-            entry.message,
+            message,
             entry.action.value,
-            entry.before if entry.before is not None else "",
-            entry.after if entry.after is not None else "",
+            _correction_value(entry, entry.before),
+            _correction_value(entry, entry.after),
             entry.status_before,
             entry.status_after,
-            entry.note,
+            note,
             entry.key,
             entry.row_id,
             entry.expected,
             entry.actual,
             entry.delta,
-        ], widths)
+        ], widths, policy)
 
     if not entries:
-        sheet.cell(row=2, column=1, value="Nobody has reviewed a finding on this document yet.")
+        _put(sheet, 2, 1,
+             "Nobody has reviewed a finding on this document yet.", policy)
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
 
@@ -642,7 +736,9 @@ def _write_source_sheet(
     *,
     redacted: bool,
     template: str,
+    policy: TextPolicy | None = None,
 ) -> None:
+    policy = policy or TextPolicy()
     # The same policy as the queue and the review card: a workbook must never
     # call reconciled a document the app shows as needing review.
     status = canonical_status(result)
@@ -677,21 +773,37 @@ def _write_source_sheet(
         ("Column template", template if isinstance(template, str) else "custom"),
         ("Exported at", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
     ]
+    if redacted:
+        rows.append(("Withheld", WITHHELD_LIST))
 
     for row_index, (label, value) in enumerate(rows, start=1):
-        label_cell = sheet.cell(row=row_index, column=1, value=label)
+        label_cell = sheet.cell(row=row_index, column=1)
+        policy.write(label_cell, label)
         label_cell.font = Font(bold=True)
-        value_cell = sheet.cell(row=row_index, column=2, value=value)
-        if isinstance(value, date):
+        value_cell = sheet.cell(row=row_index, column=2)
+        stored = policy.write(value_cell, value)
+        if isinstance(stored, date):
             value_cell.number_format = DATE_FORMAT
 
-    blank = len(rows) + 2
-    sheet.cell(row=blank, column=1, value="Printed totals vs extracted").font = Font(bold=True)
+    # Written after every other cell so the count covers the whole workbook,
+    # including anything repaired while Source Info itself was written.
+    repaired_row = len(rows) + 1
+    policy.write(sheet.cell(row=repaired_row, column=1), "Control characters replaced")
+    sheet.cell(row=repaired_row, column=1).font = Font(bold=True)
+    policy.write(
+        sheet.cell(row=repaired_row, column=2), policy.replaced_control_characters
+    )
+
+    blank = repaired_row + 2
+    totals_label = sheet.cell(row=blank, column=1)
+    policy.write(totals_label, "Printed totals vs extracted")
+    totals_label.font = Font(bold=True)
     header_row = blank + 1
     for column_index, title in enumerate(
         ["Column", "Printed on document", "Extracted total", "Difference"], start=1
     ):
-        cell = sheet.cell(row=header_row, column=column_index, value=title)
+        cell = sheet.cell(row=header_row, column=column_index)
+        policy.write(cell, title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
 
@@ -701,15 +813,17 @@ def _write_source_sheet(
         if printed is None:
             continue
         extracted = document.column_total(field_name)
-        sheet.cell(row=row_index, column=1, value=_title(field_name))
+        policy.write(sheet.cell(row=row_index, column=1), _title(field_name))
         for column_index, amount in enumerate(
             (printed, extracted, extracted - printed), start=2
         ):
-            cell = sheet.cell(row=row_index, column=column_index, value=float(amount))
+            cell = sheet.cell(row=row_index, column=column_index)
+            policy.write(cell, float(amount))
             cell.number_format = MONEY_FORMAT
         row_index += 1
     if row_index == header_row + 1:
-        sheet.cell(row=row_index, column=1, value="The document printed no column totals.")
+        policy.write(sheet.cell(row=row_index, column=1),
+                     "The document printed no column totals.")
 
     _autosize(sheet, {1: 34, 2: 46, 3: 20, 4: 18})
 
@@ -735,28 +849,55 @@ def build_workbook(
     columns = resolve_columns(
         template, redact=redact, include_provenance=include_provenance
     )
+    redaction = RedactionPolicy.from_document(document) if redact else None
+    policy = TextPolicy(redaction=redaction)
+
     workbook = Workbook()
+    _apply_properties(workbook, document, policy)
+
     claims_sheet = workbook.active
-    claims_sheet.title = "Claim Detail"
-    _write_claims_sheet(claims_sheet, document, columns, result, source_path)
-    _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
+    claims_sheet.title = WORKBOOK_SHEETS[0]
+    _write_claims_sheet(claims_sheet, document, columns, result, source_path, policy)
+    _write_summary_sheet(workbook.create_sheet(WORKBOOK_SHEETS[1]), document, policy)
     if document.is_packet:
-        _write_runs_sheet(workbook.create_sheet("Runs"), document, result)
+        _write_runs_sheet(workbook.create_sheet("Runs"), document, result, policy)
     _write_large_loss_sheet(
-        workbook.create_sheet("Large Loss"), document, large_loss_threshold
+        workbook.create_sheet(WORKBOOK_SHEETS[2]), document, large_loss_threshold, policy
     )
     _write_exceptions_sheet(
-        workbook.create_sheet("Exceptions"), result, document.review_log
+        workbook.create_sheet(WORKBOOK_SHEETS[3]),
+        result,
+        document.review_log,
+        policy,
+        redaction,
     )
-    _write_review_sheet(workbook.create_sheet("Review History"), document)
+    _write_review_sheet(
+        workbook.create_sheet(WORKBOOK_SHEETS[4]), document, policy, redaction
+    )
     _write_source_sheet(
-        workbook.create_sheet("Source Info"),
+        workbook.create_sheet(WORKBOOK_SHEETS[5]),
         document,
         result,
         redacted=redact,
         template=template if isinstance(template, str) else "custom",
+        policy=policy,
     )
     return workbook
+
+
+def _apply_properties(
+    workbook: Workbook, document: LossRunDocument, policy: TextPolicy
+) -> None:
+    """Workbook metadata is a ZIP member too, and is written under the policy.
+
+    It carries no document text today, but it is set explicitly rather than
+    left to openpyxl's defaults so that nothing reaches ``docProps`` without
+    passing the same writer as every cell.
+    """
+    properties = workbook.properties
+    properties.creator = policy.prepare_text("LossLift")
+    properties.title = policy.prepare_text("LossLift loss run export")
+    properties.subject = policy.prepare_text(document.source_filename)
 
 
 def to_bytes(
@@ -770,10 +911,14 @@ def to_bytes(
     return buffer.getvalue()
 
 
-def _header_row(sheet: Worksheet, headers: Sequence[str]) -> dict[int, int]:
+def _header_row(
+    sheet: Worksheet, headers: Sequence[str], policy: TextPolicy | None = None
+) -> dict[int, int]:
+    policy = policy or TextPolicy()
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell = sheet.cell(row=1, column=column_index)
+        policy.write(cell, title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
         widths[column_index] = len(title) + 2
@@ -781,10 +926,16 @@ def _header_row(sheet: Worksheet, headers: Sequence[str]) -> dict[int, int]:
 
 
 def _fill_row(
-    sheet: Worksheet, row_index: int, values: Sequence[Any], widths: dict[int, int]
+    sheet: Worksheet,
+    row_index: int,
+    values: Sequence[Any],
+    widths: dict[int, int],
+    policy: TextPolicy | None = None,
 ) -> None:
+    policy = policy or TextPolicy()
     for column_index, value in enumerate(values, start=1):
-        cell = sheet.cell(row=row_index, column=column_index, value=value)
+        cell = sheet.cell(row=row_index, column=column_index)
+        value = policy.write(cell, value)
         if isinstance(value, float):
             cell.number_format = MONEY_FORMAT
         elif isinstance(value, date):
@@ -799,8 +950,21 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     Deliberately not the single-document workbook pointed at merged claims: the
     provenance of a merged history is several files with several valuation
     dates, and Source Info can only name one. The Sources sheet names them all.
+
+    Under redaction the claimant column is dropped and every remaining text
+    cell — carrier, filenames, claim numbers — is scrubbed of the sensitive
+    values drawn from every document in the account, so the merged workbook
+    cannot leak what a single document's workbook would not.
     """
+    redaction = (
+        RedactionPolicy.from_documents(account.documents) if redact else None
+    )
+    policy = TextPolicy(redaction=redaction)
+
     workbook = Workbook()
+    _apply_properties(workbook, account.documents[0] if account.documents
+                      else LossRunDocument(source_filename="account.xlsx",
+                                           file_sha256=""), policy)
 
     claims_sheet = workbook.active
     claims_sheet.title = "Claims"
@@ -809,7 +973,7 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
                "Review"]
     if not redact:
         headers.insert(3, "Claimant")
-    widths = _header_row(claims_sheet, headers)
+    widths = _header_row(claims_sheet, headers, policy)
 
     for row_index, history in enumerate(account.histories, start=2):
         claim = history.current
@@ -832,7 +996,7 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             (history.uncertain
              or ("" if history.trusted else "read from a run that needs review")),
         ]
-        _fill_row(claims_sheet, row_index, values, widths)
+        _fill_row(claims_sheet, row_index, values, widths, policy)
         if history.development and history.development > 0:
             claims_sheet.cell(row=row_index, column=len(headers) - 2).fill = _FINDING_FILL
         if not history.trusted:
@@ -843,7 +1007,7 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     summary_sheet = workbook.create_sheet("Loss Summary")
     widths = _header_row(summary_sheet, ["Policy term", "Claims", "Open", "Closed",
                                          "Paid", "Reserves", "Recoveries", "Incurred",
-                                         "Largest loss"])
+                                         "Largest loss"], policy)
     for row_index, period in enumerate(account.periods, start=2):
         _fill_row(summary_sheet, row_index, [
             period.label, period.claims, period.open_claims, period.closed_claims,
@@ -852,13 +1016,13 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             float(period.totals["recovery_total"]),
             float(period.totals["incurred_total"]),
             _float(period.largest_loss),
-        ], widths)
+        ], widths, policy)
     summary_sheet.freeze_panes = "A2"
     _autosize(summary_sheet, widths)
 
     sources_sheet = workbook.create_sheet("Sources")
     widths = _header_row(sources_sheet, ["File", "Run ID", "Carrier", "Policy number",
-                                         "Valuation date", "Claims", "Status", "SHA-256"])
+                                         "Valuation date", "Claims", "Status", "SHA-256"], policy)
     for row_index, source in enumerate(account.sources, start=2):
         _fill_row(sources_sheet, row_index, [
             source.source_filename,
@@ -869,13 +1033,13 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             len(source.claims),
             source.status.value if source.status is not None else "NOT RECONCILED",
             source.file_sha256,
-        ], widths)
+        ], widths, policy)
     _autosize(sources_sheet, widths)
 
     # Said once, where a recipient opening the workbook looks first after the
     # claims: whether the merged history can be used as it stands.
     status_sheet = workbook.create_sheet("Account Status", 0)
-    widths = _header_row(status_sheet, ["Account", "Status", "Why"])
+    widths = _header_row(status_sheet, ["Account", "Status", "Why"], policy)
     reasons = account.reasons() or [""]
     for row_index, reason in enumerate(reasons, start=2):
         _fill_row(status_sheet, row_index, [
@@ -883,7 +1047,7 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             ("Reconciled" if account.status is DocumentStatus.CLEAN else "Needs review")
             if row_index == 2 else None,
             reason,
-        ], widths)
+        ], widths, policy)
     _autosize(status_sheet, widths)
     return workbook
 
@@ -893,6 +1057,60 @@ def account_to_bytes(account: "AccountRollup", **kwargs: Any) -> bytes:
     buffer = io.BytesIO()
     build_account_workbook(account, **kwargs).save(buffer)
     return buffer.getvalue()
+
+
+def build_batch_zip(
+    items: Sequence[tuple[LossRunDocument, ReconciliationResult | None, Any]],
+    *,
+    template: str | Sequence[str] = DEFAULT_TEMPLATE,
+    redact: bool = False,
+    large_loss_threshold: Decimal = LARGE_LOSS_THRESHOLD,
+    on_success: Callable[[LossRunDocument], None] | None = None,
+) -> tuple[bytes, list[str]]:
+    """Several workbooks in one archive, under the same policy as one.
+
+    ``items`` is ``(document, reconciliation, source_path)`` per report. A
+    document whose workbook cannot be built is left out and named in the
+    failures rather than aborting the archive — one unreadable row must not
+    cost a broker the other forty reports. Entry names pass the text policy,
+    so a crafted source filename cannot smuggle a control character or a path
+    into the ZIP.
+    """
+    buffer = io.BytesIO()
+    used_names: set[str] = set()
+    failures: list[str] = []
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for document, result, source_path in items:
+            try:
+                payload = to_bytes(
+                    document,
+                    result,
+                    template=template,
+                    redact=redact,
+                    source_path=source_path,
+                    large_loss_threshold=large_loss_threshold,
+                )
+            except Exception as error:  # noqa: BLE001 - isolate one bad report
+                failures.append(
+                    f"{document.source_filename} could not be exported "
+                    f"({error}) and was left out of the archive."
+                )
+                continue
+            name = safe_member_name(
+                suggested_filename(
+                    document,
+                    needs_review=canonical_status(result) is DocumentStatus.NEEDS_REVIEW,
+                    redact=redact,
+                )
+            )
+            if name in used_names:
+                stem, _, ext = name.rpartition(".")
+                name = safe_member_name(f"{stem} ({document.document_id[:8]}).{ext}")
+            used_names.add(name)
+            archive.writestr(name, payload)
+            if on_success is not None:
+                on_success(document)
+    return buffer.getvalue(), failures
 
 
 def _float(value: Decimal | None) -> float | None:
@@ -911,14 +1129,35 @@ def write_xlsx(
     return target
 
 
-def suggested_filename(document: LossRunDocument) -> str:
-    """A filename an account manager can find again."""
+def suggested_filename(
+    document: LossRunDocument, *, needs_review: bool = False, redact: bool = False
+) -> str:
+    """A filename an account manager can find again.
+
+    ``needs_review`` marks a workbook whose document still has unresolved
+    ERRORs, so the honest status travels with the file even after it leaves the
+    app. ``redact`` scrubs the sensitive values out of the name itself, since a
+    source filename can carry a claimant's name into an archive listing.
+    """
     stem = Path(document.source_filename).stem or "loss-run"
     parts = [part for part in (document.named_insured, stem) if part]
     label = " - ".join(parts)[:80]
     valuation = document.valuation_date.isoformat() if document.valuation_date else "no-valuation-date"
     safe = "".join(ch if ch.isalnum() or ch in " -_." else "-" for ch in label).strip()
-    return f"{safe} {valuation}.xlsx".replace("  ", " ")
+    suffix = "-NEEDS-REVIEW" if needs_review else ""
+    name = f"{safe} {valuation}{suffix}.xlsx".replace("  ", " ")
+    redaction = RedactionPolicy.from_document(document) if redact else None
+    return safe_member_name(name, TextPolicy(redaction=redaction))
+
+
+def suggested_json_filename(
+    document: LossRunDocument, *, needs_review: bool = False, redact: bool = False
+) -> str:
+    """Apply the workbook's redaction and path policy to a JSON filename."""
+    workbook_name = suggested_filename(
+        document, needs_review=needs_review, redact=redact
+    )
+    return safe_member_name(workbook_name.removesuffix(".xlsx") + ".json")
 
 
 # --------------------------------------------------------------------------
@@ -949,6 +1188,34 @@ def _redact_claim(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+_JSON_STRUCTURAL_FIELDS = frozenset({
+    "schema", "rule_id", "run_id", "severity", "category", "scope",
+    "field", "condition", "status", "review_status", "engine_status",
+    "trust", "review", "action", "source_method", "read_method",
+    "extraction_method", "claim_status", "null_reason",
+})
+
+
+def _redact_json_value(value: Any, redaction: RedactionPolicy, key: str = "") -> Any:
+    """Scrub all JSON text, including nested provenance and finding details."""
+    if isinstance(value, dict):
+        return {
+            name: _redact_json_value(item, redaction, name)
+            for name, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item, redaction, key) for item in value]
+    if isinstance(value, str):
+        if key in {"note", "notes"} and value:
+            return WITHHELD_NOTE
+        clean, _ = sanitize_control_characters(value)
+        clean = redaction.scrub(clean)
+        if key not in _JSON_STRUCTURAL_FIELDS:
+            clean = redaction.scrub_name_tokens(clean)
+        return clean
+    return value
+
+
 def build_json(
     document: LossRunDocument,
     result: ReconciliationResult | None = None,
@@ -971,7 +1238,7 @@ def build_json(
     for entry in document.review_log.entries:
         record = entry.model_dump(mode="json")
         if redact and entry.field in REDACTED_FIELDS:
-            record.update(before=None, after=None, note="", expected=None, actual=None,
+            record.update(before=None, after=None, note=WITHHELD_NOTE, expected=None, actual=None,
                           message="(redacted)")
         review.append(record)
 
@@ -984,7 +1251,7 @@ def build_json(
 
     header = document.model_dump(mode="json", exclude={
         "claims", "runs", "review_log", "refused_claim_rows", "unplaced_rows"})
-    return {
+    payload = {
         "schema": JSON_SCHEMA,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "redacted": redact,
@@ -1004,6 +1271,9 @@ def build_json(
         "findings": findings,
         "review_log": review,
     }
+    if redact:
+        return _redact_json_value(payload, RedactionPolicy.from_document(document))
+    return payload
 
 
 def to_json_bytes(
