@@ -1878,6 +1878,16 @@ BAND_POLICY = re.compile(
 )
 
 
+#: A glyph pdfplumber could not map to a character: the font carries no
+#: ToUnicode map and nothing it could be recovered from.
+UNDECODABLE_GLYPH = re.compile(r"\(cid:\d+\)")
+
+
+def _decodable(obj: dict) -> bool:
+    return not (obj.get("object_type") == "char"
+                and UNDECODABLE_GLYPH.fullmatch(obj.get("text", "")))
+
+
 @dataclass
 class DigitalExtraction:
     tables: list[RawTable]
@@ -1890,6 +1900,9 @@ class DigitalExtraction:
     column_split_pages: list[tuple[int, int]] = dataclass_field(default_factory=list)
     #: What each extracted page prints about which report it belongs to.
     page_evidence: dict[int, PageEvidence] = dataclass_field(default_factory=dict)
+    #: Pages printing glyphs that cannot be decoded to characters. Those
+    #: glyphs were withheld from the reading, so the page is not fully read.
+    undecodable_pages: list[int] = dataclass_field(default_factory=list)
 
     @property
     def all_rows(self) -> list[RawRow]:
@@ -1916,6 +1929,7 @@ def extract_pdf(
     page_texts: dict[int, str] = {}
     signatures: list[PageSignature] = []
     evidence: dict[int, PageEvidence] = {}
+    undecodable_pages: list[int] = []
 
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
@@ -1925,6 +1939,13 @@ def extract_pdf(
             # to read as "no letter band here" for the pairing below to
             # correctly refuse to join across it, and it only reads that way
             # if it was looked at.
+            # Glyphs set in a font with no map to characters extract as
+            # "(cid:N)" placeholders. What they print is unknown, so no cell,
+            # claim, carrier or total may be made of them: they are withheld
+            # from every reading of the page, and the page is reported.
+            if any(UNDECODABLE_GLYPH.fullmatch(char.get("text", "")) for char in page.chars):
+                undecodable_pages.append(index)
+                page = page.filter(_decodable)
             words = page_words(page)
             signatures.append(page_signature(index, words))
             if pages is not None and index not in pages:
@@ -1990,4 +2011,5 @@ def extract_pdf(
         page_count=page_count,
         column_split_pages=column_split_pages,
         page_evidence=evidence,
+        undecodable_pages=undecodable_pages,
     )
