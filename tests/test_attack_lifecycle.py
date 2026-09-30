@@ -4,7 +4,7 @@ These tests assert security/retention properties of the ingest/discard and
 evidence lifecycle, not implementation details. They are expected to FAIL on
 the base checkout: the point is to be red.
 
-Synthetic data only: the app checks the %PDF- magic for ingest.
+Synthetic data only: every staged file is a generated PDF that opens.
 """
 
 import os
@@ -16,8 +16,9 @@ import pytest
 from core.evidence import Evidence, EvidenceKind, claim_evidence, confirm_region, render_evidence
 from core.ingest import IngestedFile, discard, ingest
 from core.schema import Claim, SourceMethod
+from tests.pdf_fixtures import synthetic_pdf
 
-PDF = b"%PDF-1.4\n" + b"x" * 200
+PDF = synthetic_pdf("attack lifecycle")
 
 OUTCOMES = {"deleted", "already_gone", "refused", "failed"}
 

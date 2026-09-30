@@ -25,8 +25,9 @@ from core.ingest import (
     sweep_orphaned_staging,
 )
 from core.schema import Claim, LossRunDocument
+from tests.pdf_fixtures import synthetic_pdf
 
-PDF = b"%PDF-1.4\n" + b"synthetic staged bytes" * 4
+PDF = synthetic_pdf("staged lifecycle")
 
 
 def _marked_dir(root: Path, name: str, *, age_seconds: float = 0) -> Path:
