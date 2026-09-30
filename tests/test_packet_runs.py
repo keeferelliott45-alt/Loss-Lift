@@ -162,6 +162,23 @@ def test_p1_1_mechanism_a_page_after_n_of_n_is_not_in_that_run():
     assert [s.pages for s in plan_runs([1, 2, 3], evidence, {1, 2, 3})] == [[1, 2], [3]]
 
 
+def test_a_foreign_unnumbered_page_filling_the_exact_count_is_blind():
+    """A "Page 1 of 3", another carrier's unnumbered page, A "Page 3 of 3": the
+    foreign page sits in A's missing page 2 slot exactly. It names another
+    report, so it is joined blind -- never silently -- and its refused rows are
+    named by R-29 rather than read as A's."""
+    evidence = {
+        1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 3", "header")),
+                        identity=identity_of("Northfield loss run")),
+        2: PageEvidence(2, identity=identity_of("Harbor Crest loss run")),
+        3: PageEvidence(3, paginations=tuple(paginations_in("Page 3 of 3", "header")),
+                        identity=identity_of("Northfield loss run")),
+    }
+    segments = plan_runs([1, 2, 3], evidence, {1, 2, 3})
+    assert [s.pages for s in segments] == [[1, 2, 3]]
+    assert segments[0].blind == {2}
+
+
 @pytest.mark.parametrize("where", ["prose", "cell"])
 def test_p1_2_mechanism_body_pagination_is_seen_and_ignored(tmp_path, where):
     from core.extract_digital import extract_pdf

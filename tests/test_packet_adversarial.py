@@ -616,6 +616,25 @@ def test_r3_8_blind_page_inside_the_count_is_named(tmp_path):
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
+def test_r3_9_a_foreign_page_filling_the_exact_count_is_not_silent(tmp_path):
+    """A "Page 1 of 3", another carrier's unnumbered page, A "Page 3 of 3": the
+    foreign page fits A's missing page 2 exactly and is bridged. Nothing on it
+    names A, so it is joined blind and its refused claim is named by R-29; the
+    packet needs review. Without the blind mark the vote reads it as A's page,
+    no rule names the refusal, and the packet reads CLEAN."""
+    large = _large_run(8)
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": large[:3]},
+        {"top": ("HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+         "headers": SMALL_HEADERS, "rows": BARE[:1]},
+        {"top": ("Page 3 of 3", LARGE_CARRIER, *LETTER), "rows": large[3:],
+         "total": _total(large)},
+    ])
+    seen = _named_or_read(result, BARE[:1])
+    assert all(ok for ok, _ in seen.values()), _msg(result)
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW, _msg(result)
+
+
 # Codex review of 17e704e: headings that share or lack naming words, and a
 # report resumed after another report interrupted it.
 
