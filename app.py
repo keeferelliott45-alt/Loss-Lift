@@ -13,6 +13,7 @@ person running this will have dozens of reports in flight at once.
 
 from __future__ import annotations
 
+import html
 import time
 from pathlib import Path
 from decimal import Decimal
@@ -59,7 +60,17 @@ from core.pipeline import (
     save_confirmed_mapping,
     to_records,
 )
+from core.eml_intake import EmlFatalError, read_submission
 from core.profiles import list_profiles, llm_enabled
+from core.submission import (
+    OUTCOME_LABELS,
+    PROCESSING_LABELS,
+    IntakeOutcome,
+    Submission,
+    status_label,
+    summarise_submission,
+)
+from core.submission_export import submission_filename, submission_to_bytes
 from core.account import UNNAMED_ACCOUNT, build_accounts
 from core.accounting import claim_accounting
 from core.runs import unsettled_runs
@@ -127,6 +138,16 @@ div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 </style>
 """
 
+def _plain(text: str) -> str:
+    """Text from outside (a file name, a carrier) made inert for st.markdown.
+
+    An email's sender chooses its attachments' names; neither HTML nor
+    markdown in one may render as anything but characters.
+    """
+    escaped = html.escape(text or "")
+    return "".join("\\" + ch if ch in "\\`*_{}[]()#+-.!|<>~" else ch for ch in escaped)
+
+
 def _status_pill(result: ExtractionResult) -> str:
     """User-facing status: Ready / Review N issue(s) / Needs mapping --
     never the internal rule/status vocabulary."""
@@ -168,6 +189,12 @@ def _state() -> dict[str, Any]:
     # Local telemetry: counts and tokens only (core/telemetry.py).
     st.session_state.setdefault("telemetry_session", telemetry.new_session())
     st.session_state.setdefault("processed_at", {})  # document_id -> monotonic seconds
+    # Saved emails read as submissions. Email metadata lives here, in session
+    # memory only (core/submission.py); nothing is written to disk.
+    st.session_state.setdefault("submissions", {})     # submission_id -> Submission
+    st.session_state.setdefault("submission_order", [])
+    st.session_state.setdefault("submission_of", {})   # document_id -> submission_id
+    st.session_state.setdefault("open_submission", None)
     return st.session_state
 
 
@@ -719,7 +746,8 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs — one or a hundred at once. Each uploaded file is "
+        "Drop in carrier PDFs, or a broker's saved email (.eml) with its loss "
+        "runs attached — one or a hundred at once. Each uploaded file is "
         "staged in a temporary directory for this session. It is deleted after "
         "you export it, when you press Delete, or when you remove it from the "
         "queue. Temporary files left behind by an interrupted session are swept "
@@ -729,8 +757,8 @@ def screen_queue() -> None:
 
     state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
-        "Choose PDF files",
-        type=["pdf"],
+        "Choose PDF files or saved emails (.eml)",
+        type=["pdf", "eml"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"uploader-{state['uploader_generation']}",
@@ -744,13 +772,14 @@ def screen_queue() -> None:
     for message in state["rejected"]:
         st.error(message)
 
-    if not state["order"]:
-        st.info("No documents yet. Upload loss runs to get started.")
+    if not state["order"] and not state["submission_order"]:
+        st.info("No documents yet. Upload loss runs or a saved email to get started.")
         _profile_library()
         return
 
     st.divider()
     _queue_summary()
+    _submissions_panel()
     _accounts_panel()
     st.divider()
     _queue_toolbar_and_list()
@@ -792,6 +821,28 @@ def _download_export(
     _discard_after_download(document_id)
 
 
+def _download_submission(document_ids: list[str]) -> None:
+    """The submission workbook was downloaded: its documents' staged PDFs go.
+
+    The same lifecycle as a document export. A document still waiting for its
+    columns to be mapped keeps its file -- mapping re-reads it, and its claims
+    are not in the workbook yet.
+    """
+    state = _state()
+    kept: list[str] = []
+    for document_id in document_ids:
+        result = state["documents"].get(document_id)
+        if result is not None and result.needs_mapping:
+            continue
+        outcome = _discard_staged(document_id)
+        if outcome is not None and not outcome.gone:
+            kept.append(outcome.reason or str(outcome.outcome))
+    state["staged_error"] = (
+        f"{len(kept)} staged upload(s) could not be deleted and were left in place: "
+        f"{'; '.join(kept)}." if kept else ""
+    )
+
+
 def _extract_uploads(uploads: list[Any]) -> None:
     """Process every upload and land back on the queue with all of them
     visible. Never guess which one the user wants to see next — that guess is
@@ -801,8 +852,15 @@ def _extract_uploads(uploads: list[Any]) -> None:
     state["notices"] = []
     progress = st.progress(0.0, text="Reading documents")
     added = 0
+    read_email = False
 
     for index, upload in enumerate(uploads, start=1):
+        if upload.name.lower().endswith(".eml"):
+            before = len(state["submission_order"])
+            added += _extract_email(upload)
+            read_email = read_email or len(state["submission_order"]) > before
+            progress.progress(index / len(uploads), text=f"Read {upload.name}")
+            continue
         try:
             # Extract or discard: a failure after ingest never leaves the
             # staged copy behind (spec section 9).
@@ -819,8 +877,8 @@ def _extract_uploads(uploads: list[Any]) -> None:
             twin = _already_open(result.document.file_sha256)
             if twin is not None:
                 state["notices"].append(
-                    f"{upload.name} is the same file as "
-                    f"{twin.document.source_filename}, already in the queue. It "
+                    f"{_plain(upload.name)} is the same file as "
+                    f"{_plain(twin.document.source_filename)}, already in the queue. It "
                     f"was read again from scratch: corrections and review "
                     f"history do not carry over between uploads."
                 )
@@ -840,10 +898,82 @@ def _extract_uploads(uploads: list[Any]) -> None:
     progress.empty()
     if added:
         state["last_added"] = added
+    if added or read_email:
         # A fresh uploader key so already-processed files disappear from the
-        # tray instead of sitting there ready to be re-added by accident.
+        # tray instead of sitting there ready to be re-added by accident -- an
+        # email whose attachments were all rejected is still a submission, and
+        # adding it again would list it twice.
         state["uploader_generation"] = state.get("uploader_generation", 0) + 1
     st.rerun()
+
+
+def _extract_email(upload: Any) -> int:
+    """Read one saved email into a submission; return the documents added.
+
+    Parsing, staging and reading are separate steps (core/eml_intake.py). A
+    fatal problem with the email as a whole adds nothing and says why; an
+    attachment that cannot be read is listed with its reason and never stops
+    its siblings.
+    """
+    state = _state()
+    status = st.empty()
+
+    def show(read: int, total: int) -> None:
+        status.caption(f"Reading attachment {read + 1} of {total} from the saved email…")
+
+    try:
+        submission, done = read_submission(
+            upload.getvalue(),
+            lambda source: run_pipeline(source, use_llm=llm_enabled()),
+            progress=show,
+        )
+    except EmlFatalError as error:
+        state["rejected"].append(f"{upload.name}: {error}")
+        return 0
+    except Exception:  # noqa: BLE001 - never crash the page, never echo parser text
+        state["rejected"].append(
+            f"{upload.name} could not be read as a saved email. Save it again from "
+            f"your mail program as .eml and retry."
+        )
+        return 0
+    # No Streamlit call until every staged file is recorded: any st call can
+    # raise a rerun, and a staged file nobody recorded is never deleted.
+    for document_id, (staged, result) in done.items():
+        twin = _already_open(result.document.file_sha256)
+        if twin is not None:
+            attachment = submission.attachment_for_document(document_id)
+            state["notices"].append(
+                f"Attachment {attachment.position if attachment else '?'} of the saved "
+                f"email is the same file as {_plain(twin.document.source_filename)}, already in "
+                f"the queue. It was read again from scratch: corrections and review "
+                f"history do not carry over between uploads."
+            )
+        state["staged"][document_id] = staged
+        _store(result)
+        state["submission_of"][document_id] = submission.submission_id
+        _record_processed(result)
+    state["submissions"][submission.submission_id] = submission
+    state["submission_order"].append(submission.submission_id)
+    status.empty()
+    counts = ", ".join(
+        f"{submission.count(outcome)} {label.lower()}"
+        for outcome, label in OUTCOME_LABELS.items() if submission.count(outcome)
+    )
+    state["notices"].append(
+        f"Read a saved email with {len(submission.attachments)} attachment(s): {counts}. "
+        f"Open the submission to see each one."
+    )
+    return len(done)
+
+
+def _submission_results(submission: Submission) -> dict[str, ExtractionResult]:
+    """The submission's documents still in this session."""
+    state = _state()
+    return {
+        document_id: state["documents"][document_id]
+        for document_id in submission.document_ids
+        if document_id in state["documents"]
+    }
 
 
 def _already_open(sha256: str) -> "ExtractionResult | None":
@@ -1002,10 +1132,16 @@ def _queue_row(document_id: str) -> None:
             help="Mark it as looked at, so you can hide it and see what is left.",
         )
         filename_style = "opacity: 0.55;" if reviewed else ""
+        # Both names come from outside -- an email's sender chooses the file
+        # name -- so they are escaped before they reach HTML.
+        submission_note = (
+            "<br><span style='color: gray; font-size: 0.8rem;'>from a saved email</span>"
+            if document_id in _state()["submission_of"] else ""
+        )
         name.markdown(
-            f"<div style='{filename_style}'>📄 <b>{document.source_filename}</b><br>"
+            f"<div style='{filename_style}'>📄 <b>{html.escape(document.source_filename)}</b><br>"
             f"<span style='color: gray; font-size: 0.85rem;'>"
-            f"{document.carrier or 'Carrier unknown'}</span></div>",
+            f"{html.escape(document.carrier or 'Carrier unknown')}</span>{submission_note}</div>",
             unsafe_allow_html=True,
         )
         status_col.markdown(_status_pill(result), unsafe_allow_html=True)
@@ -1046,6 +1182,8 @@ def _remove_from_queue(document_id: str) -> None:
         state["order"].remove(document_id)
     if state.get("open_document") == document_id:
         state["open_document"] = None
+    # The submission keeps its link: its summary then says this document was
+    # removed, rather than quietly reading as complete without it.
     for key in (f"select-{document_id}", f"reviewed-{document_id}"):
         st.session_state.pop(key, None)
 
@@ -1180,13 +1318,17 @@ def screen_workspace(document_id: str) -> None:
         return
 
     top_left, top_right = st.columns([1, 5])
-    if top_left.button("← Back to queue"):
+    submission_id = _state()["submission_of"].get(document_id)
+    if submission_id and submission_id in _state()["submissions"]:
+        if top_left.button("← Back to submission"):
+            _close()
+            _open_submission(submission_id)
+            st.rerun()
+    elif top_left.button("← Back to queue"):
         _close()
         st.rerun()
     with top_right:
-        st.markdown(
-            f"## 📄 {result.document.source_filename}"
-        )
+        st.markdown(f"## 📄 {_plain(result.document.source_filename)}")
         st.caption(
             f"{result.document.carrier or 'Carrier unknown'}"
             + (f" · {result.document.named_insured}" if result.document.named_insured else "")
@@ -1194,7 +1336,7 @@ def screen_workspace(document_id: str) -> None:
     st.divider()
 
     # Streamlit's default rerun dimming reads as a stall on a heavy table, inviting re-clicks.
-    with st.spinner(f"Opening {result.document.source_filename}…"):
+    with st.spinner(f"Opening {_plain(result.document.source_filename)}…"):
         if result.needs_mapping:
             screen_mapping(document_id, result)
             return
@@ -1214,7 +1356,7 @@ def screen_workspace(document_id: str) -> None:
 def screen_mapping(document_id: str, result: ExtractionResult) -> None:
     st.caption(
         f"LossLift could not place every column in "
-        f"{result.document.source_filename}. Tell it what each one is; it will "
+        f"{_plain(result.document.source_filename)}. Tell it what each one is; it will "
         f"remember this format for every future document from this carrier."
     )
 
@@ -1480,6 +1622,276 @@ def _period_summary(document) -> None:
     st.dataframe(rows, hide_index=True, width="stretch")
 
 
+# --------------------------------------------------------------------------
+# Submissions — a saved email and everything that arrived with it
+# --------------------------------------------------------------------------
+
+_SUBMISSION_PILL = {
+    "ready": "ll-pill-clean", "needs_review": "ll-pill-review", "incomplete": "ll-pill-review",
+}
+
+
+def _open_submission(submission_id: str) -> None:
+    state = _state()
+    state["open_submission"] = submission_id
+    state["open_document"] = None
+
+
+def _submissions_panel() -> None:
+    """Each saved email, with its status and a way into it."""
+    state = _state()
+    if not state["submission_order"]:
+        return
+    st.markdown("#### Submissions from saved emails")
+    for submission_id in state["submission_order"]:
+        submission = state["submissions"].get(submission_id)
+        if submission is None:
+            continue
+        summary = summarise_submission(submission, _submission_results(submission))
+        left, middle, right = st.columns([3, 3, 1])
+        left.markdown(
+            f"<span class='ll-pill {_SUBMISSION_PILL[summary.status]}'>"
+            f"{html.escape(status_label(summary))}</span>",
+            unsafe_allow_html=True,
+        )
+        left.caption(f"Submission {submission.submission_id}")
+        middle.write(
+            f"{len(submission.attachments)} attachment(s) · {len(summary.documents)} read · "
+            f"{len(summary.blockers)} outstanding"
+        )
+        if right.button("Open", key=f"open-sub-{submission_id}"):
+            _open_submission(submission_id)
+            st.rerun(scope="app")
+    st.divider()
+
+
+def _inventory_frame(submission: Submission) -> pd.DataFrame:
+    """The attachment inventory. A dataframe: email-derived text is never markdown."""
+    return pd.DataFrame([
+        {
+            "#": a.position,
+            "File name": a.display_filename,
+            "Declared type": a.declared_mime,
+            "Size (KB)": round(a.size_bytes / 1024, 1),
+            "Outcome": OUTCOME_LABELS[a.outcome] + (" · set aside" if a.set_aside else ""),
+            "Reading": PROCESSING_LABELS[a.processing],
+            "Why": a.reason or a.processing_reason,
+            "SHA-256": (a.sha256 or "")[:16],
+            "Attachment ID": a.attachment_id,
+        }
+        for a in submission.attachments
+    ])
+
+
+def _show_evidence(document_id: str, claim_number: str, page: int | None,
+                   row: int | None) -> None:
+    """Open a document at the page and row a summarised claim was read from."""
+    state = _state()
+    state["open_document"] = document_id
+    st.session_state[f"stage-{document_id}"] = REVIEW
+    result = state["documents"].get(document_id)
+    if result is None:
+        return
+    claim = next((c for c in result.document.claims
+                  if c.claim_number == claim_number
+                  and (c.source_page, c.source_row) == (page, row)), None)
+    if claim is None:
+        return
+    st.session_state[f"evidence-pick-{document_id}"] = f"Claim {claim.claim_number}"
+    if "incurred_total" in claim.raw_cells:
+        st.session_state[f"evidence-field-{document_id}"] = "incurred_total"
+    st.session_state[f"show-evidence-{document_id}"] = True
+
+
+def _source_label(submission: Submission, source: Any) -> str:
+    """"Attachment 2 · run-1": LossLift's own words and ids, never email text."""
+    attachment = submission.attachment(source.attachment_id) if source.attachment_id else None
+    label = f"Attachment {attachment.position}" if attachment else "Document"
+    return label + (f" · {source.run_id}" if source.run_id else "")
+
+
+def _all_claims(submission: Submission, account: Any, key: str) -> None:
+    """Every claim the account counts, where it was read, and a way to its page."""
+    lines = account.claim_lines
+    if not lines:
+        return
+    with st.expander(f"All {len(lines)} claim(s), with where each was read"):
+        st.dataframe(pd.DataFrame([
+            {
+                "Claim number": line.claim_number,
+                "Date of loss": line.date_of_loss,
+                "Status": line.claim_status or "",
+                "Incurred": _money(line.incurred_total),
+                "Valued at": line.valued_at,
+                "Valuations": line.valuations,
+                "Read from": _source_label(submission, line.provenance),
+                "Page": line.provenance.page,
+                "Review": line.note,
+            }
+            for line in lines
+        ]), hide_index=True, width="stretch")
+        left, right = st.columns([3, 1])
+        index = left.selectbox(
+            "Claim", range(len(lines)), key=f"{key}-pick",
+            format_func=lambda i: f"{lines[i].claim_number} · page {lines[i].provenance.page}",
+            label_visibility="collapsed",
+        )
+        if right.button("Evidence", key=f"{key}-evidence"):
+            chosen = lines[index].provenance
+            _show_evidence(chosen.document_id, lines[index].claim_number,
+                           chosen.page, chosen.row)
+            st.rerun()
+
+
+def screen_submission(submission_id: str) -> None:
+    state = _state()
+    submission = state["submissions"].get(submission_id)
+    if submission is None:
+        st.warning("This submission is no longer in the session.")
+        state["open_submission"] = None
+        st.rerun()
+        return
+    results = _submission_results(submission)
+    summary = summarise_submission(submission, results)
+
+    if st.button("← Back to queue", key="submission-back"):
+        state["open_submission"] = None
+        st.rerun()
+    st.markdown("## 📨 Submission")
+    st.caption(f"Submission {submission.submission_id} · uploaded "
+               f"{submission.uploaded_at:%Y-%m-%d %H:%M} UTC")
+    css = "ll-status-pass" if summary.status == "ready" else "ll-status-fail"
+    st.markdown(
+        f"<div class='ll-status {css}'><b>{html.escape(status_label(summary))}</b></div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Email details (kept in this session only)"):
+        st.text(f"From:    {submission.sender or 'not stated'}\n"
+                f"Subject: {submission.subject or 'not stated'}\n"
+                f"Date:    {submission.email_date or 'not stated'}")
+        st.caption("The email body is never read into LossLift, and the raw message is "
+                   "not kept. Nothing linked or embedded in it is opened.")
+
+    cols = st.columns(5)
+    cols[0].metric("Attachments", len(submission.attachments))
+    cols[1].metric("Read", len(summary.documents))
+    cols[2].metric("Rejected or failed",
+                   submission.count(IntakeOutcome.REJECTED) + submission.count(IntakeOutcome.FAILED))
+    cols[3].metric("Duplicates", submission.count(IntakeOutcome.DUPLICATE))
+    cols[4].metric("Outstanding", len(summary.blockers))
+
+    st.markdown("### What arrived")
+    st.dataframe(_inventory_frame(submission), hide_index=True, width="stretch")
+    settable = [a for a in submission.attachments
+                if a.outcome in (IntakeOutcome.REJECTED, IntakeOutcome.FAILED)]
+    if settable:
+        st.caption("A rejected attachment keeps the submission open until you confirm it "
+                   "is not a loss run this submission needs.")
+        for attachment in settable:
+            aside = st.checkbox(
+                f"Attachment {attachment.position} is not needed",
+                value=attachment.set_aside,
+                key=f"aside-{attachment.attachment_id}",
+                help="Recorded beside the rejection, never in place of it.",
+            )
+            if aside != attachment.set_aside:
+                submission.set_attachment_aside(attachment.attachment_id, aside)
+                st.rerun()
+
+    st.markdown("### Outstanding")
+    if summary.blockers:
+        for blocker in summary.blockers:
+            st.text(f"• {blocker}")
+    else:
+        st.success("Nothing outstanding.")
+
+    st.markdown("### Documents")
+    if not summary.documents:
+        st.info("No loss run was read from this email.")
+    for line in summary.documents:
+        result = results[line.document_id]
+        attachment = submission.attachment(line.attachment_id)
+        left, middle, right = st.columns([3, 3, 1])
+        left.text(f"Attachment {attachment.position}: {attachment.display_filename}")
+        left.markdown(_status_pill(result), unsafe_allow_html=True)
+        runs = f"{len(line.runs)} logical runs · " if line.runs else ""
+        middle.write(f"{runs}{line.claims} claim(s) · {line.blocking_findings} open issue(s)")
+        if right.button("Open", key=f"sub-open-{line.document_id}"):
+            state["open_document"] = line.document_id
+            st.rerun()
+
+    st.markdown("### Loss summary")
+    st.caption("Merged across the documents above. Claims repeated at several valuations "
+               "count once, at their latest value; duplicate attachments are read once.")
+    st.text(f"Named insured: {summary.named_insured or summary.named_insured_note}")
+    for account in summary.accounts:
+        with st.container(border=True):
+            st.text(account.name)
+            metrics = st.columns(4)
+            metrics[0].metric("Claims", account.claims)
+            metrics[1].metric("Open", account.open_claims)
+            metrics[2].metric(
+                "Total incurred",
+                f"{account.incurred_total:,.2f}" if account.incurred_total is not None else "—",
+            )
+            metrics[3].metric("Status", "Reconciled" if account.status is DocumentStatus.CLEAN
+                              else "Needs review")
+            if account.incurred_unavailable:
+                st.caption(f"Total incurred {account.incurred_unavailable}.")
+            elif account.status is not DocumentStatus.CLEAN:
+                st.caption("These figures come from documents that still need review; "
+                           "check them before relying on the total.")
+            st.text(
+                "Valuation dates: "
+                + (", ".join(d.isoformat() for d in account.valuation_dates) or "not stated")
+                + "\nPolicy terms: " + ("; ".join(account.policy_periods) or "not stated")
+            )
+            for note in account.period_notes:
+                st.caption(_plain(note))
+            st.caption("Read from: " + "; ".join(
+                _source_label(submission, source) for source in account.sources))
+            if account.large_claims:
+                st.markdown(f"**Large claims** (incurred of "
+                            f"{export_module.LARGE_LOSS_THRESHOLD:,.0f} or more)")
+                for index, claim in enumerate(account.large_claims):
+                    row = st.columns([2, 2, 3, 1])
+                    row[0].text(claim.claim_number)
+                    row[1].text(f"{claim.incurred_total:,.2f}")
+                    where = submission.attachment(claim.provenance.attachment_id)
+                    row[2].caption(
+                        f"Attachment {where.position if where else '?'}"
+                        + (f" · {claim.provenance.run_id}" if claim.provenance.run_id else "")
+                        + f" · page {claim.provenance.page}"
+                        + ("" if claim.trusted else " · needs review")
+                    )
+                    if row[3].button("Evidence",
+                                     key=f"ev-{submission_id}-{account.name}-{index}"):
+                        _show_evidence(claim.provenance.document_id, claim.claim_number,
+                                       claim.provenance.page, claim.provenance.row)
+                        st.rerun()
+            _all_claims(submission, account, key=f"all-{submission_id}-{account.name}")
+
+    st.markdown("### Export")
+    if state.get("staged_error"):
+        st.warning(state.pop("staged_error"))
+    redact = st.toggle("Redact identifying data", value=True, key=f"sub-redact-{submission_id}",
+                       help="Withholds the sender, subject, file names, insured, policy "
+                            "numbers and claimant data. Ids and file hashes stay.")
+    st.download_button(
+        "Download submission summary (.xlsx)",
+        data=submission_to_bytes(submission, summary, results, redact=redact),
+        file_name=submission_filename(submission),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"sub-download-{submission_id}",
+        on_click=_download_submission,
+        args=(list(results),),
+    )
+    st.caption("Downloading deletes the uploaded PDFs behind this summary, as a document "
+               "export does; the extracted tables stay in this session. Evidence pages "
+               "are drawn from those files, so check them before you download. A document "
+               "still waiting for its columns keeps its file.")
+
+
 def _accounts_panel() -> None:
     """Loss runs for one insured, merged into the history a submission asks for.
 
@@ -1511,14 +1923,14 @@ def _accounts_panel() -> None:
     for account in accounts:
         clean = account.status is DocumentStatus.CLEAN
         with st.expander(
-            f"{'✓' if clean else '⚠'} {account.name} — {len(account.sources)} loss runs, "
+            f"{'✓' if clean else '⚠'} {_plain(account.name)} — {len(account.sources)} loss runs, "
             f"{len(account.histories)} claims"
             + ("" if clean else " — needs review")
         ):
             if not clean:
                 st.warning(
                     "This merged history is not reconciled. "
-                    + "; ".join(account.reasons()[:6])
+                    + "; ".join(_plain(reason) for reason in account.reasons()[:6])
                     + ". Claims from those runs are included and marked; resolve "
                     "them before relying on the totals."
                 )
@@ -1526,7 +1938,7 @@ def _accounts_panel() -> None:
                 "Valued at "
                 + ", ".join(d.isoformat() for d in account.valuation_dates)
                 + " · " + ", ".join(
-                    s.source_filename + (f" ({s.run_id})" if s.run_id else "")
+                    _plain(s.source_filename) + (f" ({s.run_id})" if s.run_id else "")
                     for s in account.sources
                 )
             )
@@ -1621,7 +2033,10 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     with st.expander("Review findings", expanded=bool(result.reconciliation.findings)):
         _review_workspace(result, document_id)
 
-    with st.expander("Source evidence", expanded=False):
+    # Opened from a submission's Evidence button, the panel starts open on
+    # the claim it was asked about.
+    with st.expander("Source evidence",
+                     expanded=bool(st.session_state.pop(f"show-evidence-{document_id}", False))):
         _evidence_panel(result, document_id)
 
     st.markdown("**Claims**")
@@ -1836,9 +2251,10 @@ def main() -> None:
                 f"{statuses.count('needs_review')} need review · "
                 f"{statuses.count('clean')} reconciled"
             )
-        if state["open_document"]:
+        if state["open_document"] or state["open_submission"]:
             if st.button("← Back to queue", width="stretch"):
                 _close()
+                state["open_submission"] = None
                 st.rerun()
         st.divider()
         st.caption(
@@ -1851,6 +2267,8 @@ def main() -> None:
 
     if state["open_document"]:
         screen_workspace(state["open_document"])
+    elif state["open_submission"]:
+        screen_submission(state["open_submission"])
     else:
         screen_queue()
 
