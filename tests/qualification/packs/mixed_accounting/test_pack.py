@@ -90,8 +90,7 @@ def test_one_claim_number_printed_by_two_carriers_is_two_occurrences(cases):
 
 def test_review_cases_are_declared_consistently(cases):
     review = {c.case_id for c in cases if c.expectation is Expectation.REVIEW}
-    assert review == {"missing-replay", "same-number-two-carriers", "section-counts-only",
-                      "printed-count-mismatch"}
+    assert review == {"missing-replay", "section-counts-only", "printed-count-mismatch"}
     for case in cases:
         assert (case.truth.status == "NEEDS_REVIEW") == (case.case_id in review)
 

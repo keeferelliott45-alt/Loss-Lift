@@ -1842,6 +1842,7 @@ def page_evidence(
         if normal in seen:
             seen.remove(normal)
     policy = BAND_POLICY.search(heading) if not sideways else None
+    insured = BAND_INSURED.search(heading) if not sideways else None
     return PageEvidence(
         page=number,
         method=SourceMethod.DIGITAL,
@@ -1850,7 +1851,21 @@ def page_evidence(
         heading=heading_of(heading),
         ignored=tuple(seen),
         policy=policy.group(1) if policy else None,
+        insured=" ".join(insured.group(1).split()) if insured else None,
     )
+
+
+#: The insured a page's header band names: "Named Insured: Ridgeway Freight
+#: LLC", "Insured: ...", "Insured Name: ...", "Customer: ...", "Account Name:
+#: ...". The value runs to the next labelled fact on the band ("Policy
+#: Number:", "Valuation Date:") or its end.
+BAND_INSURED = re.compile(
+    r"\b(?:named\s+insured|insured\s+name|insured|customer|account\s+name)\s*:\s*"
+    r"(.+?)(?=\s+(?:policy|valuation|named|insured|account|customer|report|run|"
+    r"print(?:ed)?|date|period|effective|location|carrier|agent|producer|status|"
+    r"prepared|finance|filters?|level)\b[^:]{0,25}:|$)",
+    re.IGNORECASE,
+)
 
 
 #: A policy number labelled as one in a page's header band: "Policy Number:
