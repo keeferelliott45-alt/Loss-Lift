@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 import json
 import re
-from typing import Annotated, Any, Iterable
+from typing import Annotated, Any, Iterable, Sequence
 from uuid import uuid4
 
 from pydantic import (
@@ -603,6 +603,19 @@ class LogicalRun(BaseModel):
             if page is not None:
                 start = previous = page
         return ", ".join(spans)
+
+
+def split_is_settled(runs: Sequence[LogicalRun]) -> bool:
+    """Whether every boundary of a packet is printed and unambiguous.
+
+    Only then is it known which run a printed count or total belongs to. A
+    boundary resting on a reading (OCR, the vision model) or on nothing, or
+    one the planner could not settle, leaves the carrier's printed figures
+    with the whole document they were read from.
+    """
+    return bool(runs) and all(
+        run.confidence is RunConfidence.PRINTED and not run.ambiguous for run in runs
+    )
 
 
 class RefusedClaimRow(BaseModel):

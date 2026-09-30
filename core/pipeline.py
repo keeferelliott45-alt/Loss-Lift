@@ -91,6 +91,7 @@ from core.schema import (
     UnplacedRow,
     Resolution,
     SourceMethod,
+    split_is_settled,
 )
 from core.runs import OCR, plan_packet, vision_evidence, vote_plan
 
@@ -2392,12 +2393,22 @@ def _run_pipeline(
     # choosing one run's total for the whole packet checks every other run's
     # claims against a figure that never covered them. Each run's total is
     # read from its own pages, against its own claims.
-    run_tables: dict[str, list[RawTable]] = {}
+    #
+    # Only across a settled split, though. Where any boundary rests on a
+    # reading (OCR, the vision model) or on nothing at all, which run a printed
+    # count or total belongs to is exactly what is not known: attributed to a
+    # run holding none of the claims it counted, a figure that tied the whole
+    # document reports a discrepancy nobody made, and the carrier's own check
+    # is lost. An unsettled packet keeps its runs -- R-28 names the boundaries
+    # -- and its printed evidence is read, and checked, for the whole document.
+    per_run_evidence = split_is_settled(runs)
+    run_tables: dict[str, list[RawTable]] = {
+        run.run_id: [table for table in tables if run.holds(table.page)] for run in runs
+    }
     run_totals: dict[str, tuple[dict, tuple[int, int] | None, dict[str, str]]] = {}
-    if runs:
+    if per_run_evidence:
         printed_totals, document_total_row, unreadable_totals = {}, None, {}
         for run in runs:
-            run_tables[run.run_id] = [table for table in tables if run.holds(table.page)]
             run_totals[run.run_id] = _document_total(
                 run_tables[run.run_id], mapping, locale,
                 sum(1 for claim in claims if run.holds(claim.source_page)),
@@ -2422,7 +2433,7 @@ def _run_pipeline(
             confident=True,
             evidence="carrier profile",
         )
-    if runs:
+    if per_run_evidence:
         printed_sections = [
             section
             for run in runs
@@ -2511,17 +2522,18 @@ def _run_pipeline(
         letterhead_carrier = None
 
     for run in runs:
-        totals, total_row, unreadable = run_totals[run.run_id]
         texts = {page: text for page, text in extraction.page_texts.items() if run.holds(page)}
-        counted = [entry for entry in vision_counts if run.holds(entry["page"])]
-        run.printed_totals = totals
-        run.unreadable_totals = unreadable
-        run.unreadable_totals_page = total_row[0] if total_row else None
-        run.unreadable_totals_row = total_row[1] if total_row else None
-        run.printed_claim_count = document_claim_count(
-            texts, [entry["count"] for entry in counted]
-        )
-        run.printed_count_evidence = counted_claim_evidence(texts) + counted
+        if per_run_evidence:
+            totals, total_row, unreadable = run_totals[run.run_id]
+            counted = [entry for entry in vision_counts if run.holds(entry["page"])]
+            run.printed_totals = totals
+            run.unreadable_totals = unreadable
+            run.unreadable_totals_page = total_row[0] if total_row else None
+            run.unreadable_totals_row = total_row[1] if total_row else None
+            run.printed_claim_count = document_claim_count(
+                texts, [entry["count"] for entry in counted]
+            )
+            run.printed_count_evidence = counted_claim_evidence(texts) + counted
         # What the run's own pages say about it -- its first claims page's
         # letterhead, a valuation date or policy term printed on any of its
         # pages -- and nothing another run printed.
@@ -2593,8 +2605,8 @@ def _run_pipeline(
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,
-        # A packet's count is each run's own; see ``runs``.
-        printed_claim_count=None if runs else metadata.printed_claim_count,
+        # A settled packet's count is each run's own; see ``runs``.
+        printed_claim_count=None if per_run_evidence else metadata.printed_claim_count,
         unreadable_totals=unreadable_totals,
         unreadable_totals_page=(
             document_total_row[0] if document_total_row else None
