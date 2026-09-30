@@ -2334,12 +2334,40 @@ def _run_pipeline(
     runs = plan.runs
     groups, borrowed = vote_plan(runs)
 
+    # Where the planner has established that pages are one report, the text
+    # layer and the scan are two readings of it, and a claim-number vote taken
+    # by each reader alone lets a scanned page's rows vote on themselves: a
+    # dated cause code under a claim, a shape nothing else shares, becomes a
+    # claim. Established means a settled run of a packet, or a single report
+    # every one of whose claim pages prints its own numbering, none of them
+    # joined blind and none missing. Nothing is pooled across reports, or
+    # where a boundary is unsure.
+    both_readers = [*digital_tables, *vision_tables] if digital_tables and vision_tables else None
+    single_report_established = bool(
+        both_readers
+        and groups is None
+        and not runs
+        and plan.bounded
+        and not plan.blind
+        and plan.incomplete is None
+        and all(page_evidence.get(page) is not None and page_evidence[page].paginations
+                for page in claim_table_pages)
+    )
+    pooled_single = (identifier_shapes_by_run(both_readers, mapping)
+                     if single_report_established else None)
+    pooled_runs = (identifier_shapes_by_run(both_readers, mapping, groups)
+                   if both_readers and groups is not None else {})
+
     def shapes_for(reader_tables: list[RawTable]) -> dict[int, set[str]] | None:
-        """Each run's claim-number vote over one reader's tables. An unsettled
-        run reads under the vote of the settled run before it."""
+        """Each run's claim-number vote for one reader's tables. A settled run
+        votes over both readers' tables; an unsettled run reads under the vote
+        of the settled run before it."""
         if groups is None:
-            return None
+            return pooled_single
         shapes = identifier_shapes_by_run(reader_tables, mapping, groups)
+        for index, run in enumerate(runs):
+            if not run.ambiguous and index in shapes and index in pooled_runs:
+                shapes[index] = pooled_runs[index]
         for index, source in borrowed.items():
             if source in shapes:
                 shapes[index] = shapes[source]
