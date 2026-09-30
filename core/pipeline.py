@@ -2152,10 +2152,20 @@ def _run_pipeline(
                     unread_image_pages.add(number)
                     if set(left) & set(record.fragment_boxes):
                         partly_recognised.add(number)
-    processed_pages = set(extraction.page_texts) - unread_image_pages
+    # Text in a font that cannot be decoded was withheld from the reading.
+    # It may be a print date or a claim row; nothing can say which, so the
+    # page is not called read.
+    undecodable_pages = set(extraction.undecodable_pages) & set(extraction.page_texts)
+    processed_pages = set(extraction.page_texts) - unread_image_pages - undecodable_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
-    unresolved_pages: set[int] = set(unread_image_pages)
+    unresolved_pages: set[int] = set(unread_image_pages) | undecodable_pages
+    if undecodable_pages:
+        joined = ", ".join(str(page) for page in sorted(undecodable_pages))
+        warnings.append(
+            f"Page(s) {joined} print text in a font whose characters cannot be "
+            f"decoded. That text was not read; whether it holds claims is unknown."
+        )
     unrecognised = sorted(unread_image_pages - partly_recognised)
     if unrecognised:
         joined = ", ".join(str(page) for page in unrecognised)
@@ -2651,6 +2661,10 @@ def _run_pipeline(
                 "picture holds"
             )
             for page in sorted(unread_image_pages)
+        } | {
+            page: "some of its text is printed in a font whose characters "
+            "cannot be decoded, so what that text says is unknown"
+            for page in sorted(undecodable_pages - unread_image_pages)
         },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
