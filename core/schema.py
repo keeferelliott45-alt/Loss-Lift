@@ -225,7 +225,11 @@ class Claim(BaseModel):
     medical_only_flag: bool | None = None
 
     # Provenance — spec section 2, principle 2.
-    source_page: int = 1
+    #: The page a claim was read from. ``None`` for a claim a person added on
+    #: the review screen without giving it a page: in a packet the page is what
+    #: ties a claim to its loss run, so such a claim belongs to no run and is
+    #: named by R-11 until the reviewer places it.
+    source_page: int | None = 1
     source_method: SourceMethod = SourceMethod.DIGITAL
     source_row: int | None = None
     source_bbox: tuple[float, float, float, float] | None = None

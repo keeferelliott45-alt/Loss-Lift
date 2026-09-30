@@ -883,6 +883,30 @@ def test_a_claim_added_by_hand_joins_the_run_of_its_page(tmp_path):
     assert apply_edits(document, moved).claims[0].source_page == 1
 
 
+def test_a_claim_added_with_no_page_belongs_to_no_run_and_is_named(tmp_path):
+    """A row a reviewer adds to a packet without saying which run it belongs to
+    must not default into run-1. It belongs to no run, R-11 names it, and the
+    packet needs review even though every run's own arithmetic still ties."""
+    from core.pipeline import edit_claims, to_records
+
+    result, _large, _small = _two_carrier_packet(tmp_path)
+    document = result.document
+    columns = ["claim_number", "date_of_loss", "claim_status", "paid_total",
+               "reserve_total", "incurred_total"]
+    records = to_records(document, columns)
+    records.append({"claim_number": "CR-40999", "date_of_loss": "2022-05-05",
+                    "claim_status": "OPEN", "paid_total": "", "reserve_total": "",
+                    "incurred_total": ""})
+    edited = edit_claims(result, records)
+    added = next(c for c in edited.document.claims if c.claim_number == "CR-40999")
+    assert added.source_page is None
+    for run in edited.document.runs:
+        assert added not in edited.document.run_claims(run)
+    assert edited.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert any(f.rule_id == "R-11" and "CR-40999" in f.message
+               for f in edited.reconciliation.findings)
+
+
 def test_each_row_carries_its_runs_valuation_date(tmp_path):
     large, small = _large_run(4), list(SMALL_RUN)
     document = pymupdf.open()
