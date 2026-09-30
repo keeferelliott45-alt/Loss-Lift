@@ -1934,18 +1934,19 @@ def extract_pdf(
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
         for index, page in enumerate(pdf.pages, start=1):
+            # Glyphs set in a font with no map to characters extract as
+            # "(cid:N)" placeholders. What they print is unknown, so no cell,
+            # claim, carrier or total may be made of them: they are withheld
+            # from every reading of the page, and the page is reported.
+            if any(UNDECODABLE_GLYPH.fullmatch(char.get("text", ""))
+                   for char in getattr(page, "chars", ())):
+                undecodable_pages.append(index)
+                page = page.filter(_decodable)
             # Read for every page, not only the ones ``pages`` selects for
             # table extraction: a scanned page between two digital ones has
             # to read as "no letter band here" for the pairing below to
             # correctly refuse to join across it, and it only reads that way
             # if it was looked at.
-            # Glyphs set in a font with no map to characters extract as
-            # "(cid:N)" placeholders. What they print is unknown, so no cell,
-            # claim, carrier or total may be made of them: they are withheld
-            # from every reading of the page, and the page is reported.
-            if any(UNDECODABLE_GLYPH.fullmatch(char.get("text", "")) for char in page.chars):
-                undecodable_pages.append(index)
-                page = page.filter(_decodable)
             words = page_words(page)
             signatures.append(page_signature(index, words))
             if pages is not None and index not in pages:
