@@ -347,6 +347,7 @@ def summarise_submission(
     something: one insured, one currency, certain claim identity.
     """
     blockers: list[str] = []
+    removed_documents = False
     if not submission.inventory_complete:
         blockers.append("The email could not be read completely, so some attachments "
                         "may not be listed.")
@@ -365,6 +366,12 @@ def summarise_submission(
             blockers.append(
                 f"Attachment {attachment.position} ({attachment.display_filename}) was "
                 f"not read: {attachment.processing_reason or 'processing has not finished.'}"
+            )
+        elif attachment.document_id and attachment.document_id not in results:
+            removed_documents = True
+            blockers.append(
+                f"Attachment {attachment.position} ({attachment.display_filename}) was "
+                f"read, but its document has since been removed from this session."
             )
 
     processed = [
@@ -490,7 +497,7 @@ def summarise_submission(
         and bool(documents)
         and not separate
     )
-    if not submission.intake_complete:
+    if not submission.intake_complete or removed_documents:
         status = "incomplete"
     elif trusted:
         status = "ready"

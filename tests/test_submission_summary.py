@@ -192,3 +192,11 @@ def test_an_email_with_no_loss_run_says_so(read):
     summary = summarise_submission(submission, results)
     assert summary.status == "incomplete"
     assert summary.named_insured is None
+
+
+def test_a_document_removed_from_the_session_reopens_the_submission(read):
+    submission, results = read([("a.pdf", "application/pdf", PDF_2022)])
+    assert summarise_submission(submission, results).status == "ready"
+    summary = summarise_submission(submission, {})
+    assert summary.status == "incomplete"
+    assert any("removed from this session" in b for b in summary.blockers)
