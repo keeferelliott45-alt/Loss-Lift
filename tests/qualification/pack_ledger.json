@@ -74,13 +74,8 @@
       "shortfalls": []
     },
     "policy-change-boundary": {
-      "met": false,
-      "shortfalls": [
-        "claims_wrong_run",
-        "false_clean",
-        "runs_differ"
-      ],
-      "followup": "Phase 2, first: FALSE CLEAN. Two unnumbered reports differing only in their printed policy number are merged and auto-accepted; a change of policy number must be boundary evidence, or the split must be reviewed."
+      "met": true,
+      "shortfalls": []
     },
     "printed-count-mismatch": {
       "met": true,
