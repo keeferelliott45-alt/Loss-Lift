@@ -72,6 +72,12 @@ Catastrophic blind spots found:
    is not adopted), and nothing real-corpus protects the scanned path.
 4. `detect_carrier` can take a column-label line as a carrier; account
    identity then treats a repeated claim as two claims without flagging it.
+5. ~~A single report whose own numbering stopped short (e.g. `Page 1 of 3`
+   with pages 2-3 absent) carried no run, so nothing recorded that it was
+   incomplete and it read CLEAN with part of its table missing.~~ Closed on
+   this branch: `LossRunDocument.incomplete_report` from the run planner and
+   R-28 (ERROR) name the missing pages (synthetic regression in
+   `test_packet_runs.py`).
 
 ## Known architectural gaps
 
@@ -79,6 +85,12 @@ Catastrophic blind spots found:
   are per document; per run they are only *checked* (borrowed-convention R-15).
 - Packet document header, Source Info and Loss Summary show page 1's facts.
 - Refused rows on a bounded single report are recorded but named by no rule.
+- A claim-like row whose identifier cell carries a worded label before a colon
+  (e.g. `Claim No: ...`) is taken for printed furniture by
+  `pipeline.is_structural_row` and dropped before it is parsed, so it is
+  neither a claim nor in `rows_seen_per_page`; with no printed total to
+  disagree with, the document can read CLEAN. Found by this campaign's
+  synthetic probe; not fixed on this branch (see the handoff).
 - R-19 (row-count gap) is categorised underwriting (spec WARN) but blocks
   trust through `UNACCOUNTED_RULES`.
 

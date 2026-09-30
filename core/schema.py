@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 import json
 import re
-from typing import Annotated, Any, Iterable
+from typing import Annotated, Any, Iterable, Sequence
 from uuid import uuid4
 
 from pydantic import (
@@ -609,6 +609,19 @@ class LogicalRun(BaseModel):
         return ", ".join(spans)
 
 
+def split_is_settled(runs: Sequence[LogicalRun]) -> bool:
+    """Whether every boundary of a packet is printed and unambiguous.
+
+    Only then is it known which run a printed count or total belongs to. A
+    boundary resting on a reading (OCR, the vision model) or on nothing, or
+    one the planner could not settle, leaves the carrier's printed figures
+    with the whole document they were read from.
+    """
+    return bool(runs) and all(
+        run.confidence is RunConfidence.PRINTED and not run.ambiguous for run in runs
+    )
+
+
 class RefusedClaimRow(BaseModel):
     """A row that reads as a claim but whose claim number the vote refused.
 
@@ -687,6 +700,11 @@ class LossRunDocument(BaseModel):
     #: a single loss run, which is the whole document. Each run is reconciled
     #: on its own against what it printed; see :class:`LogicalRun`.
     runs: list[LogicalRun] = Field(default_factory=list)
+    #: A lone report whose own numbering stops before its declared last page:
+    #: pages it holds are absent from the PDF. None for a packet, whose
+    #: incompleteness lives on the run, and for a report that prints no
+    #: numbering or printed its own last page. R-28 reads it.
+    incomplete_report: str | None = None
     #: Rows that read as claims but whose claim number was refused. Recorded,
     #: never silently absorbed; see :class:`RefusedClaimRow`.
     refused_claim_rows: list[RefusedClaimRow] = Field(default_factory=list)

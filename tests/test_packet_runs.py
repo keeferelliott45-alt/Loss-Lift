@@ -23,6 +23,7 @@ from openpyxl import load_workbook
 
 from core.export import build_workbook, resolve_columns, _DOCUMENT_COLUMNS
 from core.pipeline import build_claims, build_mapping, rerun_reconciliation, run_pipeline
+from core.review import canonical_status
 from core.runs import (
     PageEvidence,
     identity_of,
@@ -463,6 +464,30 @@ def test_a_single_report_has_no_runs_and_no_run_columns(tmp_path):
     assert "Run ID" not in headers
     assert len(headers) == len(resolve_columns("Underwriting standard")) + len(_DOCUMENT_COLUMNS)
     assert runs_overview(document, result.reconciliation) == []
+
+
+def test_a_lone_report_that_stops_before_its_last_page_is_not_clean(tmp_path):
+    """A single report whose own numbering declares pages the PDF lacks.
+
+    One report is not a packet and carries no run, so before this nothing held
+    the fact that its numbering stopped short: the document read CLEAN with
+    part of its table absent. The pages it says it has and the PDF does not are
+    a claim-accountability hole, named by R-28.
+    """
+    large = _large_run(6)
+    result = _read_ex(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, large, {"marker": "Page 1 of 2"}),
+    ])
+    document = result.document
+    assert not document.is_packet
+    assert document.runs == []
+    assert document.incomplete_report
+    assert "page 1 of 2" in document.incomplete_report
+    assert result.reconciliation.run_status == {}
+    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    r28 = [f for f in result.reconciliation.findings if f.rule_id == "R-28"]
+    assert len(r28) == 1 and r28[0].run_id is None
+    assert canonical_status(result.reconciliation) is DocumentStatus.NEEDS_REVIEW
 
 
 def test_a_cover_page_before_a_report_does_not_make_a_packet(tmp_path):

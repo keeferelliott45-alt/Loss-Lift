@@ -709,6 +709,11 @@ class Plan:
     bounded: bool
     #: Pages joined to a run with nothing confirming they belong to it.
     blind: set[int]
+    #: A single report whose own numbering stops before its declared last page:
+    #: pages it holds are absent from the PDF. None when the document binds
+    #: several runs (each run carries its own incompleteness) or when nothing
+    #: printed says the lone report is short.
+    incomplete: str | None = None
 
 
 def plan_packet(
@@ -719,10 +724,25 @@ def plan_packet(
 ) -> Plan:
     table_pages = set(table_pages)
     segments = plan_runs(pages, evidence, table_pages)
+    runs = _as_runs(segments, table_pages, methods)
+    # A single report carries no run, so nothing above can hold the fact that
+    # its own numbering stops short. Read it here instead: a page printing
+    # "Page 1 of 3" in a one-report PDF says two pages of it are missing, and
+    # the document must not read clean with part of its table absent.
+    incomplete = None
+    if not runs and len(segments) == 1:
+        sole = segments[0]
+        if sole.numbered and not sole.exhausted and sole.track is not None:
+            index, count = sole.track
+            incomplete = (
+                f"the report stops at page {index} of {count}: its remaining "
+                f"page(s) are not in this PDF"
+            )
     return Plan(
-        runs=_as_runs(segments, table_pages, methods),
+        runs=runs,
         bounded=any(item.paginations for item in evidence.values()),
         blind={page for segment in segments for page in segment.blind},
+        incomplete=incomplete,
     )
 
 
