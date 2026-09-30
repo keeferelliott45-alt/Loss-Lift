@@ -62,6 +62,7 @@ from core.records import (
     consensus_shapes,
     is_identifier_candidate,
     leading_identifier,
+    strip_identifier_label,
 )
 from core.reconcile import ReconcileConfig, reconcile
 from core.review import (
@@ -1020,7 +1021,7 @@ def accepted_identifier_shapes(
         if index is None:
             continue
         for row in table.rows:
-            cell = row.cell(index).strip()
+            cell = strip_identifier_label(row.cell(index))
             if cell and is_identifier_candidate(cell):
                 candidates.append(cell)
     return consensus_shapes(candidates)
@@ -1069,7 +1070,7 @@ def identifier_shapes_by_run(
         if index is None:
             continue
         for row in table.rows:
-            cell = row.cell(index).strip()
+            cell = strip_identifier_label(row.cell(index))
             if not cell or not is_identifier_candidate(cell):
                 continue
             printed[run].append(cell)
@@ -1129,11 +1130,21 @@ def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
     how much of the value follows the colon depends on where the column
     boundary happens to fall. A claim number contains no colon at all, so a
     worded label ahead of one marks the row as printed furniture.
+
+    Except where the label names the claim number itself. "Claim No: WC-1004"
+    is a claim some carriers print with its label in the cell, and dropping it
+    here removed it from the claims and from the per-page row count alike, so
+    nothing disagreed and the document could read clean with a claim missing.
+    Such a row goes on to be judged as a claim like any other; whether it
+    becomes one is still the identifier vote's decision.
     """
     index = mapping.index_of("claim_number")
     if index is None:
         return False
-    label, separator, _ = row.cell(index).strip().partition(":")
+    cell = row.cell(index).strip()
+    if strip_identifier_label(cell) != cell:
+        return False
+    label, separator, _ = cell.partition(":")
     return bool(separator) and bool(label) and label.replace(" ", "").isalpha()
 
 
@@ -1315,7 +1326,7 @@ def _note_refusal(
     index = mapping.index_of("claim_number")
     if index is None:
         return False
-    cell = row.cell(index).strip()
+    cell = strip_identifier_label(row.cell(index))
     if not cell or not is_identifier_candidate(cell):
         return False
     values = _row_values(row, mapping)
