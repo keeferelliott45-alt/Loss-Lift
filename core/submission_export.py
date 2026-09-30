@@ -27,7 +27,6 @@ from typing import Any, Mapping
 
 from openpyxl import Workbook
 
-from core.account import UNNAMED_ACCOUNT, build_accounts
 from core.export import _autosize, _fill_row, _header_row
 from core.review import canonical_run_status, canonical_status
 from core.submission import (
@@ -67,6 +66,9 @@ def _identifying(submission: Submission, results: Mapping[str, Any]) -> Redactio
             for value in (run.named_insured, run.policy_number):
                 if value and value.strip():
                     values.add(value.strip())
+    # The same value with its spacing collapsed, as the account rollup names
+    # an insured ("Harbor  Test LLC" becomes "Harbor Test LLC").
+    values |= {" ".join(value.split()) for value in values}
     return RedactionPolicy(values=tuple(sorted(values, key=len, reverse=True)))
 
 
@@ -209,7 +211,7 @@ def build_submission_workbook(
     widths = _header_row(sheet, [
         "Named insured", "Status", "Claims", "Open claims", "Total incurred",
         "Why no total", "Valuation dates", "Policy terms", "Claims outside a term",
-        "Missing from a later valuation", "Why review",
+        "Missing from a later valuation", "Why review", "Read from (attachment ID / run)",
     ], policy)
     for index, account in enumerate(summary.accounts, start=2):
         _fill_row(sheet, index, [
@@ -222,14 +224,15 @@ def build_submission_workbook(
             quoted("; ".join(account.period_notes)) or None,
             ", ".join(account.dropped_claims) or None,
             quoted("; ".join(account.reasons)) or None,
+            "; ".join(
+                (source.attachment_id or source.document_id)
+                + (f" / {source.run_id}" if source.run_id else "")
+                for source in account.sources
+            ) or None,
         ], widths, policy)
     _autosize(sheet, widths)
 
     # --- Claims (every surfaced claim, with where it was read) ----------------
-    by_document = {line.document_id: line.attachment_id for line in summary.documents}
-    mapped = [r for r in results.values() if not r.needs_mapping]
-    rollups = build_accounts([r.document for r in mapped],
-                             {r.document.document_id: r.reconciliation for r in mapped})
     sheet = workbook.create_sheet("Claims")
     widths = _header_row(sheet, [
         "Named insured", "Claim number", "Date of loss", "Status", "Paid", "Reserve",
@@ -237,20 +240,17 @@ def build_submission_workbook(
         "Document ID", "Run ID", "Page", "Row", "Review",
     ], policy)
     row = 2
-    for rollup in rollups:
-        for history in rollup.histories:
-            claim = history.current
-            latest = history.appearances[-1]
+    for account in summary.accounts:
+        for claim in account.claim_lines:
             _fill_row(sheet, row, [
-                hidden(rollup.name) if rollup.name != UNNAMED_ACCOUNT else rollup.name,
-                history.claim_number, claim.date_of_loss,
-                claim.claim_status.value if claim.claim_status else None,
+                hidden(account.name) if account.established else account.name,
+                claim.claim_number, claim.date_of_loss, claim.claim_status,
                 _float(claim.paid_total), _float(claim.reserve_total),
                 _float(claim.recovery_total), _float(claim.incurred_total),
-                history.valued_at, len(history.appearances),
-                by_document.get(latest.document_id), latest.document_id, latest.run_id,
-                claim.source_page, claim.source_row,
-                history.uncertain or ("" if history.trusted else "read from a document that needs review"),
+                claim.valued_at, claim.valuations,
+                claim.provenance.attachment_id, claim.provenance.document_id,
+                claim.provenance.run_id, claim.provenance.page, claim.provenance.row,
+                quoted(claim.note),
             ], widths, policy)
             row += 1
     sheet.freeze_panes = "A2"

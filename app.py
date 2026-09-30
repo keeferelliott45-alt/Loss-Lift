@@ -821,6 +821,28 @@ def _download_export(
     _discard_after_download(document_id)
 
 
+def _download_submission(document_ids: list[str]) -> None:
+    """The submission workbook was downloaded: its documents' staged PDFs go.
+
+    The same lifecycle as a document export. A document still waiting for its
+    columns to be mapped keeps its file -- mapping re-reads it, and its claims
+    are not in the workbook yet.
+    """
+    state = _state()
+    kept: list[str] = []
+    for document_id in document_ids:
+        result = state["documents"].get(document_id)
+        if result is not None and result.needs_mapping:
+            continue
+        outcome = _discard_staged(document_id)
+        if outcome is not None and not outcome.gone:
+            kept.append(outcome.reason or str(outcome.outcome))
+    state["staged_error"] = (
+        f"{len(kept)} staged upload(s) could not be deleted and were left in place: "
+        f"{'; '.join(kept)}." if kept else ""
+    )
+
+
 def _extract_uploads(uploads: list[Any]) -> None:
     """Process every upload and land back on the queue with all of them
     visible. Never guess which one the user wants to see next — that guess is
@@ -855,8 +877,8 @@ def _extract_uploads(uploads: list[Any]) -> None:
             twin = _already_open(result.document.file_sha256)
             if twin is not None:
                 state["notices"].append(
-                    f"{upload.name} is the same file as "
-                    f"{twin.document.source_filename}, already in the queue. It "
+                    f"{_plain(upload.name)} is the same file as "
+                    f"{_plain(twin.document.source_filename)}, already in the queue. It "
                     f"was read again from scratch: corrections and review "
                     f"history do not carry over between uploads."
                 )
@@ -914,24 +936,25 @@ def _extract_email(upload: Any) -> int:
             f"your mail program as .eml and retry."
         )
         return 0
-    finally:
-        status.empty()
+    # No Streamlit call until every staged file is recorded: any st call can
+    # raise a rerun, and a staged file nobody recorded is never deleted.
     for document_id, (staged, result) in done.items():
         twin = _already_open(result.document.file_sha256)
         if twin is not None:
             attachment = submission.attachment_for_document(document_id)
             state["notices"].append(
                 f"Attachment {attachment.position if attachment else '?'} of the saved "
-                f"email is the same file as {twin.document.source_filename}, already in "
+                f"email is the same file as {_plain(twin.document.source_filename)}, already in "
                 f"the queue. It was read again from scratch: corrections and review "
                 f"history do not carry over between uploads."
             )
-        _store(result)
-        _record_processed(result)
         state["staged"][document_id] = staged
+        _store(result)
         state["submission_of"][document_id] = submission.submission_id
+        _record_processed(result)
     state["submissions"][submission.submission_id] = submission
     state["submission_order"].append(submission.submission_id)
+    status.empty()
     counts = ", ".join(
         f"{submission.count(outcome)} {label.lower()}"
         for outcome, label in OUTCOME_LABELS.items() if submission.count(outcome)
@@ -1313,7 +1336,7 @@ def screen_workspace(document_id: str) -> None:
     st.divider()
 
     # Streamlit's default rerun dimming reads as a stall on a heavy table, inviting re-clicks.
-    with st.spinner(f"Opening {result.document.source_filename}…"):
+    with st.spinner(f"Opening {_plain(result.document.source_filename)}…"):
         if result.needs_mapping:
             screen_mapping(document_id, result)
             return
@@ -1333,7 +1356,7 @@ def screen_workspace(document_id: str) -> None:
 def screen_mapping(document_id: str, result: ExtractionResult) -> None:
     st.caption(
         f"LossLift could not place every column in "
-        f"{result.document.source_filename}. Tell it what each one is; it will "
+        f"{_plain(result.document.source_filename)}. Tell it what each one is; it will "
         f"remember this format for every future document from this carrier."
     )
 
@@ -1680,6 +1703,46 @@ def _show_evidence(document_id: str, claim_number: str, page: int | None,
     st.session_state[f"show-evidence-{document_id}"] = True
 
 
+def _source_label(submission: Submission, source: Any) -> str:
+    """"Attachment 2 · run-1": LossLift's own words and ids, never email text."""
+    attachment = submission.attachment(source.attachment_id) if source.attachment_id else None
+    label = f"Attachment {attachment.position}" if attachment else "Document"
+    return label + (f" · {source.run_id}" if source.run_id else "")
+
+
+def _all_claims(submission: Submission, account: Any, key: str) -> None:
+    """Every claim the account counts, where it was read, and a way to its page."""
+    lines = account.claim_lines
+    if not lines:
+        return
+    with st.expander(f"All {len(lines)} claim(s), with where each was read"):
+        st.dataframe(pd.DataFrame([
+            {
+                "Claim number": line.claim_number,
+                "Date of loss": line.date_of_loss,
+                "Status": line.claim_status or "",
+                "Incurred": _money(line.incurred_total),
+                "Valued at": line.valued_at,
+                "Valuations": line.valuations,
+                "Read from": _source_label(submission, line.provenance),
+                "Page": line.provenance.page,
+                "Review": line.note,
+            }
+            for line in lines
+        ]), hide_index=True, width="stretch")
+        left, right = st.columns([3, 1])
+        index = left.selectbox(
+            "Claim", range(len(lines)), key=f"{key}-pick",
+            format_func=lambda i: f"{lines[i].claim_number} · page {lines[i].provenance.page}",
+            label_visibility="collapsed",
+        )
+        if right.button("Evidence", key=f"{key}-evidence"):
+            chosen = lines[index].provenance
+            _show_evidence(chosen.document_id, lines[index].claim_number,
+                           chosen.page, chosen.row)
+            st.rerun()
+
+
 def screen_submission(submission_id: str) -> None:
     state = _state()
     submission = state["submissions"].get(submission_id)
@@ -1784,7 +1847,9 @@ def screen_submission(submission_id: str) -> None:
                 + "\nPolicy terms: " + ("; ".join(account.policy_periods) or "not stated")
             )
             for note in account.period_notes:
-                st.caption(note)
+                st.caption(_plain(note))
+            st.caption("Read from: " + "; ".join(
+                _source_label(submission, source) for source in account.sources))
             if account.large_claims:
                 st.markdown(f"**Large claims** (incurred of "
                             f"{export_module.LARGE_LOSS_THRESHOLD:,.0f} or more)")
@@ -1804,8 +1869,11 @@ def screen_submission(submission_id: str) -> None:
                         _show_evidence(claim.provenance.document_id, claim.claim_number,
                                        claim.provenance.page, claim.provenance.row)
                         st.rerun()
+            _all_claims(submission, account, key=f"all-{submission_id}-{account.name}")
 
     st.markdown("### Export")
+    if state.get("staged_error"):
+        st.warning(state.pop("staged_error"))
     redact = st.toggle("Redact identifying data", value=True, key=f"sub-redact-{submission_id}",
                        help="Withholds the sender, subject, file names, insured, policy "
                             "numbers and claimant data. Ids and file hashes stay.")
@@ -1815,9 +1883,13 @@ def screen_submission(submission_id: str) -> None:
         file_name=submission_filename(submission),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"sub-download-{submission_id}",
+        on_click=_download_submission,
+        args=(list(results),),
     )
-    st.caption("Staged PDFs are deleted when each document is exported or removed from "
-               "the queue, as for any upload.")
+    st.caption("Downloading deletes the uploaded PDFs behind this summary, as a document "
+               "export does; the extracted tables stay in this session. Evidence pages "
+               "are drawn from those files, so check them before you download. A document "
+               "still waiting for its columns keeps its file.")
 
 
 def _accounts_panel() -> None:
@@ -1851,14 +1923,14 @@ def _accounts_panel() -> None:
     for account in accounts:
         clean = account.status is DocumentStatus.CLEAN
         with st.expander(
-            f"{'✓' if clean else '⚠'} {account.name} — {len(account.sources)} loss runs, "
+            f"{'✓' if clean else '⚠'} {_plain(account.name)} — {len(account.sources)} loss runs, "
             f"{len(account.histories)} claims"
             + ("" if clean else " — needs review")
         ):
             if not clean:
                 st.warning(
                     "This merged history is not reconciled. "
-                    + "; ".join(account.reasons()[:6])
+                    + "; ".join(_plain(reason) for reason in account.reasons()[:6])
                     + ". Claims from those runs are included and marked; resolve "
                     "them before relying on the totals."
                 )
@@ -1866,7 +1938,7 @@ def _accounts_panel() -> None:
                 "Valued at "
                 + ", ".join(d.isoformat() for d in account.valuation_dates)
                 + " · " + ", ".join(
-                    s.source_filename + (f" ({s.run_id})" if s.run_id else "")
+                    _plain(s.source_filename) + (f" ({s.run_id})" if s.run_id else "")
                     for s in account.sources
                 )
             )

@@ -172,3 +172,32 @@ def test_an_email_date_without_a_zone_is_read_as_utc():
     from core.submission_export import _utc
 
     assert _utc(datetime(2026, 9, 29, 10, 15)) == "2026-09-29 10:15:00 UTC"
+
+
+def test_an_insured_printed_with_extra_spacing_is_still_redacted(submission):
+    """The account rollup collapses spacing; a blocker quoting it must still scrub."""
+    from core.submission_export import _identifying
+
+    sub, _summary, results = submission
+    (result,) = results.values()
+    result.document.named_insured = "Doublespace   Sentinel  Holdings LLC"
+    scrubbed = _identifying(sub, results).scrub(
+        "Doublespace Sentinel Holdings LLC: 2 claim(s) listed in an earlier valuation")
+    assert "sentinel" not in scrubbed.lower() and scrubbed.startswith("[redacted]")
+
+
+def test_every_counted_claim_is_exported_with_where_it_was_read(submission):
+    sub, summary, results = submission
+    workbook = build_submission_workbook(sub, summary, results)
+    rows = list(workbook["Claims"].iter_rows(min_row=2, values_only=True))
+    lines = [line for account in summary.accounts for line in account.claim_lines]
+    assert len(rows) == len(lines) == summary.claims
+    for row, line in zip(rows, lines):
+        assert row[1] == line.claim_number
+        assert row[10:15] == (line.provenance.attachment_id, line.provenance.document_id,
+                              line.provenance.run_id, line.provenance.page,
+                              line.provenance.row)
+    headers = [c.value for c in workbook["Accounts"][1]]
+    read_from = workbook["Accounts"].cell(row=2, column=headers.index(
+        "Read from (attachment ID / run)") + 1).value
+    assert read_from == sub.attachments[0].attachment_id

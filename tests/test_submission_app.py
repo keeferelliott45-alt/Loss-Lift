@@ -67,7 +67,7 @@ def test_the_queue_lists_the_submission_and_opens_it(emailed):
     texts = _texts(at)
     assert any("## 📨 Submission" in t for t in texts)
     assert any("Incomplete" in t for t in texts)
-    assert len(at.dataframe) == 1  # the attachment inventory
+    assert len(at.dataframe) == 2  # the attachment inventory, then the claims
     inventory = at.dataframe[0].value
     assert list(inventory["Outcome"]) == ["Accepted", "Rejected"]
 
@@ -219,3 +219,53 @@ def test_the_same_pdf_in_a_second_email_is_noticed():
     finally:
         for staged in at.session_state["staged"].values():
             discard(staged)
+
+
+def test_any_counted_claim_opens_its_evidence(emailed):
+    submission, done = emailed
+    at = _open_submission(_app(done, submission), submission)
+    (document_id,) = list(done)
+    (_staged, result) = done[document_id]
+    picks = [s for s in at.selectbox if s.key and s.key.endswith("-pick")]
+    assert picks, "no claim picker"
+    last = len(result.document.claims) - 1
+    at = picks[0].set_value(last).run()
+    at = next(b for b in at.button if b.key and b.key.endswith("-evidence")).click().run()
+    assert not at.exception
+    assert at.session_state["open_document"] == document_id
+    wanted = result.document.claims[last].claim_number
+    assert at.selectbox(key=f"evidence-pick-{document_id}").value == f"Claim {wanted}"
+
+
+def _download_twice(raw, root):
+    """Runs inside Streamlit: read an email, then act as the download callback."""
+    import sys
+
+    sys.path.insert(0, root)
+    import streamlit as st
+
+    import app
+
+    class Upload:
+        name = "sub.eml"
+
+        def getvalue(self):
+            return raw
+
+    for key, value in (("documents", {}), ("order", []), ("rejected", []), ("notices", [])):
+        st.session_state[key] = value
+    app._extract_email(Upload())
+    st.session_state["paths"] = [s.path for s in st.session_state["staged"].values()]
+    app._download_submission(list(st.session_state["documents"]))
+
+
+def test_downloading_the_summary_deletes_its_staged_pdfs():
+    raw = eml([("a.pdf", "application/pdf", loss_run_pdf()),
+               ("b.pdf", "application/pdf", loss_run_pdf(rows=claim_rows(2)))])
+    at = AppTest.from_function(_download_twice, args=(raw, str(Path(APP).parent)),
+                               default_timeout=120).run()
+    assert not at.exception
+    paths = at.session_state["paths"]
+    assert len(paths) == 2 and not any(Path(p).exists() for p in paths)
+    assert at.session_state["staged"] == {}
+    assert len(at.session_state["documents"]) == 2  # the tables stay in the session

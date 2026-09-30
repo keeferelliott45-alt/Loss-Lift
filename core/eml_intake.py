@@ -499,8 +499,10 @@ def process_attachments(
 
     ``run`` is the pipeline call a direct upload makes. A PDF the pipeline
     cannot read is marked failed and its staged copy discarded
-    (``run_or_discard``); its siblings continue. An interruption discards the
-    staged copies not yet handed back, then propagates.
+    (``run_or_discard``); its siblings continue. An interruption -- a Streamlit
+    rerun included, which is raised from the progress callback -- discards
+    every staged copy this call held, read or not, then propagates: nothing
+    has been handed back yet, so nothing else would ever delete them.
     """
     done: dict[str, tuple[IngestedFile, Any]] = {}
     remaining = list(staged)
@@ -532,6 +534,13 @@ def process_attachments(
                 pending.staged = None
                 pending.attachment.processing = ProcessingState.FAILED
                 pending.attachment.processing_reason = REASON_PROCESSING
+        for document_id, (staged_file, _result) in done.items():
+            discard(staged_file)
+            attachment = next((p.attachment for p in staged
+                               if p.attachment.document_id == document_id), None)
+            if attachment is not None:
+                attachment.processing = ProcessingState.FAILED
+                attachment.processing_reason = REASON_PROCESSING
         raise
     return done
 

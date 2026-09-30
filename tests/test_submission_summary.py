@@ -227,3 +227,58 @@ def test_an_unnamed_insured_is_said_out_loud(read):
     assert summary.named_insured is None
     assert summary.status == "needs_review"
     assert any("No document names the insured" in b for b in summary.blockers)
+
+
+def test_a_claim_missing_from_a_later_valuation_holds_the_status(read):
+    term = "01/01/2022 - 12/31/2022"
+    earlier = loss_run_pdf(rows=claim_rows(3, big=30000), valuation="06/30/2022", period=term)
+    later = loss_run_pdf(rows=claim_rows(2, big=45000), valuation="12/31/2022", period=term)
+    submission, results = read([("june.pdf", "application/pdf", earlier),
+                                ("dec.pdf", "application/pdf", later)])
+    summary = summarise_submission(submission, results)
+    (account,) = summary.accounts
+    assert account.dropped_claims
+    assert any("missing from a later one" in b for b in summary.blockers)
+    assert summary.status == "needs_review"
+
+
+def test_claims_between_two_printed_terms_are_raised(read):
+    first = loss_run_pdf(rows=claim_rows(8), period="01/01/2022 - 12/31/2022")
+    second = loss_run_pdf(rows=claim_rows(2, start=92000000), policy="GL-200",
+                          period="06/01/2022 - 05/31/2023")
+    submission, results = read([("a.pdf", "application/pdf", first),
+                                ("b.pdf", "application/pdf", second)])
+    summary = summarise_submission(submission, results)
+    (account,) = summary.accounts
+    assert account.policy_periods, "the printed terms should be read"
+    assert any("more than one printed policy term" in b for b in summary.blockers)
+    assert summary.status != "ready"
+
+
+def test_ready_never_sits_beside_an_open_item(read):
+    for attachments in (
+        [("a.pdf", "application/pdf", PDF_2022)],
+        [("a.pdf", "application/pdf", PDF_2022), ("n.docx", "application/octet-stream",
+                                                  b"PK\x03\x04" + b"\0" * 20)],
+    ):
+        submission, results = read(attachments)
+        summary = summarise_submission(submission, results)
+        assert (summary.status == "ready") == (not summary.blockers)
+
+
+def test_every_counted_claim_carries_its_provenance(read):
+    submission, results = read([("2022.pdf", "application/pdf", PDF_2022),
+                                ("2023.pdf", "application/pdf", PDF_2023)])
+    (account,) = summarise_submission(submission, results).accounts
+    assert len(account.claim_lines) == account.claims == 7
+    for line in account.claim_lines:
+        attachment = submission.attachment(line.provenance.attachment_id)
+        assert attachment.document_id == line.provenance.document_id
+        document = results[line.provenance.document_id].document
+        claim = next(c for c in document.claims if c.claim_number == line.claim_number)
+        assert (claim.source_page, claim.source_row) == (line.provenance.page,
+                                                         line.provenance.row)
+        assert claim_evidence(claim, "incurred_total").page == line.provenance.page
+    assert sum(line.incurred_total for line in account.claim_lines) == account.incurred_total
+    sources = {(s.attachment_id, s.document_id) for s in account.sources}
+    assert sources == {(a.attachment_id, a.document_id) for a in submission.attachments}

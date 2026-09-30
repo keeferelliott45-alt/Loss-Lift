@@ -37,6 +37,7 @@ from uuid import uuid4
 from core.account import UNNAMED_ACCOUNT, AccountRollup, build_accounts
 from core.review import blocks_trust, canonical_status
 from core.schema import DocumentStatus, LossRunDocument, ReconciliationResult
+from core.summary import UNRESOLVED_TERM
 
 #: The large-loss line an underwriter reads first. The same threshold as the
 #: document workbook's Large Loss sheet, so the two never disagree.
@@ -220,6 +221,25 @@ class LargeClaim:
 
 
 @dataclass(frozen=True)
+class ClaimLine:
+    """One claim in the merged account, at its latest valuation, and where it was read."""
+
+    claim_number: str
+    date_of_loss: date | None
+    claim_status: str | None
+    paid_total: Decimal | None
+    reserve_total: Decimal | None
+    recovery_total: Decimal | None
+    incurred_total: Decimal | None
+    valued_at: date | None
+    valuations: int
+    provenance: Provenance
+    trusted: bool
+    #: Why this claim needs a look, in plain words; empty when it does not.
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class DocumentLine:
     """One processed document as the submission sees it."""
 
@@ -250,14 +270,17 @@ class AccountSummary:
     dropped_claims: tuple[str, ...]
     large_claims: tuple[LargeClaim, ...]
     sources: tuple[Provenance, ...]
+    #: Every claim counted in this account, each with its provenance.
+    claim_lines: tuple[ClaimLine, ...] = ()
 
 
 @dataclass(frozen=True)
 class SubmissionSummary:
     submission_id: str
     intake_complete: bool
-    #: "ready" only when intake is complete and every document and account is
-    #: clean; otherwise "incomplete" (intake) or "needs_review" (trust).
+    #: "ready" only when intake is complete, every document and account is
+    #: clean and nothing is outstanding; otherwise "incomplete" (intake) or
+    #: "needs_review" (trust).
     status: str
     #: Rejected or failed attachments a person set aside as not needed. When
     #: non-zero, "ready" is always shown qualified by it.
@@ -420,24 +443,41 @@ def summarise_submission(
         currencies, known = _currencies(rollup.documents, results)
         total, unavailable = _incurred(rollup, currencies, known, separate, awaiting_mapping)
         large: list[LargeClaim] = []
+        lines: list[ClaimLine] = []
         for history in rollup.histories:
             claim = history.current
-            if claim.incurred_total is None or claim.incurred_total < large_claim_threshold:
-                continue
             latest = history.appearances[-1]
             attachment = by_document.get(latest.document_id)
+            provenance = Provenance(
+                attachment_id=attachment.attachment_id if attachment else None,
+                document_id=latest.document_id,
+                run_id=latest.run_id,
+                page=claim.source_page,
+                row=claim.source_row,
+            )
+            lines.append(ClaimLine(
+                claim_number=history.claim_number,
+                date_of_loss=claim.date_of_loss,
+                claim_status=claim.claim_status.value if claim.claim_status else None,
+                paid_total=claim.paid_total,
+                reserve_total=claim.reserve_total,
+                recovery_total=claim.recovery_total,
+                incurred_total=claim.incurred_total,
+                valued_at=history.valued_at,
+                valuations=len(history.appearances),
+                provenance=provenance,
+                trusted=history.trusted,
+                note=history.uncertain or (
+                    "" if history.trusted else "read from a document that needs review"),
+            ))
+            if claim.incurred_total is None or claim.incurred_total < large_claim_threshold:
+                continue
             large.append(LargeClaim(
                 claim_number=history.claim_number,
                 date_of_loss=claim.date_of_loss,
                 incurred_total=claim.incurred_total,
                 valued_at=history.valued_at,
-                provenance=Provenance(
-                    attachment_id=attachment.attachment_id if attachment else None,
-                    document_id=latest.document_id,
-                    run_id=latest.run_id,
-                    page=claim.source_page,
-                    row=claim.source_row,
-                ),
+                provenance=provenance,
                 trusted=history.trusted,
             ))
         large.sort(key=lambda item: item.incurred_total, reverse=True)
@@ -477,11 +517,18 @@ def summarise_submission(
                 )
                 for s in rollup.sources
             ),
+            claim_lines=tuple(lines),
         ))
         for reason in rollup.reasons():
             if "needs review" in reason or "not reconciled" in reason:
                 continue  # already said per document above
             blockers.append(f"{rollup.name}: {reason}")
+        unresolved_terms = sum(p.claims for p in periods if p.label == UNRESOLVED_TERM)
+        if unresolved_terms:
+            blockers.append(
+                f"{rollup.name}: {unresolved_terms} claim(s) fall inside more than one "
+                f"printed policy term; which term covers them needs review."
+            )
         if rollup.dropped:
             blockers.append(
                 f"{rollup.name}: {len(rollup.dropped)} claim(s) listed in an earlier "
@@ -504,13 +551,18 @@ def summarise_submission(
         blockers.append("No document names the insured. Confirm whose loss history this "
                         "is before using the figures.")
 
+    if not documents and submission.intake_complete:
+        blockers.append("No loss run was read from this email.")
     # One insured, named: a submission that names two, or none, is a question
-    # for the underwriter however clean each document is.
+    # for the underwriter however clean each document is. And "complete and
+    # reconciled" never sits beside an open item: any blocker at all -- a claim
+    # missing from a later valuation, a claim between two terms -- holds it.
     trusted = (
         all(line.status == "clean" for line in documents)
         and all(account.status is DocumentStatus.CLEAN for account in accounts)
         and bool(documents)
         and not separate
+        and not blockers
     )
     if not submission.intake_complete or removed_documents:
         status = "incomplete"
@@ -518,8 +570,6 @@ def summarise_submission(
         status = "ready"
     else:
         status = "needs_review"
-    if not documents and submission.intake_complete:
-        blockers.append("No loss run was read from this email.")
 
     return SubmissionSummary(
         submission_id=submission.submission_id,

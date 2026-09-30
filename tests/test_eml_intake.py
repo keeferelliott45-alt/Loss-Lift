@@ -476,6 +476,26 @@ def test_an_interruption_while_processing_discards_what_was_not_handed_back(tmp_
     assert not any(path.exists() for path in paths)
 
 
+def test_a_rerun_after_some_pdfs_were_read_discards_those_too(profiles):
+    """Streamlit raises a rerun from the progress callback: nothing is handed back."""
+    parsed = parse_eml(eml([("a.pdf", "application/pdf", PDF_A),
+                            ("b.pdf", "application/pdf", PDF_B)]))
+    staged = stage_attachments(parsed)
+    paths = [p.staged.path for p in staged]
+
+    class Rerun(BaseException):
+        pass
+
+    def progress(read, _total):
+        if read == 1:
+            raise Rerun
+
+    with pytest.raises(Rerun):
+        process_attachments(staged, profiles, parsed.submission, progress)
+    assert not any(path.exists() for path in paths)
+    assert all(a.processing is ProcessingState.FAILED for a in parsed.submission.attachments)
+
+
 def test_cleanup_never_touches_unrelated_files(tmp_path, profiles):
     bystander = Path(tempfile.gettempdir()) / f"not-losslift-{tmp_path.name}.txt"
     bystander.write_text("keep me")

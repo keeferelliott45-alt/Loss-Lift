@@ -30,19 +30,25 @@ work and are not part of it.
      - claims and open claims;
      - total incurred, or why it is not given;
      - valuation dates and printed policy terms;
+     - which attachments and logical runs each account was read from;
      - large claims (at or above $25,000) with an *Evidence* button that
-       opens the document and page the claim was read from.
+       opens the document and page the claim was read from;
+     - every counted claim, with its attachment, run and page, and a picker
+       that opens any one of them the same way.
 4. **Set aside** a rejected attachment you have confirmed is not a loss run.
    The rejection stays on record, and the status says how many were set aside.
 5. **Export** the submission workbook. Its sheets:
    - Submission;
    - Attachments (with SHA-256);
    - Documents (per logical run);
-   - Accounts;
+   - Accounts (with the attachments and runs each was read from);
    - Claims and Large Claims (with attachment, document, run, page and row);
    - Blockers.
 
-   It is redacted by default.
+   It is redacted by default. Downloading it deletes the staged PDFs behind
+   it, as a document export does; a document still waiting for its columns
+   keeps its file. The extracted tables stay in the session, but evidence
+   pages need the file, so look at them first.
 
 Try it without real data: `python scripts/demo_submission.py`.
 
@@ -60,7 +66,10 @@ Intake and trust are separate:
 - **Trust**: every document's status comes from `core.review.canonical_status`,
   and the merged account's status from `core.account`.
 
-"Complete and reconciled" requires both, plus one named insured.
+"Complete and reconciled" requires both, plus one named insured and nothing
+outstanding. Anything on the *Outstanding* list holds it, including a claim
+missing from a later valuation and a claim whose loss date falls inside two
+printed policy terms.
 
 Totals are given only when adding them up means something:
 
@@ -142,8 +151,10 @@ combined.
   - swept after 24 hours if a session ends unexpectedly.
 
   A PDF that fails to read is deleted at once. An interruption during staging
-  or reading deletes everything that email had staged. Rejected attachments
-  are never written to disk.
+  or reading (a page rerun included) deletes everything that email had
+  staged, including PDFs already read. Rejected attachments are never written
+  to disk. Downloading the submission workbook deletes the staged PDFs it
+  summarises.
 - **Export redaction** withholds the cells that hold these values, and scrubs
   them from free-text cells (blockers, reasons, notes). Headers and LossLift's
   own labels are never scrubbed, so a short subject such as "Claim" cannot
@@ -160,6 +171,10 @@ combined.
 
 - **Forwarded emails:** an attached email is rejected, not opened. Save its
   PDFs and upload them.
+- **Inline images:** a signature logo or other embedded picture is an
+  attachment like any other. It is listed as rejected, and must be set aside
+  before the submission can read as complete; LossLift does not guess that a
+  picture is not a scanned loss run.
 - **Accounts:** grouping uses each document's named insured.
   - Documents that name the insured differently form separate accounts until
     reviewed.
