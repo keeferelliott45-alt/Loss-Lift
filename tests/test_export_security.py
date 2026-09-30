@@ -107,15 +107,29 @@ def test_every_formula_payload_is_stored_as_quoted_text():
     workbook = load_workbook(io.BytesIO(payload))
 
     seen: set[str] = set()
+    line_feed_cells = 0
     for sheet in workbook.worksheets:
         for row in sheet.iter_rows():
             for cell in row:
                 if isinstance(cell.value, str) and cell.value in PAYLOADS:
                     seen.add(cell.value)
+                    line_feed_cells += cell.value == "\n=1"
                     assert cell.data_type == "s", (sheet.title, cell.coordinate, cell.value)
                     assert cell.quotePrefix is True, (sheet.title, cell.coordinate, cell.value)
 
-    assert seen == set(PAYLOADS), f"payloads not exercised: {set(PAYLOADS) - seen}"
+    # XML parsers normalise a literal carriage return to a line feed on read,
+    # so the "\r=1" cell reads back as "\n=1" and cannot be told apart by
+    # value. Prove it was written as literal text instead: the package stores
+    # the carriage-return payload itself, and every cell reading "\n=1" --
+    # the "\r=1" cell and the "\n=1" cell alike -- is a quote-prefixed string.
+    stored = b"".join(
+        data for name, data in _members(payload).items()
+        if name.startswith("xl/worksheets/") or name == "xl/sharedStrings.xml"
+    )
+    assert b"\r=1" in stored, "the carriage-return payload was not stored as literal text"
+    assert line_feed_cells >= 2, "the \\r=1 and \\n=1 cells were not both read back"
+    missing = set(PAYLOADS) - seen - {"\r=1"}
+    assert not missing, f"payloads not exercised: {missing}"
 
 
 def test_quote_prefix_is_present_in_the_raw_styles_part():
