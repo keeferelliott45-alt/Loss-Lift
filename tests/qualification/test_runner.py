@@ -253,3 +253,17 @@ def test_a_scan_helper_really_is_image_only(tmp_path):
     corpus, _manifest, _truth = _scanned_corpus(tmp_path)
     with pymupdf.open(corpus / "scan.pdf") as document:
         assert document[0].get_text().strip() == ""
+
+
+def test_the_leak_search_skips_strings_any_report_could_contain_by_chance(tmp_path):
+    from tools.corpus_gate.manifest import Entry
+    from tools.qualification.truth import parse
+
+    spec = document_spec(rows(1), doc_id="doc-x1", sha256="f" * 64)
+    spec["claims"][0]["claim_number"] = "123"
+    spec["claims"][0]["fields"]["reserve_total"] = "0.50"
+    truth = parse({"version": 1, "documents": [spec]}).documents[0]
+    entry = Entry(id="doc-x1", path="folder/doc.pdf", sha256="f" * 64, bytes=1)
+    strings = runner.private_strings(truth, entry, [tmp_path / "folder" / "doc.pdf"])
+    assert "123" not in strings and "0.50" not in strings and "doc" not in strings
+    assert {"doc.pdf", "folder/doc.pdf", "doc-x1", "f" * 64, "30000.00"} <= strings

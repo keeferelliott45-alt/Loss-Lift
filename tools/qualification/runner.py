@@ -101,21 +101,34 @@ def private_strings(truth: DocumentTruth, entry: Any, paths: list[Path]) -> set[
     """Everything from this document that must never appear in the report."""
     # The id and the document's own hash name the file to whoever holds the
     # manifest; the report names it only by its sealed id.
-    values: set[str] = {entry.path, Path(entry.path).name, Path(entry.path).stem,
-                        truth.document_id, truth.sha256}
+    values: set[str] = {entry.path, Path(entry.path).name, truth.document_id, truth.sha256}
     values.update(str(path) for path in paths)
     for claim in truth.claims:
         if claim.claim_number:
             values.add(claim.claim_number)
         for label in claim.fields.values():
-            if label.state is LabelState.KNOWN:
-                text = str(label.value)
-                # Short or undotted numbers ("50", "3") are too common in any
-                # report of counts to search for; dates, claim numbers and
-                # amounts with decimals are what could be recognised.
-                if not (isinstance(label.value, Decimal) and ("." not in text or len(text) < 4)):
-                    values.add(text)
-    return {value for value in values if value}
+            if label.state is not LabelState.KNOWN:
+                continue
+            if isinstance(label.value, Decimal):
+                # An amount is searched for as printed with its decimals, and
+                # only from 1 up: "0.50" would match inside any rate.
+                if abs(label.value) >= 1 and "." in str(label.value):
+                    values.add(str(label.value))
+            else:
+                values.add(str(label.value))
+    return {value for value in values if _searchable(value)}
+
+
+def _searchable(value: str) -> bool:
+    """Whether a private string is distinctive enough to search a report for.
+
+    A few digits turn up in any hash or count by chance, so short numbers are
+    skipped; the report is built from counts and sealed ids, and this search
+    is the second line of defence, not the first.
+    """
+    if not value or len(value) < 3:
+        return False
+    return not (value.isdigit() and len(value) < 6)
 
 
 def _error_type(error: BaseException) -> str:
