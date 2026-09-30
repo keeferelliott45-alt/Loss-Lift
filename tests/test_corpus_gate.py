@@ -1485,3 +1485,25 @@ def test_an_unexpected_error_is_an_execution_failure_named_by_type(tmp_path, mon
     assert code == gate.EXIT_EXECUTION
     assert "OSError" in out
     assert CLAIMANT not in out + err and FILE_STEM not in out + err
+
+
+def test_vision_replay_against_revisions_that_cannot_replay_fails_to_start(world):
+    """Measuring one revision with its scanned pages and the other without them
+    would compare two different things: a revision without replay fails."""
+    recordings = world["root"] / "recordings"
+    recordings.mkdir(exist_ok=True)
+    code, stdout, _, written = _run_gate(world, "same", out="replay",
+                                         extra=["--vision-replay", str(recordings)])
+    assert code == 4, stdout
+    assert "could not start: NotImplementedError" in stdout
+    _assert_no_leak(world, stdout, written)
+    _assert_repository_untouched(world)
+
+
+def test_vision_recordings_inside_the_repository_are_refused(world):
+    inside = world["repo"] / "recordings"
+    inside.mkdir(exist_ok=True)
+    code, stdout, _, _ = _run_gate(world, "same", out="replay-inside",
+                                   extra=["--vision-replay", str(inside)])
+    assert code == 3, stdout
+    assert "vision recordings must live outside the repository" in stdout

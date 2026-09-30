@@ -124,6 +124,7 @@ def _launch(
     sandbox: DockerSandbox | None = None,
     snapshot: Path | None = None,
     containers: dict[int, str] | None = None,
+    vision_replay: Path | None = None,
 ) -> subprocess.Popen:
     isolated = dict(
         PYTHONPATH=str(worktree),
@@ -136,6 +137,8 @@ def _launch(
     )
     argv = ["-P", str(COLLECTOR), "--root", str(worktree), "--documents", str(documents),
             "--out", str(out)]
+    if vision_replay is not None:
+        argv += ["--vision-replay", str(vision_replay)]
     if sandbox is None:
         env = dict(os.environ)
         for key in ("PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT"):
@@ -155,7 +158,8 @@ def _launch(
             name=name,
             argv=argv,
             env={**isolated, "HOME": str(scratch)},
-            read_only=[worktree, COLLECTOR, snapshot, documents],
+            read_only=[worktree, COLLECTOR, snapshot, documents,
+                       *([vision_replay] if vision_replay is not None else [])],
             writable=writable,
             workdir=worktree,
         )
@@ -272,6 +276,7 @@ def run_gate(
     timeout: float = DEFAULT_TIMEOUT,
     sandbox: DockerSandbox | None = None,
     public: bool = False,
+    vision_replay: Path | None = None,
 ) -> GateRun:
     """Verify the corpus, snapshot it, measure both revisions, compare, and write the result.
 
@@ -285,6 +290,10 @@ def run_gate(
         root = repo_root(repo)
         manifests.ensure_outside(corpus, root, "corpus directory")
         manifests.ensure_outside(manifest_path, root, "manifest")
+        if vision_replay is not None:
+            # Recorded answers are what the model read off real documents.
+            manifests.ensure_outside(vision_replay, root, "vision recordings")
+            vision_replay = vision_replay.resolve()
         manifest = manifests.load(manifest_path)
         verification = manifests.verify(manifest, corpus)
         if not verification.ok:
@@ -337,6 +346,7 @@ def run_gate(
                     sandbox,
                     scratch / "snapshot",
                     containers,
+                    vision_replay,
                 ),
                 time.monotonic(),
             )

@@ -8,11 +8,12 @@ UI does any of this work.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field, field as dataclass_field
+from dataclasses import dataclass, field, field as dataclass_field, replace
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pymupdf
 
@@ -26,6 +27,8 @@ from core.extract_digital import (
     CLAIM_COUNT_LABEL,
     COUNTED_TOTAL_LABEL,
     DocumentMetadata,
+    extract_metadata,
+    pages_metadata,
 )
 from core.ingest import IngestedFile, discard, ingest_path, verify_source_unchanged
 from core.normalize import (
@@ -83,10 +86,14 @@ from core.schema import (
     RawRow,
     RawTable,
     ReconciliationResult,
+    RefusedClaimRow,
+    RunConfidence,
     UnplacedRow,
     Resolution,
     SourceMethod,
+    split_is_settled,
 )
+from core.runs import OCR, plan_packet, vision_evidence, vote_plan
 
 
 #: Labels that mark the one total covering every claim, not a section subtotal.
@@ -150,6 +157,11 @@ class ExtractionResult:
     #: (spec section 9) and this becomes None, without taking the page numbers,
     #: regions and cell text with it.
     source_path: Path | None = None
+    #: Seconds spent in each stage of this run, for operational telemetry.
+    #: Never part of what is compared or exported: timing is not behaviour.
+    timings: dict[str, float] = field(default_factory=dict)
+    #: Scanned pages handed to the vision reader (live or replayed).
+    vision_pages: int = 0
 
     @property
     def needs_mapping(self) -> bool:
@@ -447,6 +459,14 @@ _CURRENCY_MARK = re.compile(
     re.IGNORECASE,
 )
 
+#: A sign or an opening parenthesis printed hard against the currency marker
+#: it precedes: "-$4,815", "($4,815.00)". It belongs to the amount the marker
+#: opens. A sign standing apart from the marker is not matched -- "- $4,815"
+#: can be a dash printing zero in one column and the amount beside it.
+_SIGNED_MARK = re.compile(
+    r"^\s*([-+(])(?:%s)\s*" % _CURRENCY_MARK.pattern, re.IGNORECASE
+)
+
 
 def _reads_as_money(text: str, locale: str | None) -> bool:
     """Whether this cell yields one confident amount."""
@@ -686,9 +706,17 @@ def _is_smeared(text: str) -> bool:
     came to read as one: "$1 $234" left "1 234", which is a perfectly good
     space-grouped twelve hundred and thirty-four, and nothing on the page says
     that. So the markers are asked where they sit before they are taken away.
+
+    Nor is a sign one of the groups. A recovery printed "-$4,815" or
+    "($4,815.00)" puts its sign against the marker, and taking the marker out
+    between them left the sign standing alone as a first number -- so every
+    negative amount printed that way was refused, unless its digits happened
+    to make a group of three. The sign goes back to the amount before the
+    question is asked.
     """
     if _marks_two_amounts(text):
         return True
+    text = _SIGNED_MARK.sub(r"\1", text)
     tokens = _strip_currency(_CREDIT_SUFFIX.sub("", text))[0].split()
     if len(tokens) < 2:
         return False
@@ -998,6 +1026,70 @@ def accepted_identifier_shapes(
     return consensus_shapes(candidates)
 
 
+def _run_of(table: RawTable, runs: Mapping[int, int] | None) -> int:
+    """The printed run a table's page belongs to; one run where none is known."""
+    return runs.get(table.page, 0) if runs else 0
+
+
+def identifier_shapes_by_run(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    runs: Mapping[int, int] | None = None,
+) -> dict[int, set[str]]:
+    """The identifier shapes each printed run is read with, keyed by run.
+
+    A packet binds loss runs from several carriers, each numbering its claims
+    its own way. Pooled into one vote, the larger run outvotes the smaller: a
+    run of one claim bound beside a run of eight had that claim refused as a
+    stray code, and so does any run with fewer claims than a quarter of the
+    largest run's -- all of them together.
+
+    Runs are the packet's logical runs (see :mod:`core.runs`), bounded by
+    the page numbering each report prints in its own furniture, never by
+    where their headers differ: two carriers
+    print the same generic labels, and one run's header reads differently on
+    a page where a label wraps. Given no runs, every table is one run.
+
+    A run keeps the document's vote wherever that vote accepts any of its
+    identifiers: it is the same numbering, and the pooled count is what keeps
+    a one-off code inside it out. Only a run none of whose identifiers the
+    document accepts is judged by its own claims, and then only by rows that
+    read as claims in their own right, so a run of continuation codes cannot
+    promote them.
+    """
+    document = accepted_identifier_shapes(tables, mapping)
+    printed: dict[int, list[str]] = {}
+    claimed: dict[int, list[str]] = {}
+    for table in tables:
+        run = _run_of(table, runs)
+        printed.setdefault(run, [])
+        claimed.setdefault(run, [])
+        table_mapping = mapping_for(table, mapping)
+        index = table_mapping.index_of("claim_number")
+        if index is None:
+            continue
+        for row in table.rows:
+            cell = row.cell(index).strip()
+            if not cell or not is_identifier_candidate(cell):
+                continue
+            printed[run].append(cell)
+            if _row_establishes_claim_data(_row_values(row, table_mapping)):
+                claimed[run].append(cell)
+
+    if runs is None:
+        # One loss run: the document's vote, exactly as it always was.
+        return {run: document for run in printed} or {0: document}
+    shapes: dict[int, set[str]] = {}
+    for run, cells in printed.items():
+        own = consensus_shapes(claimed[run])
+        read = any(leading_identifier(cell, document) for cell in cells)
+        # A run keeps every numbering its own claims establish. The packet's
+        # vote may add the shape a stray row shares with it; it never takes
+        # the run's own series away.
+        shapes[run] = (own | document) if read else (own or document)
+    return shapes
+
+
 def claim_identifier(
     row: RawRow, mapping: ColumnMapping, shapes: set[str]
 ) -> str | None:
@@ -1067,6 +1159,9 @@ def build_claims(
     dash_means_zero: bool = False,
     source_method: SourceMethod = SourceMethod.DIGITAL,
     confidence_cap: float = 1.0,
+    runs: Mapping[int, int] | None = None,
+    shapes_by_run: Mapping[int, set[str]] | None = None,
+    refused: list[RefusedClaimRow] | None = None,
 ) -> tuple[list[Claim], list[str], list[UnplacedRow]]:
     """Normalise every row of every page, folding wrapped lines into their claim.
 
@@ -1074,17 +1169,31 @@ def build_claims(
     separately from the warnings. A warning is a note to the reader; an amount
     the app parsed and could not place is a hole in the reading, and only the
     rules can say so.
+
+    ``runs`` maps each page to the claim-number vote it takes part in (see
+    :func:`core.runs.vote_plan`). ``shapes_by_run`` is that vote, where it
+    was taken elsewhere -- an unsettled run reads under the vote of the run
+    before it. A continuation line is folded only into a claim of its own
+    run: text on one report's first line never joins another report's claim.
+
+    ``refused`` collects every row that reads as a claim -- a well-formed
+    identifier and a loss date or status of its own -- whose identifier the
+    vote refused. Whatever else becomes of such a row, it is recorded there
+    and never only folded into the claim above it.
     """
     claims: list[Claim] = []
     warnings: list[str] = []
     unplaced: list[UnplacedRow] = []
     furniture = page_furniture(tables, mapping, locale)
-    shapes = accepted_identifier_shapes(tables, mapping)
+    if shapes_by_run is None:
+        shapes_by_run = identifier_shapes_by_run(tables, mapping, runs)
 
     for table in tables:
         table_mapping = mapping_for(table, mapping)
+        shapes = shapes_by_run[_run_of(table, runs)]
         context = table_money_context(table, table_mapping, shapes)
 
+        run = _run_of(table, runs)
         for row in table.rows:
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
@@ -1113,6 +1222,9 @@ def build_claims(
             # multiplies the count by however many lines each claim occupies.
             identifier = claim_identifier(row, table_mapping, shapes)
             if identifier is None:
+                refusal = refused is not None and _note_refusal(
+                    row, table_mapping, source_method, refused, date_order,
+                )
                 extra = clean_text(" ".join(row.cells))
                 # Numeric evidence is weighed before anything may absorb the
                 # row. A cell under a money column that carries digits and
@@ -1133,15 +1245,21 @@ def build_claims(
                         row, table_mapping, locale, warnings, unplaced, extra,
                         context=context,
                     )
-                elif extra and claims and _continuation_text(row, table_mapping):
+                elif (extra and claims and not refusal
+                      and _continuation_text(row, table_mapping)
+                      and _same_run(claims[-1], run, runs)):
                     previous = claims[-1]
                     previous.loss_description = clean_text(
                         f"{previous.loss_description or ''} {extra}"
                     )
                 elif extra:
+                    held_back = bool(
+                        claims and not refusal
+                        and _continuation_text(row, table_mapping)
+                    )
                     _record_discard(
                         row, table_mapping, locale, warnings, unplaced, extra,
-                        context=context,
+                        context=context, whole=held_back,
                     )
                 continue
 
@@ -1160,7 +1278,7 @@ def build_claims(
                 continue
 
             extra = _continuation_text(row, table_mapping)
-            if extra and claims:
+            if extra and claims and _same_run(claims[-1], run, runs):
                 previous = claims[-1]
                 previous.loss_description = clean_text(
                     f"{previous.loss_description or ''} {extra}"
@@ -1169,9 +1287,48 @@ def build_claims(
                 preview = " ".join(cell for cell in row.cells if cell)
                 _record_discard(
                     row, table_mapping, locale, warnings, unplaced, preview,
-                    context=context,
+                    context=context, whole=bool(extra and claims),
                 )
     return claims, warnings, unplaced
+
+
+def _same_run(claim: Claim, run: int, runs: Mapping[int, int] | None) -> bool:
+    """Whether a claim was read in this run, so a continuation may join it."""
+    return runs is None or runs.get(claim.source_page, 0) == run
+
+
+def _note_refusal(
+    row: RawRow,
+    mapping: ColumnMapping,
+    method: SourceMethod,
+    refused: list[RefusedClaimRow],
+    date_order: str | None = None,
+) -> bool:
+    """Record a row the vote refused if it reads as a claim in its own right.
+
+    Returns whether it was recorded; a recorded row is a claim-like row and
+    is never folded into the claim above it. Its dates are read under the
+    document's settled order, and where no order is settled a date valid in
+    either order still counts: ``03/04/2022`` is a date whichever way it is
+    read, and not knowing which is no reason to treat the row as prose.
+    """
+    index = mapping.index_of("claim_number")
+    if index is None:
+        return False
+    cell = row.cell(index).strip()
+    if not cell or not is_identifier_candidate(cell):
+        return False
+    values = _row_values(row, mapping)
+    orders = (date_order,) if date_order else ("mdy", "dmy")
+    if not (_row_establishes_claim_data(values) or any(
+        parse_date(values.get(field, ""), order).value is not None
+        for field in DATE_FIELDS for order in orders
+    )):
+        return False
+    refused.append(RefusedClaimRow(
+        page=row.page, row=row.line_index, identifier=cell, method=method,
+    ))
+    return True
 
 
 def _carries_numeric_evidence(
@@ -1205,8 +1362,15 @@ def _record_discard(
     preview: str,
     *,
     context: str = "unknown",
+    whole: bool = False,
 ) -> None:
     """Note a row nothing could take, and keep any numeric evidence on it.
+
+    ``whole`` keeps the row's text entire in its warning. A line that would
+    once have been folded into the claim above, and is now held back because
+    that claim was read in another run, is text the reading used to keep; cut
+    to a preview it would be kept nowhere, and a line nothing reads must never
+    be lost silently.
 
     A text-only row stays a warning: nothing measurable was lost, and raising
     a finding for every stray line would bury the ones that matter. A row
@@ -1243,7 +1407,8 @@ def _record_discard(
         )
         return
     warnings.append(
-        f"Page {row.page}: skipped a row with no claim number ({preview[:60]})."
+        f"Page {row.page}: skipped a row with no claim number "
+        f"({preview if whole else preview[:60]})."
     )
 
 
@@ -1722,6 +1887,77 @@ _LOB_WORDS: tuple[tuple[str, LineOfBusiness], ...] = (
 )
 
 
+def _ambiguous_date(token: str) -> bool:
+    """A numeric date whose day and month could be read either way."""
+    parts = re.split(r"[\-/.\s]+", clean_text(token))
+    if len(parts) != 3 or not all(part.isdigit() for part in parts) or len(parts[0]) == 4:
+        return False
+    first, second = int(parts[0]), int(parts[1])
+    return 1 <= first <= 12 and 1 <= second <= 12 and first != second
+
+
+def _borrowed_conventions(
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+    locale_inference: LocaleInference,
+    date_inference: DateOrderInference,
+    profile: CarrierProfile | None,
+    carrier: str | None,
+) -> list[str]:
+    """Where one run of a packet was read under a convention its pages do not prove.
+
+    Number format and date order are settled once for the whole document. A
+    run whose own values are ambiguous and carry no evidence either way has
+    been read under whatever another report in the packet proved -- right
+    when the reports share a convention, a wrong answer that looks right when
+    they do not. A saved profile matched on the packet's first page carries
+    one carrier's conventions to every run.
+    """
+    reasons: list[str] = []
+    money = _money_tokens(tables, mapping)
+    own_locale = infer_locale(money)
+    if (locale_inference.confident and not (own_locale.us_votes or own_locale.eu_votes)
+            and any(parse_money(token, None).reason is NullReason.AMBIGUOUS_SEPARATOR
+                    for token in money)):
+        reasons.append(
+            f"its amounts could be read either way and were read as "
+            f"{'European' if locale_inference.locale == 'eu' else 'US'} numbers "
+            f"on another report's evidence"
+        )
+    dates = _table_date_tokens(tables, mapping)
+    own_order = infer_date_order(dates)
+    if (date_inference.confident and not (own_order.mdy_votes or own_order.dmy_votes)
+            and any(_ambiguous_date(token) for token in dates)):
+        reasons.append(
+            f"its dates could be read either way and were read "
+            f"{'day-first' if date_inference.order == 'dmy' else 'month-first'} "
+            f"on another report's evidence"
+        )
+    if (profile is not None and profile.carrier and carrier
+            and " ".join(profile.carrier.upper().split()) != " ".join(carrier.upper().split())):
+        reasons.append("it was read with a saved profile made for another carrier")
+    return reasons
+
+
+def _period_of(
+    metadata: DocumentMetadata, order: str | None
+) -> tuple[date | None, date | None]:
+    """The policy term a letterhead states, widened to every term its pages
+    declare -- the same reading the document's own term gets."""
+    start = parse_date(metadata.policy_period_start_text or "", order).value
+    end = parse_date(metadata.policy_period_end_text or "", order).value
+    declared = [
+        (start_value, end_value)
+        for start_text, end_text in metadata.policy_periods
+        if (start_value := parse_date(start_text, order).value) is not None
+        and (end_value := parse_date(end_text, order).value) is not None
+    ]
+    if len(declared) > 1:
+        start = min(item for item, _ in declared)
+        end = max(item for _, item in declared)
+    return start, end
+
+
 def _line_of_business(text: str | None) -> LineOfBusiness | None:
     if not text:
         return None
@@ -1793,6 +2029,22 @@ def run_pipeline(
         discard(ingested)
 
 
+class _StageClock:
+    """Seconds per pipeline stage, measured and nothing else."""
+
+    def __init__(self) -> None:
+        self.started = self.last = time.perf_counter()
+        self.stages: dict[str, float] = {}
+
+    def mark(self, stage: str) -> None:
+        now = time.perf_counter()
+        self.stages[stage] = round(now - self.last, 6)
+        self.last = now
+
+    def done(self) -> dict[str, float]:
+        return {**self.stages, "total": round(time.perf_counter() - self.started, 6)}
+
+
 def _run_pipeline(
     ingested: IngestedFile,
     *,
@@ -1806,7 +2058,9 @@ def _run_pipeline(
     llm_client: Any | None = None,
 ) -> ExtractionResult:
     """Run extraction against a stable staged PDF."""
+    clock = _StageClock()
     classification = classify_pdf(ingested.path)
+    clock.mark("classify")
 
     digital_pages = classification.digital_pages
     # `pages=None` means "extract every page" (spec: no filter). Passing the
@@ -1815,6 +2069,7 @@ def _run_pipeline(
     # eagerly parse every heavy scanned page for a document that has nothing
     # digital on it at all. An explicit empty list correctly extracts none.
     extraction = extract_digital.extract_pdf(ingested.path, pages=digital_pages)
+    clock.mark("digital")
     tables = list(extraction.tables)
     metadata = extraction.metadata
     warnings: list[str] = []
@@ -1972,6 +2227,7 @@ def _run_pipeline(
             f"Turn on vision extraction to include them."
         )
 
+    clock.mark("vision")
     # Fingerprint the letterhead plus the header labels.
     # A scanned page prints its valuation date and claim count like any other,
     # but there is no text layer to read them from, so the vision pass reports
@@ -2008,6 +2264,7 @@ def _run_pipeline(
         use_llm=use_llm,
         llm_client=llm_client,
     )
+    clock.mark("mapping")
 
     # Number and date conventions, derived from the document itself.
     locale_inference = infer_locale(_money_tokens(tables, mapping))
@@ -2034,8 +2291,54 @@ def _run_pipeline(
     # column is the better source: it is the document saying so directly, not
     # a guess about which line of the letterhead names the carrier.
     stated = read_document_columns(digital_tables)
+
+    # Which loss runs this PDF binds. Both readers report what each page
+    # prints about itself -- the text layer measured in the page's furniture,
+    # a scan as the vision model read it -- and one decision is taken over
+    # the whole packet from that. A single loss run is the whole document.
+    page_evidence = {**extraction.page_evidence, **vision_evidence(vision_tables)}
+    # A text layer recognised off a picture -- a scan saved as searchable --
+    # is a reading of the page like the vision model's, not a measurement of
+    # it. Numbering found there counts, as a reading.
+    for number, record in classified.items():
+        found = page_evidence.get(number)
+        if found is not None and found.paginations and record.transcribed_boxes:
+            page_evidence[number] = replace(found, paginations=tuple(
+                replace(label, source=OCR) for label in found.paginations
+            ))
+    claim_table_pages = {
+        table.page for table in tables
+        if mapping_for(table, mapping).index_of("claim_number") is not None
+    }
+    table_methods = {
+        table.page: SourceMethod.VISION if table.strategy == "vision" else SourceMethod.DIGITAL
+        for table in tables
+    }
+    plan = plan_packet(
+        range(1, classification.page_count + 1),
+        page_evidence,
+        claim_table_pages,
+        table_methods,
+    )
+    runs = plan.runs
+    groups, borrowed = vote_plan(runs)
+
+    def shapes_for(reader_tables: list[RawTable]) -> dict[int, set[str]] | None:
+        """Each run's claim-number vote over one reader's tables. An unsettled
+        run reads under the vote of the settled run before it."""
+        if groups is None:
+            return None
+        shapes = identifier_shapes_by_run(reader_tables, mapping, groups)
+        for index, source in borrowed.items():
+            if source in shapes:
+                shapes[index] = shapes[source]
+        return shapes
+
+    refused_rows: list[RefusedClaimRow] = []
+
     claims, row_warnings, unplaced_rows = build_claims(
-        digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero
+        digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero,
+        runs=groups, shapes_by_run=shapes_for(digital_tables), refused=refused_rows,
     )
     warnings.extend(row_warnings)
 
@@ -2045,6 +2348,7 @@ def _run_pipeline(
             dash_means_zero=dash_means_zero,
             source_method=SourceMethod.VISION,
             confidence_cap=0.85,
+            runs=groups, shapes_by_run=shapes_for(vision_tables), refused=refused_rows,
         )
         claims.extend(vision_claims)
         warnings.extend(vision_warnings)
@@ -2097,6 +2401,30 @@ def _run_pipeline(
     printed_totals, document_total_row, unreadable_totals = _document_total(
         tables, mapping, locale, len(claims)
     )
+    # A packet has no total of its own unless one is printed for it, and
+    # choosing one run's total for the whole packet checks every other run's
+    # claims against a figure that never covered them. Each run's total is
+    # read from its own pages, against its own claims.
+    #
+    # Only across a settled split, though. Where any boundary rests on a
+    # reading (OCR, the vision model) or on nothing at all, which run a printed
+    # count or total belongs to is exactly what is not known: attributed to a
+    # run holding none of the claims it counted, a figure that tied the whole
+    # document reports a discrepancy nobody made, and the carrier's own check
+    # is lost. An unsettled packet keeps its runs -- R-28 names the boundaries
+    # -- and its printed evidence is read, and checked, for the whole document.
+    per_run_evidence = split_is_settled(runs)
+    run_tables: dict[str, list[RawTable]] = {
+        run.run_id: [table for table in tables if run.holds(table.page)] for run in runs
+    }
+    run_totals: dict[str, tuple[dict, tuple[int, int] | None, dict[str, str]]] = {}
+    if per_run_evidence:
+        printed_totals, document_total_row, unreadable_totals = {}, None, {}
+        for run in runs:
+            run_totals[run.run_id] = _document_total(
+                run_tables[run.run_id], mapping, locale,
+                sum(1 for claim in claims if run.holds(claim.source_page)),
+            )
 
     # Recoveries: settle the carrier's sign convention before anything is
     # reconciled, and apply it to the printed totals too — otherwise R-04
@@ -2117,13 +2445,26 @@ def _run_pipeline(
             confident=True,
             evidence="carrier profile",
         )
-    printed_sections = collect_printed_sections(
-        tables,
-        mapping,
-        locale_inference.locale,
-        date_inference.order,
-        document_row=document_total_row,
-    )
+    if per_run_evidence:
+        printed_sections = [
+            section
+            for run in runs
+            for section in collect_printed_sections(
+                run_tables[run.run_id],
+                mapping,
+                locale_inference.locale,
+                date_inference.order,
+                document_row=run_totals[run.run_id][1],
+            )
+        ]
+    else:
+        printed_sections = collect_printed_sections(
+            tables,
+            mapping,
+            locale_inference.locale,
+            date_inference.order,
+            document_row=document_total_row,
+        )
     if recovery_sign.should_negate:
         for claim in claims:
             if claim.recovery_total is not None:
@@ -2132,6 +2473,15 @@ def _run_pipeline(
             name: (-value if name == "recovery_total" and value is not None else value)
             for name, value in printed_totals.items()
         }
+        for run_id, (totals, row, unreadable) in list(run_totals.items()):
+            run_totals[run_id] = (
+                {
+                    name: (-value if name == "recovery_total" and value is not None else value)
+                    for name, value in totals.items()
+                },
+                row,
+                unreadable,
+            )
         # The same convention, applied to the same kind of figure. A subtotal's
         # recovery column is printed exactly as the document total's is, so
         # leaving it un-negated set every claim's flipped recovery against an
@@ -2183,6 +2533,53 @@ def _run_pipeline(
         # as the document's, and file a third of the book under the wrong one.
         letterhead_carrier = None
 
+    for run in runs:
+        texts = {page: text for page, text in extraction.page_texts.items() if run.holds(page)}
+        if per_run_evidence:
+            totals, total_row, unreadable = run_totals[run.run_id]
+            counted = [entry for entry in vision_counts if run.holds(entry["page"])]
+            run.printed_totals = totals
+            run.unreadable_totals = unreadable
+            run.unreadable_totals_page = total_row[0] if total_row else None
+            run.unreadable_totals_row = total_row[1] if total_row else None
+            run.printed_claim_count = document_claim_count(
+                texts, [entry["count"] for entry in counted]
+            )
+            run.printed_count_evidence = counted_claim_evidence(texts) + counted
+        # What the run's own pages say about it -- its first claims page's
+        # letterhead, a valuation date or policy term printed on any of its
+        # pages -- and nothing another run printed.
+        first = next((page for page in run.table_pages if page in texts), None)
+        letterhead = pages_metadata(texts, first)
+        run.carrier = letterhead.carrier
+        run.named_insured = letterhead.named_insured
+        run.policy_number = letterhead.policy_number
+        run.line_of_business = _line_of_business(letterhead.line_of_business)
+        run.valuation_date_text = letterhead.valuation_date_text
+        run.policy_period_start, run.policy_period_end = _period_of(letterhead, header_order)
+        if run.valuation_date_text is None:
+            run.valuation_date_text = next(
+                (table.valuation_date_text for table in run_tables[run.run_id]
+                 if table.valuation_date_text), None,
+            )
+        if run.valuation_date_text:
+            run.valuation_date = parse_date(run.valuation_date_text, header_order).value
+        run.borrowed_conventions = _borrowed_conventions(
+            run_tables[run.run_id], mapping, locale_inference, date_inference,
+            profile, run.carrier,
+        )
+    for row in refused_rows:
+        run = next((item for item in runs if item.holds(row.page)), None)
+        row.bounded = plan.bounded and row.page not in plan.blind and (
+            run is None or (not run.ambiguous and run.confidence is not RunConfidence.NONE)
+        )
+        # A refusal is reported wherever another report's numbering may be why:
+        # in a packet, and wherever the vote was not bounded by what the pages
+        # print. An unsettled run's refusals are named by R-28 instead.
+        row.report = not (run is not None and run.ambiguous) and (
+            bool(runs) or not row.bounded
+        )
+
     document = LossRunDocument(
         document_id=ingested.document_id,
         source_filename=ingested.source_filename,
@@ -2220,7 +2617,8 @@ def _run_pipeline(
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
         printed_totals=printed_totals,
-        printed_claim_count=metadata.printed_claim_count,
+        # A settled packet's count is each run's own; see ``runs``.
+        printed_claim_count=None if per_run_evidence else metadata.printed_claim_count,
         unreadable_totals=unreadable_totals,
         unreadable_totals_page=(
             document_total_row[0] if document_total_row else None
@@ -2238,6 +2636,9 @@ def _run_pipeline(
         rows_seen_per_page=rows_seen_per_page,
         column_mapping=mapping.decisions,
         printed_sections=printed_sections,
+        runs=runs,
+        incomplete_report=plan.incomplete,
+        refused_claim_rows=refused_rows,
         claims=claims,
         currencies_seen=currencies_seen,
         document_issues=document_issues,
@@ -2250,9 +2651,14 @@ def _run_pipeline(
     scope_sections(document.printed_sections, document.claims)
 
     config = reconcile_config or _config_for(profile)
+    clock.mark("assemble")
+    reconciliation = reconcile(document, config)
+    clock.mark("reconcile")
     return ExtractionResult(
         document=document,
-        reconciliation=reconcile(document, config),
+        reconciliation=reconciliation,
+        timings=clock.done(),
+        vision_pages=len(scanned_pages) if use_vision else 0,
         mapping=mapping,
         classification=classification,
         source_path=ingested.path,
@@ -2794,7 +3200,13 @@ def apply_edits(
             Claim(
                 claim_number=claim_number,
                 row_id=original.row_id if original else "",
-                source_page=int(record.get("_page") or (original.source_page if original else 1)),
+                # Where a row was read is provenance, not something to edit.
+                # A row added by hand takes the page it was given, which in a
+                # packet is how it joins its loss run.
+                source_page=(
+                    original.source_page if original is not None
+                    else int(record.get("_page") or 1)
+                ),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,
                 source_lines=list(original.source_lines) if original else [],

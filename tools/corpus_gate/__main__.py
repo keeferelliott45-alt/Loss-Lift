@@ -51,11 +51,44 @@ def _parser() -> argparse.ArgumentParser:
         help="write only the publishable result: states, changed fields, claim count and status",
     )
     run.add_argument(
+        "--vision-replay",
+        type=Path,
+        default=None,
+        help="replay recorded vision answers from this directory (outside the repository) "
+             "so scanned pages are measured too; no live model is ever called",
+    )
+    run.add_argument(
         "--sandbox-image",
         default=None,
         help="run each collector in this local container image, with no network and no credentials",
     )
+
+    labels = commands.add_parser(
+        "init-labels",
+        help="write a labels file listing every manifest document with every label unknown",
+    )
+    labels.add_argument("--manifest", required=True, type=Path)
+    labels.add_argument("--labels", required=True, type=Path)
+    labels.add_argument("--repo", type=Path, default=Path.cwd())
+    labels.add_argument("--force", action="store_true", help="replace an existing labels file")
     return parser
+
+
+def _init_labels(args: argparse.Namespace) -> int:
+    from tools.corpus_gate import labels as corpus_labels
+
+    try:
+        root = repo_root(args.repo)
+        manifests.ensure_outside(args.manifest, root, "manifest")
+        manifests.ensure_outside(args.labels, root, "labels file")
+        manifest = manifests.load(args.manifest)
+        corpus_labels.write_template(manifest, args.labels, force=args.force)
+    except SetupError as error:
+        print(f"init-labels: {error}", file=sys.stderr)
+        return comparison.EXIT_SETUP
+    print(f"Listed {len(manifest.entries)} document(s) with every label unknown. "
+          "Keep the labels file out of Git: it names real carriers.")
+    return comparison.EXIT_PASS
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -93,6 +126,7 @@ def _run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             sandbox=sandbox,
             public=args.public_output,
+            vision_replay=args.vision_replay,
         )
     except SetupError as error:
         print(f"LossLift real-corpus gate: FAIL (exit 3)\n\n{error}")
@@ -119,6 +153,8 @@ def _run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "init-labels":
+        return _init_labels(args)
     return _init(args) if args.command == "init-manifest" else _run(args)
 
 

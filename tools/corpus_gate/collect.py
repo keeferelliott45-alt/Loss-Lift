@@ -64,6 +64,7 @@ UPPER_TOKEN = re.compile(r"[A-Z][A-Z_]{1,23}")
 LOWER_TOKEN = re.compile(r"[a-z][a-z_]{1,23}")
 FIELD_NAME = re.compile(r"[a-z][a-z0-9_]{0,47}")
 ERROR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+RUN_ID = re.compile(r"run-[1-9][0-9]{0,3}")
 
 DIGEST_PREFIX = "h:"
 RAW_PREFIX = "r:"
@@ -299,7 +300,11 @@ def _printed(document: Any, digest: Digest) -> dict[str, Any]:
     }
 
 
-_IDENTITY = ("rule_id", "scope", "subject", "condition", "field", "page", "claim_number", "related_rows")
+#: ``run_id`` is part of a finding's identity: the same rule on the same claim
+#: in two logical runs of a packet is two findings. A revision without runs
+#: reads None for every finding, the same on both sides of a comparison.
+_IDENTITY = ("rule_id", "scope", "subject", "condition", "field", "page", "claim_number",
+             "related_rows", "run_id")
 _DETAIL = ("severity", "category", "message", "expected", "actual", "delta")
 
 
@@ -388,6 +393,154 @@ def _warnings(result: Any, digest: Digest) -> dict[str, Any] | None:
     return {"count": len(warnings), "digest": digest(list(warnings))}
 
 
+# -- trust status and logical runs -----------------------------------------
+#
+# A revision that predates logical runs, one whose document has ``runs=[]``,
+# and one whose single report is a whole-document run all measure alike: one
+# run, not a packet, no items. Refused rows a revision does not record are
+# measured as none. Only a change in what a document is or holds shows up --
+# never a change in how a revision represents the same thing.
+
+
+#: ``core.review.UNACCOUNTED_RULES``, mirrored for a revision that predates it.
+_UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
+
+
+def _blocks_trust(finding: Any) -> bool:
+    """``core.review.blocks_trust``, for a revision that predates it."""
+    return (plain(getattr(finding, "category", None)) != "underwriting"
+            or plain(getattr(finding, "severity", None)) == "ERROR"
+            or getattr(finding, "rule_id", None) in _UNACCOUNTED_RULES)
+
+
+def _canonical_status(result: Any, reconciliation: Any) -> Any:
+    """The one status policy (``core.review.canonical_status``).
+
+    A revision that predates the function is measured under the same policy,
+    so the comparison shows where a document's trust changed, not where the
+    code learnt to state it.
+    """
+    needs_mapping = bool(getattr(result, "needs_mapping", False))
+    try:
+        from core.review import canonical_status
+    except ImportError:
+        canonical_status = None
+    if canonical_status is not None:
+        return canonical_status(reconciliation, needs_mapping=needs_mapping)
+    if reconciliation is None or needs_mapping:
+        return "NEEDS_REVIEW"
+    if plain(getattr(reconciliation, "status", None)) != "CLEAN":
+        return "NEEDS_REVIEW"
+    run_status = getattr(reconciliation, "run_status", None) or {}
+    if any(plain(status) != "CLEAN" for status in run_status.values()):
+        return "NEEDS_REVIEW"
+    if any(_blocks_trust(f) for f in getattr(reconciliation, "findings", None) or []):
+        return "NEEDS_REVIEW"
+    return "CLEAN"
+
+
+def _canonical_run_status(
+    reconciliation: Any, run_id: Any, *, needs_mapping: bool = False
+) -> Any:
+    """``core.review.canonical_run_status``, for any revision.
+
+    No run of a document whose column mapping is still to be confirmed is
+    clean. That is decided here, before the revision's own function is asked,
+    so a revision whose function predates the mapping input is measured under
+    the same rule as one that takes it.
+    """
+    if needs_mapping:
+        return "NEEDS_REVIEW"
+    try:
+        from core.review import canonical_run_status
+    except ImportError:
+        canonical_run_status = None
+    if canonical_run_status is not None:
+        return canonical_run_status(reconciliation, run_id)
+    if reconciliation is None:
+        return "NEEDS_REVIEW"
+    run_status = getattr(reconciliation, "run_status", None) or {}
+    if plain(run_status.get(run_id)) != "CLEAN":
+        return "NEEDS_REVIEW"
+    if any(_blocks_trust(f) for f in getattr(reconciliation, "findings", None) or []
+           if getattr(f, "run_id", None) in (None, run_id)):
+        return "NEEDS_REVIEW"
+    return "CLEAN"
+
+
+def _on(pages: set[int], item: Any) -> bool:
+    return int(getattr(item, "page", 0) or 0) in pages
+
+
+def _refused(document: Any, digest: Digest) -> dict[str, Any]:
+    rows = list(getattr(document, "refused_claim_rows", None) or [])
+    by_page = Counter(int(getattr(row, "page", 0) or 0) for row in rows)
+    return {
+        "count": len(rows),
+        "reported": sum(1 for row in rows if getattr(row, "report", False)),
+        "by_page": {str(page): seen for page, seen in sorted(by_page.items())},
+        "digest": digest(rows),
+    }
+
+
+_RUN_FACTS = ("carrier", "named_insured", "policy_number", "policy_period_start",
+              "policy_period_end", "line_of_business", "valuation_date")
+
+
+def _run_item(
+    document: Any, reconciliation: Any, run: Any, digest: Digest, *, needs_mapping: bool = False
+) -> dict[str, Any]:
+    pages = {int(page) for page in getattr(run, "pages", None) or []}
+    run_id = getattr(run, "run_id", None)
+    claims = [claim for claim in getattr(document, "claims", None) or []
+              if int(getattr(claim, "source_page", 0) or 0) in pages]
+    findings = [f for f in getattr(reconciliation, "findings", None) or []
+                if getattr(f, "run_id", None) == run_id]
+    engine = (getattr(reconciliation, "run_status", None) or {}).get(run_id)
+    printed = getattr(run, "printed_totals", None) or {}
+    return {
+        "run_id": token(run_id, RUN_ID, digest),
+        "pages": sorted(pages),
+        "confidence": token(getattr(run, "confidence", None), LOWER_TOKEN, digest),
+        "ambiguous": bool(getattr(run, "ambiguous", False)),
+        "incomplete": bool(getattr(run, "incomplete", None)),
+        "claims": len(claims),
+        "claims_digest": digest(claims),
+        "refused": sum(1 for row in getattr(document, "refused_claim_rows", None) or []
+                       if _on(pages, row)),
+        "unplaced": sum(1 for row in getattr(document, "unplaced_rows", None) or []
+                        if _on(pages, row)),
+        "printed_claim_count": count(getattr(run, "printed_claim_count", None), digest),
+        "printed_totals": sorted(field_key(name, digest)
+                                 for name, value in printed.items() if value is not None),
+        "engine_status": None if engine is None else token(engine, UPPER_TOKEN, digest),
+        "status": token(_canonical_run_status(reconciliation, run_id, needs_mapping=needs_mapping),
+                        UPPER_TOKEN, digest),
+        "r04": sum(1 for f in findings if getattr(f, "rule_id", None) == "R-04"),
+        "r05": sum(1 for f in findings if getattr(f, "rule_id", None) == "R-05"),
+        "evidence": digest(list(getattr(run, "evidence", None) or [])),
+        "facts": digest([getattr(run, name, None) for name in _RUN_FACTS]),
+    }
+
+
+def _runs(
+    document: Any, reconciliation: Any, digest: Digest, *, needs_mapping: bool = False
+) -> dict[str, Any]:
+    runs = list(getattr(document, "runs", None) or [])
+    packet = len(runs) > 1
+    return {
+        "count": max(len(runs), 1),
+        "packet": packet,
+        "unsettled": sum(1 for run in runs if getattr(run, "ambiguous", False)),
+        "incomplete": sum(1 for run in runs if getattr(run, "incomplete", None)),
+        "items": {
+            str(index): _run_item(document, reconciliation, run, digest,
+                                  needs_mapping=needs_mapping)
+            for index, run in enumerate(runs, start=1)
+        } if packet else {},
+    }
+
+
 def measure(result: Any, digest: Digest) -> dict[str, Any]:
     """Every privacy-safe measurement the gate compares, for one document.
 
@@ -415,6 +568,12 @@ def measure(result: Any, digest: Digest) -> dict[str, Any]:
         "claims": lambda: _claims(claims, digest),
         "metadata": lambda: _metadata(document, digest),
         "warnings": lambda: _warnings(result, digest),
+        "review_status": lambda: token(
+            _canonical_status(result, reconciliation), UPPER_TOKEN, digest
+        ),
+        "runs": lambda: _runs(document, reconciliation, digest,
+                              needs_mapping=bool(getattr(result, "needs_mapping", False))),
+        "refused": lambda: _refused(document, digest),
     }
     try:
         claims.extend(getattr(document, "claims", None) or [])
@@ -452,6 +611,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--documents", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--vision-replay", type=Path, default=None,
+        help="replay recorded vision answers from this directory instead of "
+             "skipping scanned pages; never calls a live model",
+    )
     args = parser.parse_args(argv)
 
     first = sys.stdin.readline().strip()
@@ -465,6 +629,17 @@ def main(argv: list[str] | None = None) -> int:
                 _write(handle, {"kind": "fatal", "error_type": "IsolationError"})
                 return 3
             from core.pipeline import run_pipeline
+
+            vision: dict[str, Any] = {"use_vision": False}
+            if args.vision_replay is not None:
+                try:
+                    from core.extract_vision import replay_extractor
+                except ImportError:
+                    # A revision that cannot replay would be measured without
+                    # its scanned pages while the other is measured with them.
+                    raise NotImplementedError("vision replay") from None
+                vision = {"use_vision": True,
+                          "vision_extractor": replay_extractor(args.vision_replay)}
         except Exception as error:  # noqa: BLE001 - the revision cannot start
             _write(handle, {"kind": "fatal", "error_type": error_name(error)})
             return 3
@@ -482,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         for entry in documents:
             record: dict[str, Any] = {"kind": "document", "id": entry["id"]}
             try:
-                result = run_pipeline(Path(entry["path"]), use_vision=False)
+                result = run_pipeline(Path(entry["path"]), **vision)
             except Exception as error:  # noqa: BLE001 - recorded as a failure
                 record.update(ok=False, error_type=error_name(error))
             else:

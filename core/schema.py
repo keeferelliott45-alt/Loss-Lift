@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 import json
 import re
-from typing import Annotated, Any, Iterable
+from typing import Annotated, Any, Iterable, Sequence
 from uuid import uuid4
 
 from pydantic import (
@@ -494,6 +494,155 @@ class PrintedSection(BaseModel):
     unreadable_totals: dict[str, str] = Field(default_factory=dict)
 
 
+class RunConfidence(str, Enum):
+    """How a logical run's extent is known.
+
+    A physical PDF can bind several loss runs. Where one ends and the next
+    begins is only ever as good as what the pages themselves printed about it.
+    """
+
+    #: The report numbered its own pages, in the page's header or footer band,
+    #: as read from the text layer.
+    PRINTED = "printed"
+    #: The vision model reported the page numbering printed in the page's
+    #: header or footer. A reading, not a measurement: lower confidence.
+    MODEL = "model"
+    #: Nothing numbers these pages; the neighbouring report declared its own
+    #: last page ("Page 3 of 3"), so these cannot be part of it.
+    INFERRED = "inferred"
+    #: Nothing on the pages says where a report begins or ends.
+    NONE = "none"
+
+
+class RunBoundary(BaseModel):
+    """One piece of page-local evidence about where a run begins or ends."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    #: opened | continued | unnumbered | restarted | section | break | leading
+    kind: str
+    #: header | footer | model | none -- where on the page the evidence sits.
+    source: str
+    #: What the page printed, and what was concluded from it, in words.
+    text: str
+
+
+class LogicalRun(BaseModel):
+    """One insurance loss run inside a physical packet.
+
+    A board or RFP packet binds several carriers' loss runs into one PDF, each
+    numbering its own pages and claims and printing its own totals. A logical
+    run is one of them: a set of pages, the evidence that bounds it, and what
+    it printed about itself. Claims belong to the run holding their source
+    page, so membership needs no field on the claim and survives any edit.
+
+    Present on a document only when it binds more than one run; a single loss
+    run is the whole document and carries none.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    pages: list[int]
+    confidence: RunConfidence
+    #: The evidence did not settle where this run begins: a page-number
+    #: sequence broke, or a report stopped before its declared last page and
+    #: the next page prints no number. The run is kept whole and apart -- its
+    #: claims are neither dropped nor handed to a neighbour -- and reviewed.
+    ambiguous: bool = False
+    ambiguity: str | None = None
+    #: The report stopped before its own last page ("2 of 3") and another
+    #: began, or the PDF ended: pages of it -- and their claims -- are missing.
+    incomplete: str | None = None
+    evidence: list[RunBoundary] = Field(default_factory=list)
+    source_methods: list[SourceMethod] = Field(default_factory=list)
+    #: Pages carrying a claims table the run's claims were read from.
+    table_pages: list[int] = Field(default_factory=list)
+
+    #: What this run printed about itself on its own pages -- never another
+    #: run's letterhead. None where the run does not say.
+    carrier: str | None = None
+    named_insured: str | None = None
+    policy_number: str | None = None
+    policy_period_start: date | None = None
+    policy_period_end: date | None = None
+    line_of_business: LineOfBusiness | None = None
+    valuation_date_text: str | None = None
+    valuation_date: date | None = None
+    #: Conventions this run's values were read under that its own pages do not
+    #: establish -- a number format or date order proven only by another
+    #: report in the packet, or a saved profile made for another carrier.
+    #: Conventions are still inferred once per document; this is where that
+    #: assumption could be wrong for this run, and it is reported (R-15).
+    borrowed_conventions: list[str] = Field(default_factory=list)
+
+    #: What this run printed about itself, read from its own pages only.
+    printed_totals: dict[str, Money | None] = Field(default_factory=dict)
+    printed_claim_count: int | None = None
+    printed_count_evidence: list[dict[str, int]] = Field(default_factory=list)
+    unreadable_totals: dict[str, str] = Field(default_factory=dict)
+    unreadable_totals_page: int | None = None
+    unreadable_totals_row: int | None = None
+
+    def holds(self, page: int | None) -> bool:
+        return page is not None and page in self.pages
+
+    @property
+    def page_range(self) -> str:
+        pages = sorted(self.pages)
+        if not pages:
+            return "no pages"
+        spans: list[str] = []
+        start = previous = pages[0]
+        for page in pages[1:] + [None]:
+            if page is not None and page == previous + 1:
+                previous = page
+                continue
+            spans.append(str(start) if start == previous else f"{start}-{previous}")
+            if page is not None:
+                start = previous = page
+        return ", ".join(spans)
+
+
+def split_is_settled(runs: Sequence[LogicalRun]) -> bool:
+    """Whether every boundary of a packet is printed and unambiguous.
+
+    Only then is it known which run a printed count or total belongs to. A
+    boundary resting on a reading (OCR, the vision model) or on nothing, or
+    one the planner could not settle, leaves the carrier's printed figures
+    with the whole document they were read from.
+    """
+    return bool(runs) and all(
+        run.confidence is RunConfidence.PRINTED and not run.ambiguous for run in runs
+    )
+
+
+class RefusedClaimRow(BaseModel):
+    """A row that reads as a claim but whose claim number the vote refused.
+
+    Its identifier cell is well formed and the row states a loss date or a
+    status of its own, yet the run's claim-number vote did not accept its
+    shape, so no claim was built from it. It is kept here -- page, line and
+    the identifier printed -- rather than folded into the claim above or
+    reduced to a warning, so a reviewer can be told where it is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    row: int | None = None
+    identifier: str
+    method: SourceMethod = SourceMethod.DIGITAL
+    #: Whether the row's run is bounded by what its pages print. Unbounded,
+    #: the vote that refused it may have pooled two reports' claim numbers.
+    bounded: bool = True
+    #: Whether a reviewer must be told (R-29): in a packet, where another
+    #: report's numbering is the likeliest reason for a refusal, or on a scan
+    #: nothing bounds. Rows in an unsettled run are named by R-28 instead.
+    report: bool = False
+
+
 class LossRunDocument(BaseModel):
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
@@ -543,6 +692,18 @@ class LossRunDocument(BaseModel):
     policy_periods: list[tuple[date, date]] = Field(default_factory=list)
     #: Per-term subtotals the carrier printed, for checking each term's claims.
     printed_sections: list[PrintedSection] = Field(default_factory=list)
+    #: The loss runs this packet binds, when it binds more than one. Empty for
+    #: a single loss run, which is the whole document. Each run is reconciled
+    #: on its own against what it printed; see :class:`LogicalRun`.
+    runs: list[LogicalRun] = Field(default_factory=list)
+    #: A lone report whose own numbering stops before its declared last page:
+    #: pages it holds are absent from the PDF. None for a packet, whose
+    #: incompleteness lives on the run, and for a report that prints no
+    #: numbering or printed its own last page. R-28 reads it.
+    incomplete_report: str | None = None
+    #: Rows that read as claims but whose claim number was refused. Recorded,
+    #: never silently absorbed; see :class:`RefusedClaimRow`.
+    refused_claim_rows: list[RefusedClaimRow] = Field(default_factory=list)
     #: Claim rows found on each page before stitching, so R-19 can tell whether
     #: dropping repeated headers and subtotals also dropped a claim.
     rows_seen_per_page: dict[int, int] = Field(default_factory=dict)
@@ -656,6 +817,19 @@ class LossRunDocument(BaseModel):
             return "credits, normalised to positive amounts"
         return "positive amounts"
 
+    @property
+    def is_packet(self) -> bool:
+        """Whether this PDF binds more than one loss run."""
+        return len(self.runs) > 1
+
+    def run_of(self, page: int | None) -> LogicalRun | None:
+        """The logical run holding a page, or None for a single loss run."""
+        return next((run for run in self.runs if run.holds(page)), None)
+
+    def run_claims(self, run: LogicalRun) -> list[Claim]:
+        """The claims read from this run's pages, in document order."""
+        return [claim for claim in self.claims if run.holds(claim.source_page)]
+
     def column_total(self, field: str) -> Decimal:
         """Sum of a money column across claims, ignoring nulls.
 
@@ -708,6 +882,9 @@ class Finding(BaseModel):
     actual: Decimal | int | str | None = None
     delta: Decimal | None = None
     page: int | None = None
+    #: The logical run this finding was raised in, for a packet binding
+    #: several. None on a single loss run, where the document is the run.
+    run_id: str | None = None
 
     @model_validator(mode="after")
     def _identity_is_complete(self) -> "Finding":
@@ -831,13 +1008,15 @@ def finding_key(finding: "Finding") -> str:
     """
     # A JSON tuple is readable and cannot collide when a label contains a
     # delimiter. Concatenating with '|' made boundary placement ambiguous.
-    return json.dumps(
-        [finding.rule_id, finding.category.value, finding.scope.value,
-         finding.subject, finding.field or "", finding.condition,
-         sorted(finding.related_rows)],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    identity = [finding.rule_id, finding.category.value, finding.scope.value,
+                finding.subject, finding.field or "", finding.condition,
+                sorted(finding.related_rows)]
+    # Two runs in one packet each print a total, and the same rule checking
+    # each is two findings. The run joins the key only where there is one, so
+    # every decision already recorded against a single loss run still matches.
+    if finding.run_id is not None:
+        identity.append(finding.run_id)
+    return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
 
 
 class Resolution(BaseModel):
@@ -961,6 +1140,10 @@ class ReconciliationResult(BaseModel):
 
     status: DocumentStatus
     findings: list[Finding] = Field(default_factory=list)
+    #: Each logical run's own status, for a packet binding several. The
+    #: document is NEEDS_REVIEW whenever any run is, or any boundary is not
+    #: settled; empty for a single loss run.
+    run_status: dict[str, DocumentStatus] = Field(default_factory=dict)
 
     @property
     def errors(self) -> list[Finding]:
@@ -1158,6 +1341,15 @@ class RawTable(BaseModel):
     #: layer to read these from, so the vision pass reports them here.
     printed_claim_count: int | None = None
     valuation_date_text: str | None = None
+    #: The page numbering and the heading the vision model read in the page's
+    #: furniture -- what a scanned page says about which report it belongs
+    #: to. Readings, not measurements; the digital path measures its own.
+    page_label: str | None = None
+    page_label_index: int | None = None
+    page_label_count: int | None = None
+    #: header | footer. A number the model found anywhere else is not kept.
+    page_label_position: str | None = None
+    heading: str | None = None
 
     @property
     def column_count(self) -> int:

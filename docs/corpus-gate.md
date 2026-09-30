@@ -128,7 +128,10 @@ For every document, both commits' results are compared field by field:
 | Group | Compared as |
 | --- | --- |
 | `claim_count` | integer (**critical**) |
-| `status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) |
+| `status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) -- the engine's own status (any ERROR) |
+| `review_status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) -- the canonical trust status every layer shows (`core.review.canonical_status`); a revision that predates the function is measured under the same policy |
+| `runs` | number of logical runs, whether the document is a packet, unsettled and incomplete runs; for a packet, per run (keyed by position): run id, pages, boundary confidence, whether settled and complete, claims held and a digest of them, refused and unplaced rows on its pages, printed claim count, which printed totals it has, engine and canonical status, R-04 and R-05 counts, digests of its boundary evidence and of its own carrier/policy/term/valuation facts |
+| `refused` | claim-like rows the claim-number vote refused: count, how many a rule reports, per page, and a digest |
 | `pages` | processed, failed, skipped, unresolved and scanned page lists; page count; column-split pages; rows seen per page; a digest of each unresolved page's reason |
 | `unplaced` | count of rows whose money could not be placed, per page and in total; digest of their content |
 | `printed` | printed claim count; a digest per printed total column; unreadable totals, count evidence and printed sections, as counts and digests |
@@ -139,9 +142,69 @@ For every document, both commits' results are compared field by field:
 | `warnings` | count and digest |
 | per document | whether the pipeline raised or a measurement could not be taken, and the exception's type name |
 
+A document without logical runs is measured as one run however a revision
+represents it -- no `runs` attribute at all, `runs=[]`, or a single run -- and
+refused rows a revision does not record are measured as none. So moving from
+one representation to another is never a change in itself; a packet read as
+one report, or a claim moving between runs, is. A finding's identity includes
+its `run_id`, so the same rule on the same claim in two runs is two findings.
+
 A field one commit reports and the other does not is a change. Values are
 compared as JSON values, type included: `true` is not `1`, and `1` is not
 `1.0`, at any depth. Timing is recorded and never compared.
+
+## Scanned pages: recorded vision answers
+
+By default the collector runs with vision off, so a scanned page is measured
+as unread on both sides. To protect the scanned path too, record the model's
+answer for each scanned page once, against the live model, and replay it:
+
+```
+python - <<'PY'
+from pathlib import Path
+from core.extract_vision import recording_extractor
+from core.pipeline import run_pipeline
+for pdf in sorted(Path("<corpus directory>").glob("*.pdf")):
+    run_pipeline(pdf, vision_extractor=recording_extractor("<recordings directory>"))
+PY
+python -m tools.corpus_gate run ... --vision-replay <recordings directory>
+```
+
+A recording is keyed by the document's SHA-256, the page, the render DPI, the
+model, the prompt and the response schema (`core.extract_vision.recording_key`).
+Replay never renders, needs no key and reaches no network. A page with no
+recording for the current prompt and model is a failed page, named in the
+warnings, so a prompt change shows up as a change until it is recorded again --
+never as a page silently read empty. A recording holds what the model
+transcribed off a real document: it lives outside the repository beside the
+corpus (the gate refuses one inside the working tree) under the same
+protections. A revision that cannot replay fails to start rather than being
+measured without its scanned pages.
+
+Not yet done: the cloud workflow does not carry recordings, so the browser
+gate still measures scanned pages as unread. Adding them means shipping the
+recordings in the private corpus release and mounting them read-only into
+the sandbox, which the local sandboxed run already does.
+
+## Labels: what a person judged each document to be
+
+The gate is a correctness check and reads no labels. For analysis -- review
+rates by carrier, by scan quality, for packets against single reports --
+label each document in a separate file keyed by its manifest id:
+
+```
+python -m tools.corpus_gate init-labels --manifest <manifest file> --labels <labels file>
+```
+
+writes every manifest document with every label unknown (null): carrier,
+template family, line of business, digital / scanned / mixed, scan-quality
+band, single report or packet, expected run count, whether printed totals and
+a printed claim count are present, and a claim-count band
+(`tools/corpus_gate/labels.py`). Only what a person assigns lives there;
+what the collector measures (detected runs, method, status, refused and
+unplaced counts) is joined by id, never copied in. The file names real
+carriers, so it lives outside the repository beside the manifest, and the
+manifest itself is never touched by relabelling.
 
 ## Privacy
 

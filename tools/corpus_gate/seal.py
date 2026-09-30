@@ -58,8 +58,10 @@ RAW = re.compile(r"r:[A-Za-z0-9_-]*")
 PAGE_KEY = re.compile(r"0|[1-9][0-9]{0,4}")
 GROUPS = (
     "claim_count", "status", "extraction_method", "pages", "unplaced", "printed",
-    "findings", "summary", "claims", "metadata", "warnings",
+    "findings", "summary", "claims", "metadata", "warnings", "review_status", "runs",
+    "refused",
 )
+MAX_RUNS = 1_000
 BUILTIN_ERRORS = frozenset(
     name for name in dir(builtins)
     if isinstance(getattr(builtins, name), type) and issubclass(getattr(builtins, name), BaseException)
@@ -71,7 +73,16 @@ MAP_PATHS = (
     "pages.unresolved_reasons", "pages.rows_seen_per_page", "unplaced.by_page",
     "printed.totals", "findings.by_rule", "findings.by_rule_severity",
     "findings.by_rule_category", "findings.by_rule_scope", "findings.identity",
-    "findings.detail", "claims.fields", "claims.null_counts",
+    "findings.detail", "claims.fields", "claims.null_counts", "refused.by_page",
+)
+#: Maps whose values are objects: the key (a run's position) collapses to
+#: ``*`` and the field beneath it is kept, so a change reads
+#: ``runs.items.*.status`` rather than just "some run".
+OBJECT_MAP_PATHS = ("runs.items",)
+RUN_ITEM_KEYS = (
+    "run_id", "pages", "confidence", "ambiguous", "incomplete", "claims", "claims_digest",
+    "refused", "unplaced", "printed_claim_count", "printed_totals", "engine_status",
+    "status", "r04", "r05", "evidence", "facts",
 )
 
 
@@ -342,6 +353,54 @@ class Sealer:
             for name in collect.METADATA_FIELDS
         }
 
+    def refused(self, value: Any) -> dict[str, Any]:
+        value = self.exact(value, ("count", "reported", "by_page", "digest"))
+        count = self.integer(value["count"])
+        return {
+            "count": count,
+            "reported": self.integer(value["reported"], 0, count),
+            "by_page": self.mapped(value["by_page"], MAX_LIST, self.page_key, self.integer),
+            "digest": self.digest(value["digest"]),
+        }
+
+    def run_item(self, value: Any) -> dict[str, Any]:
+        value = self.exact(value, RUN_ITEM_KEYS)
+        return {
+            "run_id": self.token(value["run_id"], collect.RUN_ID),
+            "pages": self.pages_list(value["pages"]),
+            "confidence": self.token(value["confidence"], collect.LOWER_TOKEN),
+            "ambiguous": self.boolean(value["ambiguous"]),
+            "incomplete": self.boolean(value["incomplete"]),
+            "claims": self.integer(value["claims"]),
+            "claims_digest": self.digest(value["claims_digest"]),
+            "refused": self.integer(value["refused"]),
+            "unplaced": self.integer(value["unplaced"]),
+            "printed_claim_count": self.countish(value["printed_claim_count"]),
+            "printed_totals": self.listed(value["printed_totals"], MAX_NAMED_KEYS, self.name_key),
+            "engine_status": self.nullable(
+                value["engine_status"], lambda v: self.token(v, collect.UPPER_TOKEN)),
+            "status": self.token(value["status"], collect.UPPER_TOKEN),
+            "r04": self.integer(value["r04"]),
+            "r05": self.integer(value["r05"]),
+            "evidence": self.digest(value["evidence"]),
+            "facts": self.digest(value["facts"]),
+        }
+
+    def runs(self, value: Any) -> dict[str, Any]:
+        value = self.exact(value, ("count", "packet", "unsettled", "incomplete", "items"))
+        count = self.integer(value["count"], 1, MAX_RUNS)
+        packet = self.boolean(value["packet"])
+        items = self.mapped(value["items"], MAX_RUNS, self.page_key, self.run_item)
+        if packet != (count > 1) or len(items) != (count if packet else 0):
+            raise Rejected("runs whose count, packet flag and items disagree")
+        return {
+            "count": count,
+            "packet": packet,
+            "unsettled": self.integer(value["unsettled"], 0, count),
+            "incomplete": self.integer(value["incomplete"], 0, count),
+            "items": items,
+        }
+
     def metrics(self, value: Any) -> dict[str, Any]:
         value = self.exact(value, GROUPS)
         return {
@@ -356,6 +415,9 @@ class Sealer:
             "claims": self.claims(value["claims"]),
             "metadata": self.metadata(value["metadata"]),
             "warnings": self.nullable(value["warnings"], self.counted),
+            "review_status": self.token(value["review_status"], collect.UPPER_TOKEN),
+            "runs": self.runs(value["runs"]),
+            "refused": self.refused(value["refused"]),
         }
 
     def document(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -472,7 +534,11 @@ def _read(path: Path, run: comparison.RevisionRun, manifest: Manifest) -> None:
 
 def _paths() -> tuple[str, ...]:
     paths = ["claim_count", "status", "extraction_method", "pages", "unplaced", "printed",
-             "findings", "summary", "claims", "metadata", "warnings"]
+             "findings", "summary", "claims", "metadata", "warnings", "review_status", "runs",
+             "refused"]
+    paths += [f"runs.{name}" for name in ("count", "packet", "unsettled", "incomplete", "items")]
+    paths += [f"runs.items.*.{name}" for name in RUN_ITEM_KEYS]
+    paths += [f"refused.{name}" for name in ("count", "reported", "by_page", "digest")]
     paths += [f"pages.{name}" for name in (*collect.PAGE_SETS, "unresolved_reasons", "page_count",
                                             "column_split_pages", "rows_seen_per_page")]
     paths += [f"unplaced.{name}" for name in ("count", "by_page", "digest")]
@@ -499,11 +565,17 @@ OTHER_PATH = "other"
 def schema_path(path: str) -> str:
     """A change's path with every free map key collapsed to ``*``."""
     parts = path.split(".")
-    for name in MAP_PATHS:
+    for name in OBJECT_MAP_PATHS:
         prefix = name.split(".")
         if parts[: len(prefix)] == prefix and len(parts) > len(prefix):
-            parts = [*prefix, "*"]
+            parts = [*prefix, "*", *parts[len(prefix) + 1:]]
             break
+    else:
+        for name in MAP_PATHS:
+            prefix = name.split(".")
+            if parts[: len(prefix)] == prefix and len(parts) > len(prefix):
+                parts = [*prefix, "*"]
+                break
     collapsed = ".".join(parts)
     return collapsed if collapsed in KNOWN_PATHS else OTHER_PATH
 
@@ -535,9 +607,9 @@ def public_result(outcome: comparison.Outcome, manifest: Manifest, verified: int
             if change.path == "claim_count":
                 entry["claim_count"] = {"baseline": _claim_count(change.baseline),
                                         "candidate": _claim_count(change.candidate)}
-            elif change.path == "status":
-                entry["status"] = {"baseline": _status(change.baseline),
-                                   "candidate": _status(change.candidate)}
+            elif change.path in ("status", "review_status"):
+                entry[change.path] = {"baseline": _status(change.baseline),
+                                      "candidate": _status(change.candidate)}
         documents[doc_id] = entry
     return {
         "gate": {"schema": 2, "verdict": outcome.verdict, "exit_code": outcome.exit_code,
@@ -630,7 +702,8 @@ def validate_public(result: Any) -> dict[str, Any]:
     _need(isinstance(documents, dict) and len(documents) == total, "a document count mismatch")
     for doc_id, document in documents.items():
         _need(DOCUMENT_ID.fullmatch(doc_id) is not None, "a bad document id")
-        document = _keys(document, ("sha256", "state", "changed"), ("claim_count", "status"))
+        document = _keys(document, ("sha256", "state", "changed"),
+                         ("claim_count", "status", "review_status"))
         _need(isinstance(document["sha256"], str)
               and re.fullmatch(r"[0-9a-f]{64}", document["sha256"]) is not None, "a bad document hash")
         _need(document["state"] in STATES, "a bad document state")
@@ -643,10 +716,11 @@ def validate_public(result: Any) -> dict[str, Any]:
             for value in pair.values():
                 _need(value in ("absent", None) or (type(value) is int and 0 <= value <= MAX_INT),
                       "a bad claim count")
-        if "status" in document:
-            pair = _keys(document["status"], ("baseline", "candidate"))
-            for value in pair.values():
-                _need(value in STATUS_VOCAB | {"absent", "unlisted"}, "a bad status")
+        for name in ("status", "review_status"):
+            if name in document:
+                pair = _keys(document[name], ("baseline", "candidate"))
+                for value in pair.values():
+                    _need(value in STATUS_VOCAB | {"absent", "unlisted"}, "a bad status")
     return result
 
 
@@ -669,7 +743,7 @@ def render_public(result: dict[str, Any]) -> str:
         if not document["changed"]:
             continue
         lines += ["", f"{doc_id} ({document['state']})"]
-        for name in ("claim_count", "status"):
+        for name in ("claim_count", "status", "review_status"):
             if name in document:
                 pair = document[name]
                 lines.append(f"  critical  {name}: {pair['baseline']} -> {pair['candidate']}")

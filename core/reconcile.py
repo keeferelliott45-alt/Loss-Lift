@@ -29,11 +29,14 @@ from core.schema import (
     Finding,
     FindingScope,
     FindingCategory,
+    LogicalRun,
     LossRunDocument,
     NullReason,
     ReconciliationResult,
     Severity,
+    SourceMethod,
     finding_key,
+    split_is_settled,
     sum_present,
 )
 
@@ -1384,6 +1387,140 @@ def r27_unresolved_claim_count(
     ]
 
 
+@rule("R-28")
+def r28_unsettled_run_boundary(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """A packet whose pages do not settle where one loss run ends is reviewed.
+
+    The runs a packet binds are drawn from what each page prints about itself
+    (see :mod:`core.runs`). Where that evidence breaks -- a report stops short
+    of its own last page and the next page prints no number, a page's number
+    does not follow the one before, an unnumbered page follows a finished
+    report under the same heading -- nothing printed says whether those pages
+    continue the report or begin another. They are kept as a run of their own
+    and read under the claim numbering of the run before them, never dropped
+    and never voted on alone; this rule says so, names the pages and the
+    evidence, and lists every row there that read as a claim but was refused.
+    """
+    findings: list[Finding] = []
+    for run in doc.runs:
+        if run.incomplete:
+            findings.append(Finding(
+                rule_id="R-28",
+                severity=Severity.ERROR,
+                category=FindingCategory.EXTRACTION,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition=f"{run.run_id}:incomplete",
+                run_id=run.run_id,
+                page=max(run.pages),
+                message=(
+                    f"The loss run on page(s) {run.page_range} is incomplete: "
+                    f"{run.incomplete}. Claims on its missing pages are not in this "
+                    f"reading; confirm the PDF holds the whole report before exporting."
+                ),
+                expected="every page the report numbers",
+                actual=run.incomplete,
+            ))
+        if not run.ambiguous:
+            continue
+        refused = [row for row in doc.refused_claim_rows if run.holds(row.page)]
+        listed = "; ".join(
+            f"page {row.page}" + (f" line {row.row + 1}" if row.row is not None else "")
+            + f" ({row.identifier})"
+            for row in refused[:10]
+        )
+        more = f" and {len(refused) - 10} more" if len(refused) > 10 else ""
+        tail = (
+            f" {len(refused)} row(s) there read as claims but their claim numbers "
+            f"were refused: {listed}{more}."
+            if refused else ""
+        )
+        findings.append(Finding(
+            rule_id="R-28",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=run.run_id,
+            run_id=run.run_id,
+            page=min(run.pages),
+            message=(
+                f"Where the loss run on page(s) {run.page_range} begins is not "
+                f"settled: {run.ambiguity}. Its claims are kept and read under the "
+                f"claim numbering of the run before it.{tail} Confirm where this "
+                f"report begins before exporting."
+            ),
+            expected="page furniture settling where the run begins",
+            actual=run.ambiguity or "unsettled",
+        ))
+    if doc.incomplete_report and not doc.runs:
+        # A lone report carries no run, so its own numbering stopping short is
+        # held on the document and named here instead.
+        findings.append(Finding(
+            rule_id="R-28",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition="incomplete",
+            page=doc.page_count or None,
+            message=(
+                f"The loss run is incomplete: {doc.incomplete_report}. Claims on "
+                f"its missing pages are not in this reading; confirm the PDF holds "
+                f"the whole report before exporting."
+            ),
+            expected="every page the report numbers",
+            actual=doc.incomplete_report,
+        ))
+    return findings
+
+
+@rule("R-29")
+def r29_refused_claims_on_unbounded_scans(
+    doc: LossRunDocument, config: ReconcileConfig
+) -> list[Finding]:
+    """Claim-like rows refused where another report's numbering may be why.
+
+    The claim-number vote is taken per loss run. Where nothing printed bounds
+    the runs -- no page numbers anywhere, or pages joined to a run with nothing
+    confirming them -- one vote may pool two reports, and a larger one
+    outvotes a smaller. In a packet, another report's numbering is the
+    likeliest reason a well-formed identifier is refused at all. A row
+    carrying such an identifier and a loss date or status of its own, refused
+    there, may be another report's claim: it is not dropped quietly -- the
+    document is reviewed and the rows are named.
+    """
+    refused = [row for row in doc.refused_claim_rows if row.report]
+    if not refused:
+        return []
+    listed = "; ".join(
+        f"page {row.page}" + (f" line {row.row + 1}" if row.row is not None else "")
+        + f" ({row.identifier})"
+        for row in refused[:10]
+    )
+    more = f" and {len(refused) - 10} more" if len(refused) > 10 else ""
+    pages = sorted({row.page for row in refused})
+    return [Finding(
+        rule_id="R-29",
+        severity=Severity.ERROR,
+        category=FindingCategory.EXTRACTION,
+        scope=FindingScope.DOCUMENT,
+        subject="document",
+        page=pages[0],
+        message=(
+            f"{len(refused)} row(s) on page(s) "
+            f"{', '.join(str(page) for page in pages)} read as claims -- a claim "
+            f"number and a loss date or status -- but their claim numbers were "
+            f"refused by a vote that may have pooled more than one loss run's "
+            f"numbering. They may be another report's claims: {listed}{more}."
+        ),
+        expected="every claim-like row read as a claim or bounded to its run",
+        actual=len(refused),
+    )]
+
+
 # --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
@@ -1391,15 +1528,237 @@ def r27_unresolved_claim_count(
 #: Findings sort by severity first so the exceptions panel leads with errors.
 _SEVERITY_ORDER = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
 
+#: Rules about how the packet is divided, asked once of the whole document.
+_PACKET_RULES = ("R-28",)
+
+#: Rules that check the claims against what the carrier printed about them:
+#: its total, its count, its subtotals, and the totals and counts it could not
+#: be read for. Across a settled split each run answers them for itself; across
+#: an unsettled one, which run a printed figure belongs to is not known, so
+#: they are asked once of the whole document the figures were read from.
+_PRINTED_EVIDENCE_RULES = ("R-04", "R-05", "R-25", "R-26", "R-27")
+
+#: Rules about what the document states once for every run -- its valuation
+#: date, currency, column mapping, page accounting, split pages. Raised alike
+#: in every run, they are one fact and reported once. Every other rule checks
+#: a run against itself, and two runs failing it alike are two findings.
+_DOCUMENT_WIDE = frozenset({"R-06", "R-15", "R-16", "R-18", "R-21", "R-22", "R-24"})
+
+
+def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
+    """One loss run of a packet, as a document of its own for the rules.
+
+    Its claims, what it printed about itself -- carrier, insured, policy and
+    its term, line of business, valuation date, totals and count -- and the
+    rows found on its pages. Nothing is taken from another run's letterhead:
+    where the run does not say, the fact is unknown for it, so R-09 is not
+    judged against another report's term and R-06 is raised for a run that
+    prints no valuation date of its own. What the document states once for
+    every page -- page accounting, the mapping -- is left as it is, so a
+    finding about it is the same finding in every run and is reported once.
+    """
+    return doc.model_copy(update={
+        "claims": doc.run_claims(run),
+        "carrier": run.carrier,
+        "named_insured": run.named_insured,
+        "policy_number": run.policy_number,
+        "policy_period_start": run.policy_period_start,
+        "policy_period_end": run.policy_period_end,
+        "line_of_business": run.line_of_business,
+        "valuation_date": run.valuation_date,
+        "printed_totals": dict(run.printed_totals),
+        "printed_claim_count": run.printed_claim_count,
+        "printed_count_evidence": list(run.printed_count_evidence),
+        "unreadable_totals": dict(run.unreadable_totals),
+        "unreadable_totals_page": run.unreadable_totals_page,
+        "unreadable_totals_row": run.unreadable_totals_row,
+        "printed_sections": [s for s in doc.printed_sections if run.holds(s.page)],
+        "rows_seen_per_page": {
+            page: seen for page, seen in doc.rows_seen_per_page.items() if run.holds(page)
+        },
+        "unplaced_rows": [row for row in doc.unplaced_rows if run.holds(row.page)],
+        "refused_claim_rows": [
+            row for row in doc.refused_claim_rows if run.holds(row.page)
+        ],
+        "runs": [],
+        "incomplete_report": None,
+    })
+
 
 def reconcile(
     doc: LossRunDocument, config: ReconcileConfig | None = None
 ) -> ReconciliationResult:
-    """Run every rule and return the findings plus the document badge."""
+    """Run every rule and return the findings plus the document badge.
+
+    A packet binding several loss runs is reconciled one run at a time, each
+    against what it printed about itself: its own total, its own claim count,
+    its own claims. A finding about one run carries its ``run_id``. A finding
+    every run raises alike -- about the document as a whole -- is reported
+    once. The packet needs review whenever any run does, or any boundary
+    between runs is not settled.
+    """
+    if not doc.is_packet:
+        return _reconcile_one(doc, config)
+    config = config or ReconcileConfig()
+
+    settled = split_is_settled(doc.runs)
+
+    def skipped(run: LogicalRun) -> tuple[str, ...]:
+        if settled:
+            return _PACKET_RULES
+        # R-20 on a run whose boundary is unsettled says only that the pages
+        # the planner split off hold no claims, which R-28 already names; the
+        # whole document is asked instead, below.
+        return _PACKET_RULES + _PRINTED_EVIDENCE_RULES + (("R-20",) if run.ambiguous else ())
+
+    per_run: list[tuple[LogicalRun, ReconciliationResult]] = [
+        (run, _reconcile_one(run_view(doc, run), config, skip=skipped(run)))
+        for run in doc.runs
+    ]
+
+    def shared(finding: Finding) -> tuple:
+        return (finding_key(finding), finding.message, str(finding.expected),
+                str(finding.actual))
+
+    everywhere = set.intersection(*(
+        {shared(f) for f in result.findings
+         if f.rule_id in _DOCUMENT_WIDE
+         and f.scope in (FindingScope.DOCUMENT, FindingScope.COLUMN)}
+        for _run, result in per_run
+    )) if per_run else set()
+
+    findings: list[Finding] = []
+    reported: set[tuple] = set()
+    run_status: dict[str, DocumentStatus] = {}
+    for run, result in per_run:
+        run_status[run.run_id] = result.status
+        for finding in result.findings:
+            key = shared(finding)
+            if key in everywhere:
+                if key not in reported:
+                    reported.add(key)
+                    findings.append(finding)
+                continue
+            findings.append(finding.model_copy(update={"run_id": run.run_id}))
+
+    if not settled:
+        whole_rules = set(_PRINTED_EVIDENCE_RULES) | {"R-20"}
+        whole = _reconcile_one(
+            doc.model_copy(update={"runs": []}),
+            config,
+            skip=[rule_id for rule_id, _fn in _RULES if rule_id not in whole_rules],
+        )
+        findings.extend(whole.findings)
+
+    if "R-28" not in config.disabled_rules:
+        for finding in r28_unsettled_run_boundary(doc, config):
+            findings.append(finding)
+            run_status[finding.run_id] = DocumentStatus.NEEDS_REVIEW
+    if "R-11" not in config.disabled_rules:
+        findings.extend(_claims_in_two_runs(doc))
+    if "R-15" not in config.disabled_rules:
+        findings.extend(_borrowed_conventions(doc))
+
+    keys = [finding_key(finding) for finding in findings]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(
+            "reconciliation produced duplicate finding identities: " + ", ".join(duplicates)
+        )
+    order = {run.run_id: index for index, run in enumerate(doc.runs)}
+    findings.sort(
+        key=lambda f: (
+            _SEVERITY_ORDER[f.severity],
+            f.rule_id,
+            f.claim_number or "",
+            f.field or "",
+            order.get(f.run_id, -1),
+        )
+    )
+    status = (
+        DocumentStatus.NEEDS_REVIEW
+        if any(f.severity is Severity.ERROR for f in findings)
+        else DocumentStatus.CLEAN
+    )
+    return ReconciliationResult(status=status, findings=findings, run_status=run_status)
+
+
+def _claims_in_two_runs(doc: LossRunDocument) -> list[Finding]:
+    """The same claim -- number and date of loss -- read in two runs of a packet.
+
+    A summary page repeating a report's large losses, or one report bound in
+    twice, puts the same claim in the packet twice, and each run on its own
+    finds nothing wrong. Two carriers can share a claim number; sharing the
+    date of loss as well is the same claim counted twice.
+    """
+    seen: dict[tuple[str, object], list[tuple[str, str]]] = {}
+    for run in doc.runs:
+        for claim in doc.run_claims(run):
+            if claim.date_of_loss is None:
+                continue
+            seen.setdefault((claim.claim_number, claim.date_of_loss), []).append(
+                (run.run_id, claim.row_id))
+    findings = []
+    for (number, loss_date), places in sorted(seen.items(), key=lambda item: str(item[0])):
+        runs = sorted({run_id for run_id, _row in places})
+        if len(runs) < 2:
+            continue
+        findings.append(Finding(
+            rule_id="R-11",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"across-runs:{number}:{loss_date}",
+            message=(
+                f"Claim {number} (loss date {loss_date}) is read in {', '.join(runs)}: "
+                f"the same claim counted twice across the packet, or two reports "
+                f"repeating it. Confirm which run it belongs to before exporting."
+            ),
+            expected="each claim in one run",
+            actual=", ".join(runs),
+        ))
+    return findings
+
+
+def _borrowed_conventions(doc: LossRunDocument) -> list[Finding]:
+    """A run read under a number format, date order or profile it does not prove.
+
+    Reported under R-15, beside the values that could not be read at all: these
+    were read, but only by assuming another report's convention. A WARN that
+    blocks trust -- the figures may be right, and nothing on the run says so.
+    """
+    return [
+        Finding(
+            rule_id="R-15",
+            severity=Severity.WARN,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition=f"borrowed-convention:{run.run_id}",
+            run_id=run.run_id,
+            message=(
+                f"{run.run_id} (pages {run.page_range}): " + "; ".join(run.borrowed_conventions)
+                + ". Check a few of its values against the PDF before relying on them."
+            ),
+            expected="conventions proven on the run's own pages",
+            actual="; ".join(run.borrowed_conventions),
+        )
+        for run in doc.runs if run.borrowed_conventions
+    ]
+
+
+def _reconcile_one(
+    doc: LossRunDocument,
+    config: ReconcileConfig | None = None,
+    *,
+    skip: Sequence[str] = (),
+) -> ReconciliationResult:
+    """Every rule over one loss run."""
     config = config or ReconcileConfig()
     findings: list[Finding] = []
     for rule_id, fn in _RULES:
-        if rule_id in config.disabled_rules:
+        if rule_id in config.disabled_rules or rule_id in skip:
             continue
         produced = fn(doc, config)
         for finding in produced:

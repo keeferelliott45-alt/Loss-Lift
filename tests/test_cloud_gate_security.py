@@ -468,11 +468,18 @@ def _result():
         return SimpleNamespace(page=page, text="Jane Q. Sentinelle 1250.00")
 
     claims = [SimpleNamespace(claim_number=f"SNTL-{n}", claimant_name="Jane Q. Sentinelle",
-                              incurred_total="1250.00") for n in range(3)]
+                              incurred_total="1250.00", source_page=1 + n % 2) for n in range(3)]
     finding = SimpleNamespace(rule_id="R-01", severity="ERROR", category="financial", scope="claim",
                               subject="SNTL-1", condition="c", field=None, page=1,
                               claim_number="SNTL-1", related_rows=(), message="Jane", expected=1,
-                              actual=2, delta=1)
+                              actual=2, delta=1, run_id="run-2")
+
+    def run(run_id, pages):
+        return SimpleNamespace(
+            run_id=run_id, pages=pages, confidence="printed", ambiguous=run_id == "run-2",
+            incomplete=None, printed_totals={"incurred_total": "1250.00"}, printed_claim_count=1,
+            evidence=["Jane's letterhead"], carrier="Sentinel Mutual", named_insured="Jane",
+            policy_number="SNTL-POL", valuation_date="2022-12-31")
     document = SimpleNamespace(
         claims=claims, processed_pages=[1, 2], failed_pages=[], skipped_pages=[3],
         unresolved_pages=[2], scanned_pages=[], unresolved_reasons={2: "Jane's page"}, page_count=3,
@@ -481,9 +488,13 @@ def _result():
         unreadable_totals_page=3, printed_count_evidence=["3 claims"], printed_sections=[
             SimpleNamespace(printed_claim_count=3)],
         printed_claim_count=3, extraction_method="digital", carrier="Sentinel Mutual",
+        runs=[run("run-1", [1]), run("run-2", [2, 3])],
+        refused_claim_rows=[SimpleNamespace(page=2, identifier="SNTL-9 Jane", report=True)],
     )
     return SimpleNamespace(document=document, warnings=["page 2 mentions Jane"],
-                           reconciliation=SimpleNamespace(status="NEEDS_REVIEW", findings=[finding]))
+                           reconciliation=SimpleNamespace(
+                               status="NEEDS_REVIEW", findings=[finding],
+                               run_status={"run-1": "CLEAN", "run-2": "NEEDS_REVIEW"}))
 
 
 def _measure(digest):
@@ -593,7 +604,7 @@ MUTATIONS = list(_mutations())
 
 def test_the_mutation_set_covers_every_group():
     groups = {case[1][1] for case in MUTATIONS if len(case[1]) > 1}
-    assert groups >= set(seal.GROUPS) - {"status", "extraction_method"}
+    assert groups >= set(seal.GROUPS) - {"status", "extraction_method", "review_status"}
     assert len(MUTATIONS) > 150
 
 

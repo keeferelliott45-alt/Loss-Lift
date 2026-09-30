@@ -14,6 +14,7 @@ person running this will have dozens of reports in flight at once.
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 from decimal import Decimal
@@ -23,10 +24,12 @@ import pandas as pd
 import streamlit as st
 
 from core import export as export_module
+from core import telemetry
 from core.review import (
-    finding_key,
-    bucket_of,
     ReviewAction,
+    review_bucket,
+    canonical_status,
+    finding_key,
     summarise_review,
 )
 from core.evidence import (
@@ -53,12 +56,15 @@ from core.pipeline import (
 )
 from core.profiles import list_profiles, llm_enabled
 from core.account import UNNAMED_ACCOUNT, build_accounts
+from core.accounting import claim_accounting
+from core.runs import unsettled_runs
 from core.summary import summarise_by_period
 from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
     MONEY_FIELDS,
     ClaimStatus,
+    DocumentStatus,
     Severity,
 )
 
@@ -121,8 +127,10 @@ def _status_pill(result: ExtractionResult) -> str:
     if result.needs_mapping:
         return '<span class="ll-pill ll-pill-mapping">Needs mapping</span>'
     data_issues, _flags = _split_findings(result.reconciliation.findings)
-    if not data_issues:
+    if canonical_status(result.reconciliation) is DocumentStatus.CLEAN:
         return '<span class="ll-pill ll-pill-clean">✓ Ready</span>'
+    if not data_issues:
+        return '<span class="ll-pill ll-pill-review">Review</span>'
     label = f"Review {len(data_issues)} issue{'s' if len(data_issues) != 1 else ''}"
     return f'<span class="ll-pill ll-pill-review">{label}</span>'
 
@@ -151,7 +159,43 @@ def _state() -> dict[str, Any]:
     # Things worth saying once about the last upload that are not failures —
     # a file read a second time, say.
     st.session_state.setdefault("notices", [])
+    # Local telemetry: counts and tokens only (core/telemetry.py).
+    st.session_state.setdefault("telemetry_session", telemetry.new_session())
+    st.session_state.setdefault("processed_at", {})  # document_id -> monotonic seconds
     return st.session_state
+
+
+def _record_processed(result: ExtractionResult) -> None:
+    state = _state()
+    state["processed_at"][result.document.document_id] = time.monotonic()
+    try:
+        telemetry.emit(telemetry.processed_event(result, session=state["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_review(result: ExtractionResult, entries_before: int) -> None:
+    entries = result.document.review_log.entries[entries_before:]
+    if not entries:
+        return
+    try:
+        telemetry.emit(telemetry.review_events(
+            result, entries, session=_state()["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_export(result: ExtractionResult, fmt: str, redacted: bool) -> None:
+    state = _state()
+    started = state["processed_at"].get(result.document.document_id)
+    try:
+        telemetry.emit(telemetry.export_event(
+            result, fmt=fmt, redacted=redacted, session=state["telemetry_session"],
+            seconds_since_processed=None if started is None
+            else round(time.monotonic() - started, 3),
+        ))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
 
 
 def _result(document_id: str) -> ExtractionResult | None:
@@ -186,8 +230,8 @@ def _status_of(result: ExtractionResult) -> str:
     the open document never disagree about whether it is reconciled."""
     if result.needs_mapping:
         return "mapping"
-    data_issues, _flags = _split_findings(result.reconciliation.findings)
-    return "needs_review" if data_issues else "clean"
+    status = canonical_status(result.reconciliation)
+    return "clean" if status is DocumentStatus.CLEAN else "needs_review"
 
 
 # --------------------------------------------------------------------------
@@ -207,7 +251,7 @@ def _status_of(result: ExtractionResult) -> str:
 # add up; extraction rules ask whether the document could be read at all.
 # Together they are what blocks the reconciled badge -- exactly as before.
 def _is_data_issue(finding) -> bool:
-    return bucket_of(finding) != "underwriting"
+    return review_bucket(finding) != "underwriting"
 
 
 def _split_findings(findings: list) -> tuple[list, list]:
@@ -226,7 +270,7 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     """
     document = result.document
     data_issues, flags = _split_findings(result.reconciliation.findings)
-    passed = not data_issues
+    passed = canonical_status(result.reconciliation) is DocumentStatus.CLEAN
 
     st.markdown(
         f"#### {document.carrier or 'Carrier unknown'}"
@@ -262,6 +306,12 @@ def _reconciliation_card(result: ExtractionResult) -> None:
             if printed_count is not None
             else f"{extracted_count} claims captured"
         )
+        if document.is_packet:
+            # Each run's count and total are its own; see "Loss runs" below.
+            count_line = (
+                f"{extracted_count} claims captured across {len(document.runs)} "
+                f"loss runs in this PDF"
+            )
         st.write(count_line)
 
         printed_incurred = document.printed_totals.get("incurred_total")
@@ -269,7 +319,8 @@ def _reconciliation_card(result: ExtractionResult) -> None:
         cols = st.columns(3)
         cols[0].metric(
             "Carrier total incurred",
-            f"{printed_incurred:,.2f}" if printed_incurred is not None else "not printed",
+            f"{printed_incurred:,.2f}" if printed_incurred is not None
+            else ("per run" if document.is_packet else "not printed"),
         )
         cols[1].metric("LossLift total incurred", f"{extracted_incurred:,.2f}")
         if printed_incurred is not None:
@@ -337,6 +388,8 @@ def _findings_table(result: ExtractionResult) -> None:
                 "Expected": _money(finding.expected),
                 "Actual": _money(finding.actual),
                 "Difference": _money(finding.delta),
+                **({"Run": finding.run_id or "whole packet"}
+                   if result.document.is_packet else {}),
             }
             for finding in findings
         ]
@@ -562,13 +615,14 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
                 st.error("Enter the corrected value, or choose confirm or dismiss.")
             else:
                 try:
-                    _store(
-                        resolve_finding(
-                            result, finding, action,
-                            note=note,
-                            corrected_value=corrected if action is ReviewAction.CORRECTED else None,
-                        )
+                    logged = len(result.document.review_log.entries)
+                    resolved = resolve_finding(
+                        result, finding, action,
+                        note=note,
+                        corrected_value=corrected if action is ReviewAction.CORRECTED else None,
                     )
+                    _store(resolved)
+                    _record_review(resolved, logged)
                 except ValueError as refused:
                     # Nothing was changed and nothing was logged. Say which,
                     # rather than recording a correction that corrected nothing.
@@ -722,6 +776,7 @@ def _extract_uploads(uploads: list[Any]) -> None:
                     f"history do not carry over between uploads."
                 )
             _store(result)
+            _record_processed(result)
             state["staged"][result.document.document_id] = staged
             added += 1
         except IngestError as error:
@@ -965,6 +1020,9 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
             if st.button(f"Prepare {len(selected_ids)} report(s)", type="primary"):
                 state["batch_zip"] = _build_batch_zip(selected_ids, template, redact)
                 state["batch_zip_count"] = len(selected_ids)
+                for document_id in selected_ids:
+                    if (prepared := _result(document_id)) is not None:
+                        _record_export(prepared, "zip", redact)
 
             if state.get("batch_zip"):
                 st.download_button(
@@ -1126,6 +1184,7 @@ def _apply_mapping(
 
     save_confirmed_mapping(updated, mapping, confirmed_by_human=True)
     _store(updated)
+    _record_processed(updated)
     st.success(
         f"Saved. Documents from {updated.document.carrier or 'this carrier'} in "
         f"this format will map themselves from now on."
@@ -1191,6 +1250,63 @@ def _loss_snapshot(document) -> None:
         st.caption(f"No claims at or above {threshold:,.0f}.")
 
 
+def _runs_summary(result: ExtractionResult) -> None:
+    """The loss runs this PDF binds, when it binds more than one.
+
+    A single loss run shows nothing here. A packet shows each run's pages, how
+    its boundary is known and whether it reconciles, and names every page
+    range whose boundary the printed pages did not settle.
+    """
+    accounts = claim_accounting(result.document, result.reconciliation)
+    packet = result.document.is_packet
+    if packet:
+        st.markdown(f"**Loss runs in this PDF ({len(accounts)})**")
+        for run_id, pages, why in unsettled_runs(result.document):
+            st.warning(
+                f"Pages {pages} ({run_id}): where this loss run begins is not settled -- "
+                f"{why}. Its claims are kept and marked for review. Check the PDF and "
+                f"confirm which report these pages belong to before exporting."
+            )
+    # What was accounted for, and what could not be: shown open for a packet
+    # or anything unaccounted, folded away for a single clean report.
+    unaccounted = any(a.refused_rows or a.unplaced_rows or not a.boundary_settled
+                      for a in accounts)
+    with st.expander("What LossLift accounted for", expanded=packet or unaccounted):
+        st.dataframe(
+            [
+                {
+                    "Run": a.run_id or "whole document",
+                    "Pages": a.pages,
+                    "Carrier": a.carrier or "",
+                    "Policy term": (f"{a.policy_term_start or '?'} to {a.policy_term_end or '?'}"
+                                    if a.policy_term_start or a.policy_term_end else ""),
+                    "Printed claim count": a.printed_claim_count,
+                    "Claims read": a.claims_read,
+                    "Refused claim-like rows": a.refused_rows,
+                    "Unplaced rows": a.unplaced_rows,
+                    "Printed totals": a.totals,
+                    "Claim count": a.claim_count,
+                    "Boundary settled": "yes" if a.boundary_settled else "no",
+                    "Status": "Reconciled" if a.status is DocumentStatus.CLEAN
+                    else "Needs review",
+                }
+                for a in accounts
+            ],
+            hide_index=True, width="stretch",
+        )
+        for a in accounts:
+            where = a.run_id or "This document"
+            if a.refused_pages:
+                st.caption(f"{where}: claim-like rows refused on page(s) "
+                           f"{', '.join(map(str, a.refused_pages))} -- open those pages "
+                           f"to check them.")
+            if a.unplaced_pages:
+                st.caption(f"{where}: rows with amounts no claim took on page(s) "
+                           f"{', '.join(map(str, a.unplaced_pages))}.")
+            for reason in a.reasons[:5]:
+                st.caption(f"{where} needs review -- {reason}")
+
+
 def _period_summary(document) -> None:
     """Claims by policy term — the loss history a submission actually asks for.
 
@@ -1251,14 +1367,16 @@ def _accounts_panel() -> None:
     since merging one run with nothing is the review screen again.
     """
     state = _state()
-    documents = [
-        state["documents"][did].document
+    results = [
+        state["documents"][did]
         for did in state["order"]
         if not state["documents"][did].needs_mapping
     ]
+    documents = [result.document for result in results]
+    reconciliations = {result.document.document_id: result.reconciliation for result in results}
     accounts = [
         account
-        for account in build_accounts(documents)
+        for account in build_accounts(documents, reconciliations)
         if len(account.documents) > 1 and account.name != UNNAMED_ACCOUNT
     ]
     if not accounts:
@@ -1270,15 +1388,25 @@ def _accounts_panel() -> None:
         "in more than one run, the newest valuation is the one carried forward."
     )
     for account in accounts:
+        clean = account.status is DocumentStatus.CLEAN
         with st.expander(
-            f"{account.name} — {len(account.documents)} loss runs, "
+            f"{'✓' if clean else '⚠'} {account.name} — {len(account.sources)} loss runs, "
             f"{len(account.histories)} claims"
+            + ("" if clean else " — needs review")
         ):
+            if not clean:
+                st.warning(
+                    "This merged history is not reconciled. "
+                    + "; ".join(account.reasons()[:6])
+                    + ". Claims from those runs are included and marked; resolve "
+                    "them before relying on the totals."
+                )
             st.caption(
                 "Valued at "
                 + ", ".join(d.isoformat() for d in account.valuation_dates)
                 + " · " + ", ".join(
-                    d.source_filename for d in account.documents
+                    s.source_filename + (f" ({s.run_id})" if s.run_id else "")
+                    for s in account.sources
                 )
             )
             st.dataframe(
@@ -1309,6 +1437,8 @@ def _accounts_panel() -> None:
                             "Incurred now": _money(history.current.incurred_total),
                             "Movement": _money(history.development),
                             "Runs": len(history.appearances),
+                            "Review": history.uncertain
+                            or ("" if history.trusted else "run needs review"),
                         }
                         for history in account.developed
                     ],
@@ -1345,6 +1475,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         _document_facts(result)
         _document_notes(result)
 
+    _runs_summary(result)
     _period_summary(result.document)
     _loss_snapshot(result.document)
 
@@ -1383,23 +1514,25 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         num_rows="dynamic",
         width="stretch",
         hide_index=True,
-        column_config=_column_config(columns),
+        column_config=_column_config(columns, packet=result.document.is_packet),
         column_order=list(columns) + list(PROVENANCE_COLUMNS),
     )
 
     edited_records = edited.to_dict("records")
     if edited_records != records:
         previous_document = result.document
+        logged = len(previous_document.review_log.entries)
         try:
             edit_claims(result, edited_records)
         except ValueError as refused:
             st.error(str(refused))
         else:
             if result.document is not previous_document:
+                _record_review(result, logged)
                 st.rerun()
 
 
-def _column_config(columns: list[str]) -> dict[str, Any]:
+def _column_config(columns: list[str], *, packet: bool = False) -> dict[str, Any]:
     config: dict[str, Any] = {}
     for name in columns:
         label = _FIELD_LABELS.get(name, name)
@@ -1419,7 +1552,14 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
         else:
             config[name] = st.column_config.TextColumn(label)
 
-    config["_page"] = st.column_config.NumberColumn("Page", disabled=True, width="small")
+    # In a packet the page decides which loss run a claim belongs to, so a row
+    # added by hand takes the page the reviewer gives it. A row read off the
+    # document keeps the page it was read from, whatever is typed here.
+    config["_page"] = st.column_config.NumberColumn(
+        "Page", disabled=not packet, width="small", min_value=1, step=1,
+        help=("For a claim you add, the page of the loss run it belongs to."
+              if packet else None),
+    )
     config["_row"] = st.column_config.NumberColumn("Line", disabled=True, width="small")
     config["_method"] = st.column_config.TextColumn(
         "Read by", disabled=True, width="small"
@@ -1475,6 +1615,17 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         key=f"download-{document_id}",
+        on_click=_record_export,
+        args=(result, "xlsx", redact),
+    )
+    st.download_button(
+        "Download JSON",
+        data=export_module.to_json_bytes(result.document, result.reconciliation, redact=redact),
+        file_name=export_module.suggested_filename(result.document).rsplit(".", 1)[0] + ".json",
+        mime="application/json",
+        key=f"download-json-{document_id}",
+        on_click=_record_export,
+        args=(result, "json", redact),
     )
     st.caption(
         "Three sheets: Claims, Exceptions, and Source Info with the file hash "

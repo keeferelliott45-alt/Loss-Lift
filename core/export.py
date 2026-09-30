@@ -38,7 +38,13 @@ if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
 from core.evidence import Evidence, EvidenceKind, claim_evidence, confirm_region
 
-from core.review import ReviewAction, ReviewLog, finding_key
+from core.review import (
+    ReviewAction,
+    ReviewLog,
+    canonical_run_status,
+    canonical_status,
+    finding_key,
+)
 from core.schema import (
     DATE_FIELDS,
     MONEY_FIELDS,
@@ -49,6 +55,7 @@ from core.schema import (
     ReconciliationResult,
     Severity,
     SourceMethod,
+    sum_present,
 )
 
 #: Column-order templates offered on the export screen.
@@ -155,12 +162,12 @@ _DOCUMENT_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _plain(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
+
+
 def _document_values(document: LossRunDocument) -> list[Any]:
-    values: list[Any] = []
-    for _, attribute in _DOCUMENT_COLUMNS:
-        value = getattr(document, attribute, None)
-        values.append(value.value if hasattr(value, "value") else value)
-    return values
+    return [_plain(getattr(document, attribute, None)) for _, attribute in _DOCUMENT_COLUMNS]
 
 
 
@@ -255,15 +262,19 @@ def _cell_value(claim: Claim, field_name: str, source_path: Any = None) -> Any:
 
 def _findings_index(
     result: ReconciliationResult | None,
-) -> dict[tuple[str, str], Severity]:
-    """Which (claim, field) pairs carry a finding, and how bad."""
-    index: dict[tuple[str, str], Severity] = {}
+) -> dict[tuple[str | None, str, str], Severity]:
+    """Which (run, claim, field) triples carry a finding, and how bad.
+
+    The run is None on a single loss run. In a packet two runs can number a
+    claim alike, and a finding about one must not shade the other.
+    """
+    index: dict[tuple[str | None, str, str], Severity] = {}
     if result is None:
         return index
     for finding in result.findings:
         if not finding.claim_number or not finding.field:
             continue
-        key = (finding.claim_number, finding.field)
+        key = (finding.run_id, finding.claim_number, finding.field)
         current = index.get(key)
         if current is None or finding.severity is Severity.ERROR:
             index[key] = finding.severity
@@ -284,8 +295,11 @@ def _write_claims_sheet(
 ) -> None:
     findings = _findings_index(result)
     widths: dict[int, int] = {}
+    packet = document.is_packet
 
-    titles = [_title(name) for name in columns] + [
+    # A packet's rows say which of its loss runs they came from, and take the
+    # carrier, insured and policy that run printed where it printed them.
+    titles = [_title(name) for name in columns] + (["Run ID"] if packet else []) + [
         title for title, _ in _DOCUMENT_COLUMNS
     ]
     for column_index, title in enumerate(titles, start=1):
@@ -298,6 +312,8 @@ def _write_claims_sheet(
     document_values = _document_values(document)
 
     for row_index, claim in enumerate(document.claims, start=2):
+        run = document.run_of(claim.source_page) if packet else None
+        run_id = run.run_id if run is not None else None
         for column_index, field_name in enumerate(columns, start=1):
             value = _cell_value(claim, field_name, source_path)
             cell = sheet.cell(row=row_index, column=column_index, value=value)
@@ -307,7 +323,7 @@ def _write_claims_sheet(
             elif field_name in DATE_FIELDS:
                 cell.number_format = DATE_FORMAT
 
-            severity = findings.get((claim.claim_number, field_name))
+            severity = findings.get((run_id, claim.claim_number, field_name))
             if severity is Severity.ERROR:
                 cell.fill = _ERROR_FILL
             elif severity is not None:
@@ -321,7 +337,17 @@ def _write_claims_sheet(
             if value is not None:
                 widths[column_index] = max(widths[column_index], len(str(value)) + 2)
 
-        for offset, value in enumerate(document_values):
+        trailing = list(document_values)
+        if packet:
+            # Only what this claim's own run printed: another run's carrier,
+            # term or valuation date on this row would be a wrong answer that
+            # looks right. Unknown for the run is left blank.
+            trailing = [
+                _plain(getattr(run, attribute, None)) if run is not None else None
+                for _, attribute in _DOCUMENT_COLUMNS
+            ]
+            trailing.insert(0, run_id or "unassigned")
+        for offset, value in enumerate(trailing):
             column_index = len(columns) + 1 + offset
             cell = sheet.cell(row=row_index, column=column_index, value=value)
             if isinstance(value, date):
@@ -351,6 +377,9 @@ def _write_exceptions_sheet(
     headers = ["Rule", "Severity", "Claim number", "Field", "What happened",
                "Expected", "Actual", "Delta", "Page", "Review", "Reviewer note",
                "Subject", "Condition", "Category"]
+    packet = bool(result and result.run_status)
+    if packet:
+        headers.append("Run ID")
     widths: dict[int, int] = {}
     for column_index, title in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
@@ -377,6 +406,8 @@ def _write_exceptions_sheet(
             finding.condition,
             finding.category.value,
         ]
+        if packet:
+            values.append(finding.run_id or "whole packet")
         for column_index, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)
             if column_index in (6, 7, 8) and isinstance(value, float):
@@ -391,6 +422,65 @@ def _write_exceptions_sheet(
     if not findings:
         sheet.cell(row=2, column=1, value="No exceptions. Every check passed.")
 
+    sheet.freeze_panes = "A2"
+    _autosize(sheet, widths)
+
+
+def _write_runs_sheet(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    result: ReconciliationResult | None,
+) -> None:
+    """One row per loss run the packet binds: where it is, how that is known,
+    what it printed about itself, and whether it reconciles.
+
+    Written only for a packet. Every claim on the Claim Detail sheet names its
+    run, and every run's page range and evidence is here to check it against.
+    """
+    headers = [
+        "Run ID", "Pages", "Boundary evidence", "Settled", "Why not settled",
+        "Read by", "Carrier", "Named insured", "Policy number", "Valuation date",
+        "Claims read", "Printed claim count", "Printed incurred total",
+        "Extracted incurred total", "Status", "Policy term",
+    ]
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = len(title) + 2
+    for row_index, run in enumerate(document.runs, start=2):
+        claims = document.run_claims(run)
+        printed = run.printed_totals.get("incurred_total")
+        extracted = sum_present(claim.incurred_total for claim in claims)
+        status = canonical_run_status(result, run.run_id) if result is not None else None
+        values = [
+            run.run_id,
+            run.page_range,
+            "; ".join(item.text for item in run.evidence),
+            "no" if run.ambiguous else "yes",
+            run.ambiguity or "",
+            ", ".join(method.value for method in run.source_methods) or "none",
+            run.carrier or "",
+            run.named_insured or "",
+            run.policy_number or "",
+            run.valuation_date_text or "",
+            len(claims),
+            run.printed_claim_count if run.printed_claim_count is not None else "not printed",
+            float(printed) if printed is not None else "not printed",
+            float(extracted) if extracted is not None else None,
+            status.value if status is not None else "",
+            (f"{run.policy_period_start or '?'} to {run.policy_period_end or '?'}"
+             if run.policy_period_start or run.policy_period_end else "not printed"),
+        ]
+        for column_index, value in enumerate(values, start=1):
+            cell = sheet.cell(row=row_index, column=column_index, value=value)
+            if column_index in (13, 14) and isinstance(value, float):
+                cell.number_format = MONEY_FORMAT
+            if run.ambiguous or status is DocumentStatus.NEEDS_REVIEW:
+                cell.fill = _FINDING_FILL
+            if value is not None:
+                widths[column_index] = max(widths[column_index], min(len(str(value)), 60) + 2)
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
 
@@ -553,7 +643,9 @@ def _write_source_sheet(
     redacted: bool,
     template: str,
 ) -> None:
-    status = result.status if result else DocumentStatus.CLEAN
+    # The same policy as the queue and the review card: a workbook must never
+    # call reconciled a document the app shows as needing review.
+    status = canonical_status(result)
     error_count = len(result.errors) if result else 0
     warn_count = len(result.warnings) if result else 0
 
@@ -648,6 +740,8 @@ def build_workbook(
     claims_sheet.title = "Claim Detail"
     _write_claims_sheet(claims_sheet, document, columns, result, source_path)
     _write_summary_sheet(workbook.create_sheet("Loss Summary"), document)
+    if document.is_packet:
+        _write_runs_sheet(workbook.create_sheet("Runs"), document, result)
     _write_large_loss_sheet(
         workbook.create_sheet("Large Loss"), document, large_loss_threshold
     )
@@ -711,7 +805,8 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     claims_sheet = workbook.active
     claims_sheet.title = "Claims"
     headers = ["Claim number", "Date of loss", "Status", "Carrier", "Valued at",
-               "Paid", "Reserve", "Recovery", "Incurred", "Development", "Runs seen in"]
+               "Paid", "Reserve", "Recovery", "Incurred", "Development", "Runs seen in",
+               "Review"]
     if not redact:
         headers.insert(3, "Claimant")
     widths = _header_row(claims_sheet, headers)
@@ -734,10 +829,14 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
             _float(claim.incurred_total),
             _float(history.development),
             len(history.appearances),
+            (history.uncertain
+             or ("" if history.trusted else "read from a run that needs review")),
         ]
         _fill_row(claims_sheet, row_index, values, widths)
         if history.development and history.development > 0:
-            claims_sheet.cell(row=row_index, column=len(headers) - 1).fill = _FINDING_FILL
+            claims_sheet.cell(row=row_index, column=len(headers) - 2).fill = _FINDING_FILL
+        if not history.trusted:
+            claims_sheet.cell(row=row_index, column=len(headers)).fill = _FINDING_FILL
     claims_sheet.freeze_panes = "A2"
     _autosize(claims_sheet, widths)
 
@@ -758,17 +857,34 @@ def build_account_workbook(account: "AccountRollup", *, redact: bool = False) ->
     _autosize(summary_sheet, widths)
 
     sources_sheet = workbook.create_sheet("Sources")
-    widths = _header_row(sources_sheet, ["File", "Carrier", "Valuation date",
-                                         "Claims", "SHA-256"])
-    for row_index, document in enumerate(account.documents, start=2):
+    widths = _header_row(sources_sheet, ["File", "Run ID", "Carrier", "Policy number",
+                                         "Valuation date", "Claims", "Status", "SHA-256"])
+    for row_index, source in enumerate(account.sources, start=2):
         _fill_row(sources_sheet, row_index, [
-            document.source_filename,
-            document.carrier,
-            document.valuation_date,
-            len(document.claims),
-            document.file_sha256,
+            source.source_filename,
+            source.run_id,
+            source.carrier,
+            source.policy_number,
+            source.valuation_date,
+            len(source.claims),
+            source.status.value if source.status is not None else "NOT RECONCILED",
+            source.file_sha256,
         ], widths)
     _autosize(sources_sheet, widths)
+
+    # Said once, where a recipient opening the workbook looks first after the
+    # claims: whether the merged history can be used as it stands.
+    status_sheet = workbook.create_sheet("Account Status", 0)
+    widths = _header_row(status_sheet, ["Account", "Status", "Why"])
+    reasons = account.reasons() or [""]
+    for row_index, reason in enumerate(reasons, start=2):
+        _fill_row(status_sheet, row_index, [
+            account.name if row_index == 2 else None,
+            ("Reconciled" if account.status is DocumentStatus.CLEAN else "Needs review")
+            if row_index == 2 else None,
+            reason,
+        ], widths)
+    _autosize(status_sheet, widths)
     return workbook
 
 
@@ -803,3 +919,101 @@ def suggested_filename(document: LossRunDocument) -> str:
     valuation = document.valuation_date.isoformat() if document.valuation_date else "no-valuation-date"
     safe = "".join(ch if ch.isalnum() or ch in " -_." else "-" for ch in label).strip()
     return f"{safe} {valuation}.xlsx".replace("  ", " ")
+
+
+# --------------------------------------------------------------------------
+# Machine-readable export
+#
+# The same canonical objects the workbook is written from, as JSON: the
+# document, its logical runs, its claims with their provenance, the
+# reconciliation and every finding with what a reviewer decided about it, the
+# claim accounting, and the canonical status. Nothing is computed here that the
+# workbook does not also show; it exists so a spreadsheet is not the only way
+# out of LossLift. Redaction removes claimant names and loss descriptions
+# everywhere they are held -- the fields, their raw cells, their original
+# values and any review entry about them.
+# --------------------------------------------------------------------------
+
+JSON_SCHEMA = "losslift.result/1"
+
+
+def _redact_claim(record: dict[str, Any]) -> dict[str, Any]:
+    for name in REDACTED_FIELDS:
+        record.pop(name, None)
+        for holder in ("raw_cells", "original_values", "field_confidence", "field_issues",
+                       "original_issues"):
+            if isinstance(record.get(holder), dict):
+                record[holder].pop(name, None)
+        if isinstance(record.get("edited_fields"), list):
+            record["edited_fields"] = [f for f in record["edited_fields"] if f != name]
+    return record
+
+
+def build_json(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    *,
+    redact: bool = False,
+) -> dict[str, Any]:
+    """The canonical result as JSON-native data."""
+    from core.accounting import claim_accounting
+    from core.review import blocks_trust, trust_class
+
+    resolutions = {entry.key: entry.action.value for entry in document.review_log.entries}
+    claims = []
+    for claim in document.claims:
+        record = claim.model_dump(mode="json")
+        run = document.run_of(claim.source_page) if document.is_packet else None
+        record["run_id"] = run.run_id if run is not None else None
+        claims.append(_redact_claim(record) if redact else record)
+
+    review = []
+    for entry in document.review_log.entries:
+        record = entry.model_dump(mode="json")
+        if redact and entry.field in REDACTED_FIELDS:
+            record.update(before=None, after=None, note="", expected=None, actual=None,
+                          message="(redacted)")
+        review.append(record)
+
+    findings = []
+    for finding in result.findings if result is not None else []:
+        record = finding.model_dump(mode="json")
+        record["blocks_trust"] = blocks_trust(finding)
+        record["review"] = resolutions.get(finding_key(finding), "open")
+        findings.append(record)
+
+    header = document.model_dump(mode="json", exclude={
+        "claims", "runs", "review_log", "refused_claim_rows", "unplaced_rows"})
+    return {
+        "schema": JSON_SCHEMA,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "redacted": redact,
+        "status": {
+            "review_status": canonical_status(result).value,
+            "engine_status": result.status.value if result is not None else None,
+            "trust": trust_class(result),
+            "runs": {run.run_id: canonical_run_status(result, run.run_id).value
+                     for run in document.runs} if result is not None else {},
+        },
+        "document": header,
+        "runs": [run.model_dump(mode="json") for run in document.runs],
+        "accounting": [item.as_dict() for item in claim_accounting(document, result)],
+        "claims": claims,
+        "refused_claim_rows": [row.model_dump(mode="json") for row in document.refused_claim_rows],
+        "unplaced_rows": [row.model_dump(mode="json") for row in document.unplaced_rows],
+        "findings": findings,
+        "review_log": review,
+    }
+
+
+def to_json_bytes(
+    document: LossRunDocument,
+    result: ReconciliationResult | None = None,
+    *,
+    redact: bool = False,
+) -> bytes:
+    """The JSON export as UTF-8 bytes, for a download button."""
+    import json
+
+    return json.dumps(build_json(document, result, redact=redact), indent=2,
+                      sort_keys=True, ensure_ascii=False).encode("utf-8")

@@ -17,16 +17,18 @@ Two rules hold everywhere here:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import pymupdf
 
 from core.normalize import clean_text
+from core.runs import paginations_in
 from core.schema import RawRow, RawTable
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "extract_vision.md"
@@ -57,6 +59,21 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         },
         "printed_claim_count": {"type": "integer", "nullable": True},
         "valuation_date": {"type": "string", "nullable": True},
+        # Page furniture: what the page prints about which report it is part
+        # of. A packet binds several loss runs, and on a scan this is the only
+        # evidence of where one ends and the next begins.
+        "page_label": {
+            "type": "object",
+            "nullable": True,
+            "properties": {
+                "text": {"type": "string"},
+                "number": {"type": "integer"},
+                "of": {"type": "integer"},
+                "position": {"type": "string", "enum": ["header", "footer", "body"]},
+            },
+            "required": ["text", "number", "of", "position"],
+        },
+        "report_heading": {"type": "string", "nullable": True},
     },
     "required": ["headers", "rows"],
 }
@@ -140,6 +157,40 @@ def _claim_count(value: object) -> int | None:
         return None
     return value if value >= 0 else None
 
+def _whole(value: object) -> int | None:
+    """A positive whole number the model gave, or None -- never a bool or float."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 1 else None
+
+
+def _page_label(value: object) -> tuple[str, int, int, str] | None:
+    """The page numbering the model read in the furniture, if it is usable.
+
+    Only numbering the model places in the header or the footer is page
+    furniture. "Page 1 of 3" in a paragraph or a table cell is the page
+    talking about a page, and taking it for this page's number splits one
+    report in two -- so it is not kept. Nor is anything malformed: a number
+    past its own count, or a count that is not a whole number.
+    """
+    if not isinstance(value, dict):
+        return None
+    number, count = _whole(value.get("number")), _whole(value.get("of"))
+    position = str(value.get("position") or "").strip().lower()
+    if number is None or count is None or number > count:
+        return None
+    if position not in ("header", "footer"):
+        return None
+    # The words must say what the numbers say, in the form the text layer's
+    # reader accepts: a label the digital path would not take as page
+    # numbering is not taken off a scan either.
+    text = clean_text(str(value.get("text") or ""))
+    stated = [(found.index, found.count) for found in paginations_in(text, "model")]
+    if (number, count) not in stated:
+        return None
+    return text, number, count, position
+
+
 def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> RawTable:
     """Turn the model's JSON into the same RawTable the digital path produces.
 
@@ -183,6 +234,9 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
 
     count = _claim_count(data.get("printed_claim_count"))
     valuation = data.get("valuation_date")
+    label = _page_label(data.get("page_label"))
+    heading = data.get("report_heading")
+    heading = clean_text(heading) if isinstance(heading, str) else None
     return RawTable(
         page=page_number,
         headers=headers,
@@ -191,6 +245,11 @@ def parse_vision_response(payload: str | dict[str, Any], page_number: int) -> Ra
         strategy="vision",
         printed_claim_count=count,
         valuation_date_text=clean_text(valuation) or None if valuation else None,
+        page_label=label[0] if label else None,
+        page_label_index=label[1] if label else None,
+        page_label_count=label[2] if label else None,
+        page_label_position=label[3] if label else None,
+        heading=heading or None,
     )
 
 
@@ -209,6 +268,10 @@ def _client(client: Any | None = None) -> Any:
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
+def _model(model: str | None) -> str:
+    return model or os.getenv("LOSSLIFT_GEMINI_MODEL", DEFAULT_MODEL)
+
+
 def extract_page(
     rendered: VisionPage,
     *,
@@ -216,8 +279,13 @@ def extract_page(
     model: str | None = None,
 ) -> RawTable:
     """Send one rendered page and parse what comes back."""
+    return parse_vision_response(_generate(rendered, client=client, model=model), rendered.page)
+
+
+def _generate(rendered: VisionPage, *, client: Any | None, model: str | None) -> str:
+    """The model's raw answer for one rendered page."""
     active = _client(client)
-    target = model or os.getenv("LOSSLIFT_GEMINI_MODEL", DEFAULT_MODEL)
+    target = _model(model)
 
     try:
         from google.genai import types
@@ -243,8 +311,7 @@ def extract_page(
         raise VisionUnavailable(
             f"Page {rendered.page}: the vision call failed ({error})."
         ) from error
-
-    return parse_vision_response(text, rendered.page)
+    return text
 
 
 def extract_scanned_pages(
@@ -271,3 +338,136 @@ def extract_scanned_pages(
     if not tables and failures:
         raise VisionUnavailable(" ".join(failures.values()))
     return VisionExtraction(tables=tables, failures=failures)
+
+
+# --------------------------------------------------------------------------
+# Recorded answers: the model called once, replayed deterministically
+#
+# The corpus gate and the test suite must never call a live model, yet the
+# scanned path has to be protected by the same regression checks as the
+# digital one. So the model's raw answer for a page is recorded once, and
+# replayed afterwards through the very same parser and pipeline.
+#
+# A recording is keyed by what decides the answer: the document's SHA-256,
+# the page, the render DPI, the model, the prompt and the response schema.
+# Change any of them and the old answer no longer applies -- replay then
+# reports the page as not read (fail closed), never silently empty, until it
+# is recorded again. A recording holds what the model transcribed, which is
+# document content: real documents' recordings belong beside the private
+# corpus under its protections, never in the repository (spec section 9).
+# --------------------------------------------------------------------------
+
+RECORDING_VERSION = 1
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def recording_key(
+    document_sha256: str, page: int, *, model: str | None = None, dpi: int = RENDER_DPI
+) -> str:
+    """The key a page's recorded answer is stored under."""
+    material = {
+        "version": RECORDING_VERSION,
+        "document": document_sha256,
+        "page": page,
+        "dpi": dpi,
+        "model": _model(model),
+        "prompt": _sha256(load_prompt().encode("utf-8")),
+        "schema": _sha256(json.dumps(RESPONSE_SCHEMA, sort_keys=True).encode("utf-8")),
+    }
+    return _sha256(json.dumps(material, sort_keys=True).encode("utf-8"))
+
+
+def _document_sha256(path: str | Path) -> str:
+    return _sha256(Path(path).read_bytes())
+
+
+def _parsed(text: str, page: int, tables: list[RawTable], failures: dict[int, str]) -> None:
+    try:
+        tables.append(parse_vision_response(text, page))
+    except VisionUnavailable as error:
+        failures[page] = str(error)
+
+
+def _finish(tables: list[RawTable], failures: dict[int, str]) -> VisionExtraction:
+    if not tables and failures:
+        raise VisionUnavailable(" ".join(failures.values()))
+    return VisionExtraction(tables=tables, failures=failures)
+
+
+def recording_extractor(
+    directory: str | Path,
+    *,
+    client: Any | None = None,
+    model: str | None = None,
+    dpi: int = RENDER_DPI,
+) -> Callable[[str | Path, Sequence[int]], VisionExtraction]:
+    """A ``vision_extractor`` that calls the model and records every answer.
+
+    The raw text is recorded before it is parsed, so a replay reproduces a
+    parse failure as faithfully as a good transcription. A transport failure
+    records nothing: there was no answer.
+    """
+    target = Path(directory)
+
+    def extract(path: str | Path, pages: Sequence[int]) -> VisionExtraction:
+        target.mkdir(parents=True, exist_ok=True)
+        document = _document_sha256(path)
+        tables: list[RawTable] = []
+        failures: dict[int, str] = {}
+        for rendered in render_pages(path, pages, dpi):
+            try:
+                text = _generate(rendered, client=client, model=model)
+            except VisionUnavailable as error:
+                failures[rendered.page] = str(error)
+                continue
+            key = recording_key(document, rendered.page, model=model, dpi=dpi)
+            record = {"version": RECORDING_VERSION, "page": rendered.page,
+                      "model": _model(model), "text": text}
+            staged = target / f".{key}.tmp"
+            staged.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            staged.replace(target / f"{key}.json")
+            _parsed(text, rendered.page, tables, failures)
+        return _finish(tables, failures)
+
+    return extract
+
+
+def replay_extractor(
+    directory: str | Path,
+    *,
+    model: str | None = None,
+    dpi: int = RENDER_DPI,
+) -> Callable[[str | Path, Sequence[int]], VisionExtraction]:
+    """A ``vision_extractor`` that answers only from recordings.
+
+    It never renders, never needs a key and never reaches a network. A page
+    with no recording is a failed page, named as such -- the pipeline then
+    accounts for it as unread, exactly as it would a failed live call.
+    """
+    source = Path(directory)
+
+    def extract(path: str | Path, pages: Sequence[int]) -> VisionExtraction:
+        document = _document_sha256(path)
+        tables: list[RawTable] = []
+        failures: dict[int, str] = {}
+        for page in pages:
+            recorded = source / f"{recording_key(document, page, model=model, dpi=dpi)}.json"
+            try:
+                record = json.loads(recorded.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                failures[page] = (
+                    f"Page {page}: no recorded vision answer to replay for this document, "
+                    f"page, model and prompt. Record it once against the live model."
+                )
+                continue
+            if record.get("version") != RECORDING_VERSION or record.get("page") != page \
+                    or not isinstance(record.get("text"), str):
+                failures[page] = f"Page {page}: the recorded vision answer is not usable."
+                continue
+            _parsed(record["text"], page, tables, failures)
+        return _finish(tables, failures)
+
+    return extract

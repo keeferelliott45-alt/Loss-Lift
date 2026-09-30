@@ -32,7 +32,17 @@ from core.records import (
     leading_identifier,
     push_qualifiers,
 )
-from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable
+from core.runs import (
+    BAND_FRACTION,
+    FOOTER,
+    HEADER,
+    PAGINATION,
+    PageEvidence,
+    heading_of,
+    identity_of,
+    paginations_in,
+)
+from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable, SourceMethod
 
 #: A line whose leading words say "total" closes the table.
 TOTAL_ROW_PATTERN = re.compile(r"\b(?:grand\s+)?(?:report\s+)?totals?\b", re.IGNORECASE)
@@ -1725,9 +1735,119 @@ def extract_metadata(page_text: str) -> DocumentMetadata:
     )
 
 
+def pages_metadata(page_texts: Mapping[int, str], first: int | None) -> DocumentMetadata:
+    """The letterhead facts one set of pages states about itself.
+
+    What :func:`extract_pdf` does for the whole document, over a logical run's
+    own pages: the letterhead of ``first`` (the run's first claims page), a
+    valuation date wherever on those pages it is printed, and every policy
+    period they declare. Nothing is read from any other page.
+    """
+    metadata = extract_metadata(page_texts.get(first, "") if first is not None else "")
+    if metadata.valuation_date_text is None:
+        for _, text in sorted(page_texts.items()):
+            found = _first_match(text, _VALUATION_PATTERNS)
+            if found:
+                metadata.valuation_date_text = found
+                break
+    seen: set[tuple[str, str]] = set()
+    for _, text in sorted(page_texts.items()):
+        for match in _PERIOD_PATTERN.finditer(text):
+            period = (clean_text(match.group(1)), clean_text(match.group(2)))
+            if period not in seen:
+                seen.add(period)
+                metadata.policy_periods.append(period)
+    return metadata
+
+
 # --------------------------------------------------------------------------
 # Whole-document entry point
 # --------------------------------------------------------------------------
+
+
+def page_evidence(
+    page: pdfplumber.page.Page,
+    number: int,
+    words: Sequence[Word],
+    table: RawTable | None,
+    text: str,
+) -> PageEvidence:
+    """What this page prints about which report it belongs to, measured where it sits.
+
+    A report numbers its pages in its furniture -- the band across the top or
+    the bottom of the sheet -- and names itself in the top one. Only words
+    there count, and only words outside the claims table: "Page 1 of 3" in a
+    paragraph, a description cell or an embedded form is not the page
+    numbering itself, and taking it for that splits one report in two. Such
+    text is kept in ``ignored`` so the reading can say it was seen.
+
+    Measured in pdfplumber's own space, which is the page as displayed: a
+    landscape report stored as a rotated portrait page reports its words
+    turned upright, so its header is at the top here too.
+    """
+    # The visible page is the crop box; text outside it is not printed on
+    # the page anyone sees. pdfplumber gives the crop box in the words' own
+    # top-left space.
+    box = getattr(page, "cropbox", None) or getattr(page, "bbox", None)
+    if box is None:
+        # No geometry, no furniture: nothing here can say where a report is.
+        return PageEvidence(page=number, method=SourceMethod.DIGITAL)
+    x0, top, x1, bottom = box
+    band = (bottom - top) * BAND_FRACTION
+    regions: list[tuple[float, float, float, float]] = []
+    if table is not None:
+        regions = [row.bbox for row in [*table.rows, *table.total_rows] if row.bbox]
+        if table.strategy == "ruled":
+            regions += [found.bbox for found in page.find_tables()]
+
+    def inside_table(word: Word) -> bool:
+        return any(
+            left <= word.middle <= right and upper <= word.centre <= lower
+            for left, upper, right, lower in regions
+        )
+
+    visible = [w for w in words if x0 <= w.middle <= x1 and top <= w.centre <= bottom]
+    head_lines = cluster_lines([w for w in visible if w.centre <= top + band])
+    foot_lines = cluster_lines([w for w in visible if w.centre >= bottom - band])
+
+    def furniture(line: Line) -> bool:
+        """A band line outside the claims table -- or one saying nothing but
+        its page number, which a table can swallow as its last row."""
+        if not any(inside_table(word) for word in line.words):
+            return True
+        rest = PAGINATION.sub(" ", line.text)
+        return bool(PAGINATION.search(line.text)) and not any(ch.isdigit() for ch in rest)
+
+    head_lines = [line for line in head_lines if furniture(line)]
+    foot_lines = [line for line in foot_lines if furniture(line)]
+    paginations = [
+        *(found for line in head_lines for found in paginations_in(line.text, HEADER)),
+        *(found for line in foot_lines for found in paginations_in(line.text, FOOTER)),
+    ]
+    heading = " ".join(line.text for line in head_lines)
+    # A page whose text runs sideways has no header band to speak of: its
+    # "top" is one edge of a turned table.
+    chars = getattr(page, "chars", None) or []
+    upright = sum(1 for char in chars if char.get("upright", True))
+    sideways = bool(chars) and upright * 2 < len(chars)
+    identity = None if sideways else identity_of(
+        heading, exclude=table.headers if table is not None else ()
+    )
+
+    # Everything the page text calls a page number, less what the bands hold.
+    seen = [" ".join(match.group(0).split()).lower() for match in PAGINATION.finditer(text)]
+    for found in paginations:
+        normal = " ".join(found.text.split()).lower()
+        if normal in seen:
+            seen.remove(normal)
+    return PageEvidence(
+        page=number,
+        method=SourceMethod.DIGITAL,
+        paginations=tuple(paginations),
+        identity=identity,
+        heading=heading_of(heading),
+        ignored=tuple(seen),
+    )
 
 
 @dataclass
@@ -1740,6 +1860,8 @@ class DigitalExtraction:
     #: table sliced by column -- see detect_column_split_pages. Structural
     #: evidence only; no claim or money field is read to produce this.
     column_split_pages: list[tuple[int, int]] = dataclass_field(default_factory=list)
+    #: What each extracted page prints about which report it belongs to.
+    page_evidence: dict[int, PageEvidence] = dataclass_field(default_factory=dict)
 
     @property
     def all_rows(self) -> list[RawRow]:
@@ -1765,6 +1887,7 @@ def extract_pdf(
     tables: list[RawTable] = []
     page_texts: dict[int, str] = {}
     signatures: list[PageSignature] = []
+    evidence: dict[int, PageEvidence] = {}
 
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
@@ -1774,13 +1897,15 @@ def extract_pdf(
             # to read as "no letter band here" for the pairing below to
             # correctly refuse to join across it, and it only reads that way
             # if it was looked at.
-            signatures.append(page_signature(index, page_words(page)))
+            words = page_words(page)
+            signatures.append(page_signature(index, words))
             if pages is not None and index not in pages:
                 continue
             page_texts[index] = page.extract_text() or ""
             table = extract_page_table(page, index)
             if table is not None:
                 tables.append(table)
+            evidence[index] = page_evidence(page, index, words, table, page_texts[index])
 
     column_split_pages = detect_column_split_pages(signatures)
 
@@ -1836,4 +1961,5 @@ def extract_pdf(
         page_texts=page_texts,
         page_count=page_count,
         column_split_pages=column_split_pages,
+        page_evidence=evidence,
     )
