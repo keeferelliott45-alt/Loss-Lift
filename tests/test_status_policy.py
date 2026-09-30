@@ -28,6 +28,7 @@ from core.schema import (
     DocumentStatus,
     Finding,
     FindingScope,
+    LineOfBusiness,
     LogicalRun,
     LossRunDocument,
     ReconciliationResult,
@@ -205,11 +206,69 @@ def test_a_run_awaiting_its_column_mapping_is_not_clean():
         is DocumentStatus.NEEDS_REVIEW
 
 
+def _packet_document(*, second_printed: int | None = 3) -> LossRunDocument:
+    """A packet whose page-1 facts differ from its runs' own.
+
+    The runs agree on insured, policy number, period, line and valuation, and
+    disagree on carrier. The document-level fields are page 1's, so any Source
+    Info row still showing them would be answering for the whole packet with
+    one run's facts.
+    """
+    runs = [
+        LogicalRun(run_id="run-1", pages=[1], confidence="printed",
+                   carrier="Alpha Mutual", named_insured="Shared Insured",
+                   policy_number="POL-9", policy_period_start=date(2022, 1, 1),
+                   policy_period_end=date(2022, 12, 31),
+                   line_of_business=LineOfBusiness.WC,
+                   valuation_date=date(2023, 6, 30), printed_claim_count=2),
+        LogicalRun(run_id="run-2", pages=[2], confidence="printed",
+                   carrier="Beta Casualty", named_insured="Shared Insured",
+                   policy_number="POL-9", policy_period_start=date(2022, 1, 1),
+                   policy_period_end=date(2022, 12, 31),
+                   line_of_business=LineOfBusiness.WC,
+                   valuation_date=date(2023, 6, 30),
+                   printed_claim_count=second_printed),
+    ]
+    return LossRunDocument(
+        source_filename="packet.pdf", file_sha256="0" * 64, page_count=2,
+        carrier="Page One Mutual", named_insured="Page One Insured",
+        policy_number="PAGE-1", policy_period_start=date(1999, 1, 1),
+        policy_period_end=date(1999, 12, 31), line_of_business=LineOfBusiness.GL,
+        valuation_date=date(1999, 6, 30), printed_claim_count=1,
+        claims=_document().claims, runs=runs)
+
+
+def test_a_packet_source_info_shows_a_field_only_when_every_run_agrees():
+    info = _source_info(_packet_document(), None)
+    assert info["Carrier"] == "differs by run — see Runs sheet"
+    assert info["Named insured"] == "Shared Insured"
+    assert info["Policy number"] == "POL-9"
+    assert info["Policy period"] == "2022-01-01 to 2022-12-31"
+    assert info["Line of business"] == "WC"
+    assert info["Valuation date"].date() == date(2023, 6, 30)
+
+
+def test_a_packet_source_info_sums_each_runs_printed_claim_count():
+    info = _source_info(_packet_document(second_printed=3), None)
+    assert info["Claim count printed on document"] == 5
+
+
+def test_a_packet_source_info_says_not_printed_when_a_run_has_no_count():
+    info = _source_info(_packet_document(second_printed=None), None)
+    assert info["Claim count printed on document"] == "not printed"
+
+
+def test_a_single_report_source_info_still_shows_its_own_facts():
+    document = _document().model_copy(update={"carrier": "Solo Mutual"})
+    assert _source_info(document, None)["Carrier"] == "Solo Mutual"
+
+
 def test_every_summary_of_a_row_count_gap_agrees_with_the_policy():
     """Codex P2 on 67e7624: the headline and the card follow blocks_trust.
 
-    R-19 keeps its underwriting category, but no summary may call a document
-    missing a claim row reconciled.
+    R-19 keeps the spec's WARN severity and is categorised ``extraction`` --
+    rows seen on a page and not read are a missing claim -- so it blocks trust
+    as a reading problem and no summary may call such a document reconciled.
     """
     from core.review import review_bucket, summarise_review
 
@@ -217,7 +276,8 @@ def test_every_summary_of_a_row_count_gap_agrees_with_the_policy():
     summary = summarise_review(result.findings)
     assert summary.headline() == "not read cleanly"
     gap = [f for f in result.findings if f.rule_id == "R-19"]
+    assert all(f.severity is Severity.WARN for f in gap)
+    assert all(f.category.value == "extraction" for f in gap)
     assert all(review_bucket(f) == "extraction" for f in gap)
     assert all(f in summary.extraction.findings for f in gap)
     assert not any(f in summary.underwriting.findings for f in gap)
-    assert all(f.category.value == "underwriting" for f in gap)

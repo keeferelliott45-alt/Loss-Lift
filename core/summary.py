@@ -12,7 +12,7 @@ by how much is a different thing from knowing the document does not tie.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from typing import Sequence
@@ -125,10 +125,41 @@ def _summarise(
 
 
 def summarise_by_period(document: LossRunDocument) -> list[PeriodSummary]:
-    """Break one document's claims down by policy term."""
-    return summarise_periods(
-        document.claims, document.policy_periods, document.printed_sections
+    """Break one document's claims down by policy term.
+
+    A packet binds several loss runs, each with its own carrier and its own
+    term. Pooled, the terms every run declared would take a claim into
+    whichever term its loss date happens to fall in -- another carrier's,
+    perhaps -- and a term's subtotal would be checked against claims the
+    carrier that printed it never wrote. Each run is summarised on its own
+    claims, under its own term and its own printed sections, and every row
+    says which run it is.
+    """
+    if not getattr(document, "is_packet", False):
+        return summarise_periods(
+            document.claims, document.policy_periods, document.printed_sections
+        )
+    summaries: list[PeriodSummary] = []
+    placed: set[int] = set()
+    for number, run in enumerate(document.runs, start=1):
+        claims = document.run_claims(run)
+        placed.update(id(claim) for claim in claims)
+        start, end = run.policy_period_start, run.policy_period_end
+        periods = [(start, end)] if start and end and start <= end else []
+        sections = [s for s in document.printed_sections if run.holds(s.page)]
+        name = f"Run {number}" + (f" ({run.carrier})" if run.carrier else "")
+        summaries.extend(
+            replace(summary, label=f"{name}: {summary.label}")
+            for summary in summarise_periods(claims, periods, sections)
+        )
+    # Every claim is on a page some run holds; one that is not still belongs
+    # in the book, or the summary disagrees with the claim table.
+    unplaced = [claim for claim in document.claims if id(claim) not in placed]
+    summaries.extend(
+        replace(summary, label=f"Outside any loss run: {summary.label}")
+        for summary in summarise_periods(unplaced)
     )
+    return summaries
 
 
 def summarise_periods(

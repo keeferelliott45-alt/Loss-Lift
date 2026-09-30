@@ -59,3 +59,25 @@ def test_an_unambiguous_dated_row_is_unchanged(tmp_path):
     assert _folded(result) == []
     assert _accounted(result)
     assert canonical_status(result.reconciliation) is DocumentStatus.NEEDS_REVIEW
+
+
+def _r29(result):
+    return [f for f in result.reconciliation.findings if f.rule_id == "R-29"]
+
+
+def test_a_refusal_on_a_bounded_single_report_is_named(tmp_path):
+    """A lone report bounded by its own page numbering pooled nothing, so its
+    refusals were flagged for no rule. The row is a claim the reading did not
+    take, and a rule now names it."""
+    body = _large_run(8)
+    row = (ODD, "03/14/2022", "OPEN", "", "", "")
+    result = _read(tmp_path, [{"top": (LARGE_CARRIER, *LETTER),
+                               "rows": body[:4] + [row] + body[4:],
+                               "total": _total(body),
+                               "bottom": ("Page 1 of 1",)}])
+    assert _folded(result) == []
+    refused = [r for r in result.document.refused_claim_rows if r.identifier == ODD]
+    assert refused and refused[0].bounded and not refused[0].report
+    named = [f for f in _r29(result) if ODD in f.message]
+    assert named, [f.message for f in result.reconciliation.findings]
+    assert canonical_status(result.reconciliation) is DocumentStatus.NEEDS_REVIEW
