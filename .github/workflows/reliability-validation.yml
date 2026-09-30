@@ -1,0 +1,46 @@
+name: Reliability batch validation
+
+on:
+  push:
+    branches:
+      - agent/lead/reliability-phase-1
+  pull_request:
+    branches:
+      - main
+      - agent/lead/reliability-phase-1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reliability-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install declared dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Validate exact head in an isolated worktree
+        env:
+          BATCH_BASE: 0f13c5c90a66621774000c6eb368df82b10e95cd
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          export LOSSLIFT_WORKTREES="$RUNNER_TEMP/losslift-validation-worktrees"
+          bash scripts/agent_worktree.sh create validation --agent ci --base "$HEAD_SHA"
+          cd "$LOSSLIFT_WORKTREES/ci--validation"
+          echo "VALIDATED_HEAD=$HEAD_SHA"
+          bash scripts/agent_validate.sh --base "$BATCH_BASE"
+          python -m tests.fuzz.run --family clean --seed-start 0 --count 20
+          python -m tests.fuzz.run --family hostile --seed-start 0 --count 20
