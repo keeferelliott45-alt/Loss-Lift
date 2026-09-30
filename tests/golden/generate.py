@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import platform
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -130,25 +132,79 @@ def cell_text(fixture: Fixture, claim: dict[str, Any], column: Column) -> str:
 #: renders as a middle dot, which would make this generator produce a document
 #: no parser could read and blame the parser for it. When a fixture prints a
 #: non-ASCII symbol, a TrueType face is embedded instead.
-_TTF_REGULAR = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-)
-_TTF_BOLD = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+#:
+#: (regular, bold) filename pairs to try, in order, within each directory
+#: ``_platform_font_dirs`` returns. A candidate is only accepted once its
+#: actual glyph table is checked (see ``_covers``) — a font found by name is
+#: never assumed to cover the symbol it is needed for.
+_FONT_STEMS: tuple[tuple[str, str], ...] = (
+    ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf"),
+    ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"),
+    ("Arial.ttf", "Arial Bold.ttf"),
+    ("arial.ttf", "arialbd.ttf"),
+    ("segoeui.ttf", "segoeuib.ttf"),
+    ("tahoma.ttf", "tahomabd.ttf"),
 )
 
 _FONT_CACHE: dict[str, "pymupdf.Font"] = {}
 
 
-def _first_existing(paths: tuple[str, ...]) -> str | None:
-    for path in paths:
-        if Path(path).exists():
-            return path
-    return None
+def _loaded(path: str) -> "pymupdf.Font":
+    if path not in _FONT_CACHE:
+        _FONT_CACHE[path] = pymupdf.Font(fontfile=path)
+    return _FONT_CACHE[path]
+
+
+def _covers(path: Path, symbol: str) -> bool:
+    """Whether the face at ``path`` has a real glyph for every character in
+    ``symbol`` — checked against the font's own glyph table, never assumed
+    from its filename."""
+    if not path.is_file():
+        return False
+    font = _loaded(str(path))
+    return all(font.has_glyph(ord(char)) for char in symbol)
+
+
+def _windows_fonts_dir() -> Path:
+    """The system Fonts directory. A font install is machine-wide, so this
+    reads the environment rather than hard-coding the invoking user's profile
+    path."""
+    root = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    return Path(root) / "Fonts"
+
+
+def _platform_font_dirs() -> tuple[Path, ...]:
+    """Directories to search for embeddable TrueType faces, per OS."""
+    if platform.system() == "Windows":
+        return (_windows_fonts_dir(),)
+    return (
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation"),
+        Path("/System/Library/Fonts/Supplemental"),
+    )
+
+
+def resolve_font_files(
+    symbol: str, dirs: Sequence[Path] | None = None
+) -> tuple[str, str]:
+    """Find a (regular, bold) TrueType pair able to encode every character in
+    ``symbol``. ``dirs`` overrides the platform search path — used by tests to
+    exercise one OS's directories without touching the others."""
+    search_dirs = tuple(dirs) if dirs is not None else _platform_font_dirs()
+    for directory in search_dirs:
+        for regular_name, bold_name in _FONT_STEMS:
+            regular = directory / regular_name
+            if not _covers(regular, symbol):
+                continue
+            bold = directory / bold_name
+            if not _covers(bold, symbol):
+                bold = regular
+            return str(regular), str(bold)
+    searched = ", ".join(str(d) for d in search_dirs)
+    raise RuntimeError(
+        f"{symbol!r} needs a TrueType face with that glyph, and none of the "
+        f"searched font directories had one: {searched}"
+    )
 
 
 def font_files(fixture: Fixture) -> tuple[str | None, str | None]:
@@ -156,19 +212,10 @@ def font_files(fixture: Fixture) -> tuple[str | None, str | None]:
     symbol = fixture.currency_symbol or ""
     if all(ord(char) < 128 for char in symbol):
         return None, None
-    regular = _first_existing(_TTF_REGULAR)
-    if regular is None:
-        raise RuntimeError(
-            f"{fixture.name} prints {symbol!r}, which the built-in fonts cannot "
-            f"encode, and no TrueType face was found to embed."
-        )
-    return regular, _first_existing(_TTF_BOLD) or regular
-
-
-def _loaded(path: str) -> "pymupdf.Font":
-    if path not in _FONT_CACHE:
-        _FONT_CACHE[path] = pymupdf.Font(fontfile=path)
-    return _FONT_CACHE[path]
+    try:
+        return resolve_font_files(symbol)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{fixture.name} prints {symbol!r}: {exc}") from exc
 
 
 def _width(text: str, font: str, size: float, fontfile: str | None = None) -> float:
