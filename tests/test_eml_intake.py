@@ -617,3 +617,14 @@ def test_a_copy_of_a_pdf_the_pipeline_failed_on_says_so(tmp_path):
     first, copy = submission.attachments
     assert first.processing is ProcessingState.FAILED
     assert "could not be read as a loss run" in copy.reason
+
+
+def test_progress_is_reported_before_each_pdf_is_read(profiles):
+    calls = []
+    submission, done = read_submission(
+        eml([("a.pdf", "application/pdf", PDF_A), ("b.pdf", "application/pdf", PDF_B)]),
+        profiles, progress=lambda read, total: calls.append((read, total)))
+    try:
+        assert calls == [(0, 2), (1, 2)]
+    finally:
+        _cleanup(done)

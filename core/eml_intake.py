@@ -493,6 +493,7 @@ def process_attachments(
     staged: list[PendingAttachment],
     run: Callable[[IngestedFile], Any],
     submission: Submission | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, tuple[IngestedFile, Any]]:
     """Read each staged PDF; map document id to (staged file, result).
 
@@ -503,8 +504,11 @@ def process_attachments(
     """
     done: dict[str, tuple[IngestedFile, Any]] = {}
     remaining = list(staged)
+    total = len(staged)
     try:
         while remaining:
+            if progress is not None:
+                progress(total - len(remaining), total)
             pending = remaining.pop(0)
             attachment = pending.attachment
             assert pending.staged is not None
@@ -537,9 +541,14 @@ def read_submission(
     run: Callable[[IngestedFile], Any],
     limits: EmlLimits = DEFAULT_LIMITS,
     workdir: Any = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> tuple[Submission, dict[str, tuple[IngestedFile, Any]]]:
-    """Parse, stage and process one saved email. Raises only on a fatal error."""
+    """Parse, stage and process one saved email. Raises only on a fatal error.
+
+    ``progress(read, total)`` is called before each PDF is read, so a caller
+    can show that a large email is moving.
+    """
     parsed = parse_eml(raw, limits)
     staged = stage_attachments(parsed, limits, workdir)
-    done = process_attachments(staged, run, parsed.submission)
+    done = process_attachments(staged, run, parsed.submission, progress)
     return parsed.submission, done

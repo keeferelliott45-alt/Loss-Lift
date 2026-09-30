@@ -894,10 +894,16 @@ def _extract_email(upload: Any) -> int:
     its siblings.
     """
     state = _state()
+    status = st.empty()
+
+    def show(read: int, total: int) -> None:
+        status.caption(f"Reading attachment {read + 1} of {total} from the saved email…")
+
     try:
         submission, done = read_submission(
             upload.getvalue(),
             lambda source: run_pipeline(source, use_llm=llm_enabled()),
+            progress=show,
         )
     except EmlFatalError as error:
         state["rejected"].append(f"{upload.name}: {error}")
@@ -908,7 +914,18 @@ def _extract_email(upload: Any) -> int:
             f"your mail program as .eml and retry."
         )
         return 0
+    finally:
+        status.empty()
     for document_id, (staged, result) in done.items():
+        twin = _already_open(result.document.file_sha256)
+        if twin is not None:
+            attachment = submission.attachment_for_document(document_id)
+            state["notices"].append(
+                f"Attachment {attachment.position if attachment else '?'} of the saved "
+                f"email is the same file as {twin.document.source_filename}, already in "
+                f"the queue. It was read again from scratch: corrections and review "
+                f"history do not carry over between uploads."
+            )
         _store(result)
         _record_processed(result)
         state["staged"][document_id] = staged

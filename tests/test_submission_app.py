@@ -182,3 +182,40 @@ def test_a_submission_with_nothing_readable_still_renders(tmp_path):
     at = _open_submission(at, submission)
     assert not at.exception
     assert any("No loss run was read" in t or "Incomplete" in t for t in _texts(at))
+
+
+def _read_email_twice(raw, root):
+    """Runs inside Streamlit: read the same saved email twice, as two uploads."""
+    import sys
+
+    sys.path.insert(0, root)
+    import streamlit as st
+
+    import app
+
+    class Upload:
+        name = "resend.eml"
+
+        def getvalue(self):
+            return raw
+
+    st.session_state["documents"] = {}
+    st.session_state["order"] = []
+    st.session_state["rejected"] = []
+    st.session_state["notices"] = []
+    app._extract_email(Upload())
+    app._extract_email(Upload())
+
+
+def test_the_same_pdf_in_a_second_email_is_noticed():
+    raw = eml([("a.pdf", "application/pdf", loss_run_pdf())])
+    at = AppTest.from_function(_read_email_twice, args=(raw, str(Path(APP).parent)),
+                               default_timeout=120).run()
+    try:
+        assert not at.exception
+        notices = at.session_state["notices"]
+        assert sum("already in the queue" in n for n in notices) == 1
+        assert len(at.session_state["submission_order"]) == 2
+    finally:
+        for staged in at.session_state["staged"].values():
+            discard(staged)

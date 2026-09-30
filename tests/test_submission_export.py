@@ -164,3 +164,11 @@ def test_a_short_subject_or_file_name_never_scrubs_labels_or_headers(tmp_path):
     finally:
         for staged, _r in done.values():
             discard(staged)
+
+
+def test_an_email_date_without_a_zone_is_read_as_utc():
+    from datetime import datetime
+
+    from core.submission_export import _utc
+
+    assert _utc(datetime(2026, 9, 29, 10, 15)) == "2026-09-29 10:15:00 UTC"

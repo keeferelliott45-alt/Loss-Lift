@@ -73,6 +73,10 @@ def _identifying(submission: Submission, results: Mapping[str, Any]) -> Redactio
 def _utc(value: datetime | None) -> str | None:
     if value is None:
         return None
+    if value.tzinfo is None:
+        # An email date with no zone ("-0000") is not in this server's local
+        # time; read it as UTC rather than shifting it by the server's offset.
+        value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
