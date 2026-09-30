@@ -1700,6 +1700,25 @@ def document_claim_count(
     return total_led[0] if len(total_led) == 1 else None
 
 
+#: A word ending in a colon: the end of a label. A time's colon follows
+#: digits, never a word, so "9:16:54" is not one.
+_LABEL_END = re.compile(r"(?<!\S)[A-Za-z][\w'&./#-]*\s*:")
+
+
+def _before_next_label(value: str) -> str:
+    """A value ends where the next labelled fact on its line begins.
+
+    The second label need not be one this reader knows ("Report run date:").
+    Its length is not printed, so it is taken as the colon's word and up to
+    two before it, as many as leave the value at least one word.
+    """
+    end = _LABEL_END.search(value)
+    if end is None:
+        return value
+    words = value[:end.start()].split()
+    return " ".join(words[:len(words) - min(2, max(len(words) - 1, 0))])
+
+
 def _labelled_value(text: str, *labels: str) -> str | None:
     for label in labels:
         match = re.search(rf"{label}\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
@@ -1711,6 +1730,7 @@ def _labelled_value(text: str, *labels: str) -> str | None:
                 value,
                 flags=re.IGNORECASE,
             )[0]
+            value = _before_next_label(value)
             if value:
                 return clean_text(value)
     return None
