@@ -45,6 +45,7 @@ def loss_run_pdf(
     policy: str = "GL-100",
     valuation: str = "12/31/2022",
     pages: int = 1,
+    period: str | None = None,
 ) -> bytes:
     """A clean single-report loss run: letterhead, claims, printed total."""
     rows = list(rows if rows is not None else _large_run(6))
@@ -55,6 +56,7 @@ def loss_run_pdf(
         _sheet(
             document,
             top=(carrier, f"Named Insured: {insured}", f"Policy Number: {policy}",
+                 *((f"Policy Period: {period}",) if period else ()),
                  "LOSS RUN REPORT", f"Valuation Date: {valuation}"),
             rows=chunk,
             total=_total(rows) if index == len(chunks) else None,

@@ -436,10 +436,16 @@ def summarise_submission(
             ))
         large.sort(key=lambda item: item.incurred_total, reverse=True)
         periods = rollup.periods
-        notes = tuple(
-            f"{period.label}: {period.claims} claim(s)" for period in periods
-            if period.start is None
-        )
+        # A policy term is only ever one a document printed. With none printed,
+        # the account groups claims by year of loss, and says that is what it is.
+        printed_terms = any(source.terms for source in rollup.sources)
+        if printed_terms:
+            terms = tuple(p.label for p in periods if p.start is not None)
+            notes = tuple(f"{p.label}: {p.claims} claim(s)" for p in periods if p.start is None)
+        else:
+            terms = ()
+            notes = (("No document prints a policy term; by year of loss: "
+                      + ", ".join(f"{p.label} ({p.claims})" for p in periods)),) if periods else ()
         accounts.append(AccountSummary(
             name=rollup.name,
             established=rollup.name != UNNAMED_ACCOUNT,
@@ -453,7 +459,7 @@ def summarise_submission(
             incurred_total=total,
             incurred_unavailable=unavailable,
             valuation_dates=tuple(rollup.valuation_dates),
-            policy_periods=tuple(p.label for p in periods if p.start is not None),
+            policy_periods=terms,
             period_notes=notes,
             dropped_claims=tuple(h.claim_number for h in rollup.dropped),
             large_claims=tuple(large),

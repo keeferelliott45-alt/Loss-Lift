@@ -200,3 +200,10 @@ def test_a_document_removed_from_the_session_reopens_the_submission(read):
     summary = summarise_submission(submission, {})
     assert summary.status == "incomplete"
     assert any("removed from this session" in b for b in summary.blockers)
+
+
+def test_a_calendar_year_is_never_presented_as_a_policy_term(read):
+    submission, results = read([("a.pdf", "application/pdf", PDF_2022)])
+    (account,) = summarise_submission(submission, results).accounts
+    assert account.policy_periods == ()
+    assert account.period_notes[0].startswith("No document prints a policy term")

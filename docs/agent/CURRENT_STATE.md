@@ -11,6 +11,13 @@ in `Remember.md`).
 - Tests: 2,594 collected — 2,581 pass, 7 skipped, 6 strict xfail (known gaps).
   Golden ratchet: 108/108 rows, money and text 100%.
 
+## Submission workspace (pilot, branch `claude/mga-submission-workspace`)
+
+Saved-email (`.eml`) intake into a submission: attachment inventory with
+outcomes, the normal pipeline per PDF, a merged summary with provenance and a
+redactable workbook. No extraction or reconciliation behaviour changed.
+Workflow, limits, privacy boundaries and limitations: `docs/submission-workspace.md`.
+
 ## Recently completed (logical-run propagation cycle)
 
 Logical runs (`core/runs.py`) with furniture-only boundaries; per-run
