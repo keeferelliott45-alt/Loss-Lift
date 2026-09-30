@@ -67,6 +67,7 @@ no business logic. `prompts/` — LLM prompts (`extract_vision.md`,
 | Submissions (saved email) | `test_eml_intake.py`, `test_submission_summary.py`, `test_submission_export.py`, `test_submission_app.py` (AppTest); fixtures `submission_fixtures.py` |
 | Gate / telemetry | `test_corpus_gate.py`, `test_gate_runs.py`, `test_cloud_gate*.py`, `test_corpus_intake.py`, `test_telemetry.py` |
 | Tooling | `test_agent_tooling.py` |
+| Fuzz (silent CLEAN) | `tests/fuzz/` — `generator.py` (synthetic loss runs + ground truth), `mutations.py` (hazard operators), `oracle.py` (SAFE/SILENT/LOUD), `shrink.py` (minimal reproducer), `run.py` (CLI); `test_fuzz_smoke.py` |
 | Golden accuracy | `tests/golden/` — `fixtures.py` (definitions), `generate.py` (PDFs), `expected/`, `baseline.py` + `accuracy_baseline.json` (per-carrier ratchet) |
 
 Shared PDF builders for packet tests: `tests/test_packet_claim_series.py`
@@ -121,4 +122,15 @@ scripts/agent_validate.sh                   # all pre-handoff checks
 scripts/agent_worktree.sh create|check|list|remove
 python -m core.telemetry summarize [file]   # local trust rates
 streamlit run app.py
+python -m tests.fuzz.run --family hostile --seed-start 0 --count 60
+python -m tests.fuzz.run --family clean   --seed-start 0 --count 60
+python -m tests.fuzz.run --case 238:add_unnumbered_run,missing_page
+python -m tests.fuzz.run --family hostile --count 50 --vision  # synthetic replay scans
 ```
+
+`tests/fuzz/run.py` writes SAFE/SILENT/LOUD/UNNAMED counts by operator
+combination and exits non-zero if any SILENT case appeared. Every case is
+reproducible from `(seed, operator list)`; the clean family renders documents a
+correct reader should read perfectly (LOUD baseline 0 across seeds 0–49), the
+hostile family applies the hazard operators in `mutations.py`. Scans are
+synthetic replays only — never a live model, never a real document.
