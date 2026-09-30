@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "head": "reliability-phase-1 F1",
+  "cases": {
+    "a4-portrait": {
+      "met": true,
+      "shortfalls": []
+    },
+    "absent-carrier": {
+      "met": true,
+      "shortfalls": []
+    },
+    "blank-versus-zero": {
+      "met": true,
+      "shortfalls": []
+    },
+    "bounded-digital-then-scan": {
+      "met": true,
+      "shortfalls": []
+    },
+    "bounded-scan-then-digital": {
+      "met": true,
+      "shortfalls": []
+    },
+    "cover-page-then-report": {
+      "met": true,
+      "shortfalls": []
+    },
+    "foreign-page-bridged": {
+      "met": false,
+      "shortfalls": [
+        "claims_missing",
+        "status_differs"
+      ],
+      "followup": "Phase 2: another carrier's unnumbered page inside a report is split off but its claim is named (R-23/R-28), not read. Safe (review), claim missing."
+    },
+    "furniture-controls": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-every-row": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-some-rows": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-unreadable": {
+      "met": true,
+      "shortfalls": []
+    },
+    "landscape-components": {
+      "met": true,
+      "shortfalls": []
+    },
+    "letter-portrait": {
+      "met": true,
+      "shortfalls": []
+    },
+    "missing-replay": {
+      "met": true,
+      "shortfalls": []
+    },
+    "mixed-series-packet": {
+      "met": false,
+      "shortfalls": [
+        "status_differs"
+      ],
+      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+    },
+    "multiline-descriptions": {
+      "met": true,
+      "shortfalls": []
+    },
+    "policy-change-boundary": {
+      "met": false,
+      "shortfalls": [
+        "claims_wrong_run",
+        "false_clean",
+        "runs_differ"
+      ],
+      "followup": "Phase 2, first: FALSE CLEAN. Two unnumbered reports differing only in their printed policy number are merged and auto-accepted; a change of policy number must be boundary evidence, or the split must be reviewed."
+    },
+    "printed-count-mismatch": {
+      "met": true,
+      "shortfalls": []
+    },
+    "run-counts-packet": {
+      "met": false,
+      "shortfalls": [
+        "status_differs"
+      ],
+      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+    },
+    "same-number-two-carriers": {
+      "met": true,
+      "shortfalls": []
+    },
+    "section-counts-only": {
+      "met": true,
+      "shortfalls": []
+    },
+    "signed-and-recovery": {
+      "met": true,
+      "shortfalls": []
+    },
+    "two-series-digital-packet": {
+      "met": false,
+      "shortfalls": [
+        "status_differs"
+      ],
+      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+    },
+    "wrapped-headers": {
+      "met": true,
+      "shortfalls": []
+    }
+  }
+}

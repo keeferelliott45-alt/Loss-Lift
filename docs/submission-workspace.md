@@ -126,7 +126,7 @@ combined.
   | Attachments | 25 |
   | Total attachment bytes (checked on encoded size, before decoding) | 200 MB |
   | One PDF | 64 MB (the existing upload limit) |
-  | PDF pages | 1000 (new: the direct-upload path has no page limit) |
+  | PDF pages | 1000 (the shared preflight, `core.ingest.preflight_pdf`, applies it to every intake path) |
 
 - **Errors**:
   - A problem with one attachment rejects or fails that attachment only.
@@ -184,5 +184,3 @@ combined.
   prompt.
 - **Setting aside:** the reviewer's decision lives in session memory with the
   submission. It is not written to the document review log.
-- **Page limit:** it applies to the email path only. Adding it to direct
-  uploads is a separate change.

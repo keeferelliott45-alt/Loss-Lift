@@ -203,5 +203,11 @@ metrics and any shortfalls, by fixed category.
 **Rules for packs.**
 - Truth comes from how the document was built.
 - Packs never edit a discovery registry; packs are listed centrally.
+- The central list is `tests/qualification/registry.py`. `tests/qualification/test_packs.py` runs
+  every registered case through the current pipeline and compares each outcome with
+  `tests/qualification/pack_ledger.json`, which records whether the case is met and, if not,
+  its shortfalls and the follow-up that owns them. The test fails when any outcome moves, in
+  either direction: a regression is caught, and a fix has to be recorded. Truth is never
+  changed to fit.
 - PDF bytes may differ between builds; printed content, truth and results
   must not.
