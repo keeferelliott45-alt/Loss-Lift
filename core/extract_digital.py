@@ -1841,6 +1841,7 @@ def page_evidence(
         normal = " ".join(found.text.split()).lower()
         if normal in seen:
             seen.remove(normal)
+    policy = BAND_POLICY.search(heading) if not sideways else None
     return PageEvidence(
         page=number,
         method=SourceMethod.DIGITAL,
@@ -1848,7 +1849,18 @@ def page_evidence(
         identity=identity,
         heading=heading_of(heading),
         ignored=tuple(seen),
+        policy=policy.group(1) if policy else None,
     )
+
+
+#: A policy number labelled as one in a page's header band: "Policy Number:
+#: GL-7003", "Policy No. CA 3303", "Policy #: 44-918". The value must carry a
+#: digit, so "Policy Number: see schedule" names none.
+BAND_POLICY = re.compile(
+    r"\bpolicy\s*(?:number|no\.?|nbr\.?|#)\s*[:#]?\s*"
+    r"((?=[A-Za-z0-9\-/.]*\d)[A-Za-z0-9][A-Za-z0-9\-/.]{2,})",
+    re.IGNORECASE,
+)
 
 
 @dataclass

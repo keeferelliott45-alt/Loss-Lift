@@ -117,6 +117,17 @@ class PageEvidence:
     #: The header band as printed, shortened, for display.
     heading: str | None = None
     ignored: tuple[str, ...] = ()
+    #: The policy number the header band prints, if it prints one. Digits are
+    #: left out of ``identity``, so without this two reports told apart only
+    #: by their policy numbers carry the same heading.
+    policy: str | None = None
+
+
+def same_policy(one: str | None, other: str | None) -> bool | None:
+    """Whether two printed policy numbers are the same policy; None if either is absent."""
+    if not one or not other:
+        return None
+    return "".join(one.upper().split()) == "".join(other.upper().split())
 
 
 def paginations_in(text: str, source: str) -> list[Pagination]:
@@ -236,6 +247,8 @@ class _Segment:
     #: The report stopped before its own last page and another began.
     incomplete: str | None = None
     identity: str | None = None
+    #: The first policy number its pages print.
+    policy: str | None = None
     numbered: bool = False
     tables: bool = False
     #: Pages joined to the segment without a heading confirming it: its
@@ -335,7 +348,8 @@ class _Planner:
         return [label for label in labels if label not in stamped]
 
     def start(self, page: int, **fields) -> _Segment:
-        segment = _Segment(pages=[page], identity=self.page_evidence(page).identity,
+        evidence = self.page_evidence(page)
+        segment = _Segment(pages=[page], identity=evidence.identity, policy=evidence.policy,
                            tables=page in self.tables, **fields)
         self.segments.append(segment)
         self.current = segment
@@ -344,6 +358,7 @@ class _Planner:
     def add(self, segment: _Segment, page: int) -> None:
         segment.pages.append(page)
         segment.tables = segment.tables or page in self.tables
+        segment.policy = segment.policy or self.page_evidence(page).policy
         self.current = segment
 
     def close_short(self, page: int) -> None:
@@ -540,6 +555,17 @@ class _Planner:
                 text=f"page {page} prints no page number")])
             return
         if not current.numbered:
+            if same_policy(page_evidence.policy, current.policy) is False:
+                # Nothing is numbered, but the page prints another policy's
+                # number than the report before it: printed evidence of another
+                # report, as a positively different heading is. Joined, one
+                # policy's claims would be filed under the other's number.
+                self.start(page, confidence=RunConfidence.INFERRED, evidence=[RunBoundary(
+                    page=page, kind="unnumbered", source="none",
+                    text=f"page {page} prints no page number and names a different "
+                         f"policy from the report on pages {current.span()}, so it "
+                         f"begins another report")])
+                return
             self.add(current, page)
             return
 
