@@ -36,6 +36,7 @@ from core.schema import (
     Severity,
     SourceMethod,
     finding_key,
+    split_is_settled,
     sum_present,
 )
 
@@ -1530,6 +1531,13 @@ _SEVERITY_ORDER = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
 #: Rules about how the packet is divided, asked once of the whole document.
 _PACKET_RULES = ("R-28",)
 
+#: Rules that check the claims against what the carrier printed about them:
+#: its total, its count, its subtotals, and the totals and counts it could not
+#: be read for. Across a settled split each run answers them for itself; across
+#: an unsettled one, which run a printed figure belongs to is not known, so
+#: they are asked once of the whole document the figures were read from.
+_PRINTED_EVIDENCE_RULES = ("R-04", "R-05", "R-25", "R-26", "R-27")
+
 #: Rules about what the document states once for every run -- its valuation
 #: date, currency, column mapping, page accounting, split pages. Raised alike
 #: in every run, they are one fact and reported once. Every other rule checks
@@ -1593,8 +1601,18 @@ def reconcile(
         return _reconcile_one(doc, config)
     config = config or ReconcileConfig()
 
+    settled = split_is_settled(doc.runs)
+
+    def skipped(run: LogicalRun) -> tuple[str, ...]:
+        if settled:
+            return _PACKET_RULES
+        # R-20 on a run whose boundary is unsettled says only that the pages
+        # the planner split off hold no claims, which R-28 already names; the
+        # whole document is asked instead, below.
+        return _PACKET_RULES + _PRINTED_EVIDENCE_RULES + (("R-20",) if run.ambiguous else ())
+
     per_run: list[tuple[LogicalRun, ReconciliationResult]] = [
-        (run, _reconcile_one(run_view(doc, run), config, skip=_PACKET_RULES))
+        (run, _reconcile_one(run_view(doc, run), config, skip=skipped(run)))
         for run in doc.runs
     ]
 
@@ -1622,6 +1640,15 @@ def reconcile(
                     findings.append(finding)
                 continue
             findings.append(finding.model_copy(update={"run_id": run.run_id}))
+
+    if not settled:
+        whole_rules = set(_PRINTED_EVIDENCE_RULES) | {"R-20"}
+        whole = _reconcile_one(
+            doc.model_copy(update={"runs": []}),
+            config,
+            skip=[rule_id for rule_id, _fn in _RULES if rule_id not in whole_rules],
+        )
+        findings.extend(whole.findings)
 
     if "R-28" not in config.disabled_rules:
         for finding in r28_unsettled_run_boundary(doc, config):
