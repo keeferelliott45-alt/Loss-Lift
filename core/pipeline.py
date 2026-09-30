@@ -2573,12 +2573,11 @@ def _run_pipeline(
         row.bounded = plan.bounded and row.page not in plan.blind and (
             run is None or (not run.ambiguous and run.confidence is not RunConfidence.NONE)
         )
-        # A refusal is reported wherever another report's numbering may be why:
-        # in a packet, and wherever the vote was not bounded by what the pages
-        # print. An unsettled run's refusals are named by R-28 instead.
-        row.report = not (run is not None and run.ambiguous) and (
-            bool(runs) or not row.bounded
-        )
+        # A refused row is named by a rule, never dropped quietly. An
+        # unsettled run's refusals are named by R-28 (which lists them); every
+        # other refusal is reported under R-29 -- in a packet, and on a single
+        # report whose vote was bounded, where before no rule named it.
+        row.report = not (run is not None and run.ambiguous)
 
     document = LossRunDocument(
         document_id=ingested.document_id,
