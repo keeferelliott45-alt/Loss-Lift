@@ -55,7 +55,8 @@ def loss_run_pdf(
     for index, chunk in enumerate(chunks, start=1):
         _sheet(
             document,
-            top=(carrier, f"Named Insured: {insured}", f"Policy Number: {policy}",
+            top=(carrier, *((f"Named Insured: {insured}",) if insured else ()),
+                 f"Policy Number: {policy}",
                  *((f"Policy Period: {period}",) if period else ()),
                  "LOSS RUN REPORT", f"Valuation Date: {valuation}"),
             rows=chunk,

@@ -144,3 +144,23 @@ def test_the_workbook_name_carries_nothing_from_the_email(submission):
     name = submission_filename(sub)
     assert name == f"losslift-{sub.submission_id}.xlsx"
     assert "SENTINEL" not in name.upper()
+
+
+def test_a_short_subject_or_file_name_never_scrubs_labels_or_headers(tmp_path):
+    raw = eml([("Claim.pdf", "application/pdf", loss_run_pdf())], subject="Claim",
+              sender="Re <re@example.test>")
+    sub, done = read_submission(raw, run(tmp_path / "profiles"))
+    try:
+        results = {d: r for d, (_s, r) in done.items()}
+        workbook = build_submission_workbook(sub, summarise_submission(sub, results),
+                                             results, redact=True)
+        headers = [c.value for c in workbook["Claims"][1]]
+        assert "Claim number" in headers
+        labels = [r[0] for r in workbook["Submission"].iter_rows(min_row=2, values_only=True)]
+        assert "Submission ID" in labels and "Every attachment accounted for" in labels
+        values = {r[0]: r[1] for r in workbook["Submission"].iter_rows(min_row=2,
+                                                                         values_only=True)}
+        assert values["Subject"] == "[redacted]" and values["Sender"] == "[redacted]"
+    finally:
+        for staged, _r in done.values():
+            discard(staged)

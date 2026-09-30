@@ -65,6 +65,7 @@ Intake and trust are separate:
 Totals are given only when adding them up means something:
 
 - one named insured;
+- every readable document mapped, so none of its claims are missing from the total;
 - one currency;
 - no claim whose identity is uncertain (a run that does not print its carrier
   or policy);
@@ -85,11 +86,16 @@ combined.
 - **Attachment types**:
   - A PDF is recognised by its bytes (`%PDF-`), never by its name or
     declared type.
-  - Attached emails, archives, executables and other formats are rejected
-    with a plain reason.
+  - Attached messages of any kind (`message/*`, including forwarded emails
+    and `message/external-body` references), archives, executables and other
+    formats are rejected with a plain reason. They are never opened.
   - Accepted PDFs go through the same `core.ingest.ingest` as a direct
-    upload, plus an in-memory check that refuses password-protected, damaged
-    or over-long files.
+    upload, plus an in-memory check that refuses damaged or over-long files
+    and files that need a password to open. A PDF with only an owner
+    password (print or copy restrictions) is read, exactly as a direct
+    upload is.
+  - A copy of a PDF that could not be read says so. It stays a duplicate, so
+    one file is never two outstanding items.
 - **What is not claimed**: LossLift does not sanitise PDFs and does not
   promise to detect every kind of active content in one.
 - **File names**:
@@ -138,8 +144,10 @@ combined.
   A PDF that fails to read is deleted at once. An interruption during staging
   or reading deletes everything that email had staged. Rejected attachments
   are never written to disk.
-- **Export redaction** withholds or scrubs, across every cell, the metadata
-  and the file name:
+- **Export redaction** withholds the cells that hold these values, and scrubs
+  them from free-text cells (blockers, reasons, notes). Headers and LossLift's
+  own labels are never scrubbed, so a short subject such as "Claim" cannot
+  mangle the sheet. The workbook metadata and file name carry none of them:
   - the sender and the subject;
   - attachment and source file names;
   - the named insured and policy numbers;

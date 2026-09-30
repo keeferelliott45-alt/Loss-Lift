@@ -158,3 +158,27 @@ def test_a_direct_pdf_upload_behaves_as_before(tmp_path):
 def test_the_uploader_accepts_pdf_and_saved_email():
     source = Path(APP).read_text(encoding="utf-8")
     assert 'type=["pdf", "eml"]' in source
+
+
+def test_evidence_opens_the_claim_on_its_page(emailed):
+    submission, done = emailed
+    at = _open_submission(_app(done, submission), submission)
+    (document_id,) = list(done)
+    at = next(b for b in at.button if b.label == "Evidence").click().run()
+    assert not at.exception
+    picked = at.selectbox(key=f"evidence-pick-{document_id}").value
+    (large,) = [c for a in __import__("core.submission", fromlist=["x"]).summarise_submission(
+        submission, {d: r for d, (_s, r) in done.items()}).accounts for c in a.large_claims]
+    assert picked == f"Claim {large.claim_number}"
+    assert at.selectbox(key=f"evidence-field-{document_id}").value == "incurred_total"
+
+
+def test_a_submission_with_nothing_readable_still_renders(tmp_path):
+    submission, done = read_submission(
+        eml([("notes.docx", "application/octet-stream", b"PK\x03\x04" + b"\0" * 20)]),
+        run(tmp_path / "profiles"))
+    at = _app(done, submission)
+    assert not at.exception
+    at = _open_submission(at, submission)
+    assert not at.exception
+    assert any("No loss run was read" in t or "Incomplete" in t for t in _texts(at))

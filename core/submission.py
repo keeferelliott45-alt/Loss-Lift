@@ -315,8 +315,13 @@ def _currencies(documents: Sequence[LossRunDocument],
 
 
 def _incurred(account: AccountRollup, currencies: set[str], known: bool,
-              separate_accounts: bool) -> tuple[Decimal | None, str | None]:
+              separate_accounts: bool, awaiting_mapping: int = 0,
+              ) -> tuple[Decimal | None, str | None]:
     """The merged incurred total, or the reason it cannot be given."""
+    if awaiting_mapping:
+        # Its claims are not in the account yet, so any total would be low.
+        return None, (f"not totalled: {awaiting_mapping} document(s) still need their "
+                      f"columns mapped, so their claims are not included yet")
     if separate_accounts:
         return None, ("not combined: this submission holds more than one insured, "
                       "or documents that do not name one")
@@ -404,6 +409,7 @@ def summarise_submission(
 
     by_document = {attachment.document_id: attachment for attachment, _ in processed}
     mapped = [result for _, result in processed if not result.needs_mapping]
+    awaiting_mapping = len(processed) - len(mapped)
     rollups = build_accounts(
         [r.document for r in mapped],
         {r.document.document_id: r.reconciliation for r in mapped},
@@ -412,7 +418,7 @@ def summarise_submission(
     accounts: list[AccountSummary] = []
     for rollup in rollups:
         currencies, known = _currencies(rollup.documents, results)
-        total, unavailable = _incurred(rollup, currencies, known, separate)
+        total, unavailable = _incurred(rollup, currencies, known, separate, awaiting_mapping)
         large: list[LargeClaim] = []
         for history in rollup.histories:
             claim = history.current
@@ -494,6 +500,9 @@ def summarise_submission(
     if len(rollups) > 1:
         blockers.append("The documents do not agree on one insured; their figures are "
                         "shown separately and not combined.")
+    elif rollups and rollups[0].name == UNNAMED_ACCOUNT:
+        blockers.append("No document names the insured. Confirm whose loss history this "
+                        "is before using the figures.")
 
     # One insured, named: a submission that names two, or none, is a question
     # for the underwriter however clean each document is.

@@ -79,6 +79,8 @@ REASON_UNSAFE_NAME = ("Its file name contains a path or control characters, whic
 REASON_UNDECODABLE = "Its contents could not be decoded from the email."
 REASON_EMPTY = "It is empty."
 REASON_DUPLICATE = "The same file as attachment {position}; it is read once."
+REASON_DUPLICATE_OF_REFUSED = ("The same file as attachment {position}, which was not read: "
+                               "{reason}")
 REASON_ENCRYPTED = "It is password-protected. Upload an unprotected copy."
 REASON_DAMAGED = "It could not be opened as a PDF; the file may be damaged."
 REASON_TOO_LARGE = "It is larger than the {limit} MB limit for one PDF."
@@ -189,8 +191,9 @@ def _walk(message: Message, limits: EmlLimits) -> Iterator[tuple[Message, int]]:
                 f"over the limit."
             )
         yield part, depth
-        # An attached email is a leaf here: it is rejected, never descended into.
-        if part.is_multipart() and part.get_content_type() != "message/rfc822":
+        # An attached message of any kind is a leaf here: it is rejected, never
+        # descended into (message/external-body would point at remote content).
+        if part.is_multipart() and part.get_content_maintype() != "message":
             children = part.get_payload()
             if isinstance(children, list):
                 stack.extend((child, depth + 1) for child in reversed(children))
@@ -203,7 +206,7 @@ def _is_attachment(part: Message) -> bool:
     are the message itself and are skipped unread. Everything else that is not
     a container counts, so an attachment cannot hide by leaving out a name.
     """
-    if part.get_content_type() == "message/rfc822":
+    if part.get_content_maintype() == "message":
         return True
     if part.is_multipart():
         return False
@@ -339,8 +342,9 @@ def parse_eml(raw: bytes, limits: EmlLimits = DEFAULT_LIMITS) -> ParsedEmail:
             submission.intake_problems.append(attachment.reason)
             submission.inventory_complete = False
             continue
-        if part.get_content_type() == "message/rfc822":
-            attachment.reason = REASON_NESTED_EMAIL
+        if part.get_content_maintype() == "message":
+            attachment.reason = (REASON_NESTED_EMAIL if part.get_content_type() in (
+                "message/rfc822", "message/global") else REASON_UNSUPPORTED)
             continue
         if unsafe:
             attachment.reason = REASON_UNSAFE_NAME
@@ -396,13 +400,28 @@ def parse_eml(raw: bytes, limits: EmlLimits = DEFAULT_LIMITS) -> ParsedEmail:
 # --------------------------------------------------------------------------
 
 
+def _explain_copies(submission: Submission, original: Attachment, reason: str) -> None:
+    """A copy of a PDF that was not read must not say it "is read once".
+
+    The copy stays a duplicate: it is resolved exactly when its original is,
+    so one file is never two blockers.
+    """
+    for other in submission.attachments:
+        if other.duplicate_of == original.attachment_id:
+            other.reason = REASON_DUPLICATE_OF_REFUSED.format(
+                position=original.position, reason=reason)
+
+
 def _page_problem(data: bytes, limits: EmlLimits) -> str | None:
     """Open the PDF in memory: refuse it if protected, damaged or too long."""
     import pymupdf
 
     try:
         with pymupdf.open(stream=data, filetype="pdf") as document:
-            if document.needs_pass or document.is_encrypted:
+            # Only a password that is needed to open the file refuses it. An
+            # owner password (print or copy restrictions) is common on carrier
+            # PDFs and does not stop reading -- a direct upload reads them too.
+            if document.needs_pass:
                 return REASON_ENCRYPTED
             if document.page_count > limits.max_pdf_pages:
                 return REASON_TOO_MANY_PAGES.format(limit=limits.max_pdf_pages)
@@ -427,28 +446,29 @@ def stage_attachments(
     memory are released either way.
     """
     staged: list[PendingAttachment] = []
+
+    def refuse(attachment: Attachment, outcome: IntakeOutcome, reason: str) -> None:
+        attachment.outcome = outcome
+        attachment.processing = ProcessingState.NOT_APPLICABLE
+        attachment.reason = reason
+        _explain_copies(parsed.submission, attachment, reason)
+
     try:
         for pending in parsed.accepted():
             attachment = pending.attachment
             problem = _page_problem(pending.data or b"", limits)
             if problem is not None:
-                attachment.outcome = IntakeOutcome.REJECTED
-                attachment.processing = ProcessingState.NOT_APPLICABLE
-                attachment.reason = problem
+                refuse(attachment, IntakeOutcome.REJECTED, problem)
                 pending.data = None
                 continue
             try:
                 pending.staged = ingest(pending.data or b"", attachment.display_filename, workdir)
             except IngestError:
-                attachment.outcome = IntakeOutcome.REJECTED
-                attachment.processing = ProcessingState.NOT_APPLICABLE
-                attachment.reason = REASON_NOT_PDF
+                refuse(attachment, IntakeOutcome.REJECTED, REASON_NOT_PDF)
                 pending.data = None
                 continue
             except OSError:
-                attachment.outcome = IntakeOutcome.FAILED
-                attachment.processing = ProcessingState.NOT_APPLICABLE
-                attachment.reason = REASON_STAGING
+                refuse(attachment, IntakeOutcome.FAILED, REASON_STAGING)
                 pending.data = None
                 continue
             pending.data = None
@@ -472,6 +492,7 @@ def stage_attachments(
 def process_attachments(
     staged: list[PendingAttachment],
     run: Callable[[IngestedFile], Any],
+    submission: Submission | None = None,
 ) -> dict[str, tuple[IngestedFile, Any]]:
     """Read each staged PDF; map document id to (staged file, result).
 
@@ -493,6 +514,8 @@ def process_attachments(
                 attachment.processing = ProcessingState.FAILED
                 attachment.processing_reason = REASON_PROCESSING
                 pending.staged = None
+                if submission is not None:
+                    _explain_copies(submission, attachment, REASON_PROCESSING)
                 continue
             document_id = result.document.document_id
             attachment.processing = ProcessingState.PROCESSED
@@ -518,5 +541,5 @@ def read_submission(
     """Parse, stage and process one saved email. Raises only on a fatal error."""
     parsed = parse_eml(raw, limits)
     staged = stage_attachments(parsed, limits, workdir)
-    done = process_attachments(staged, run)
+    done = process_attachments(staged, run, parsed.submission)
     return parsed.submission, done

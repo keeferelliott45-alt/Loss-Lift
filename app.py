@@ -830,10 +830,13 @@ def _extract_uploads(uploads: list[Any]) -> None:
     state["notices"] = []
     progress = st.progress(0.0, text="Reading documents")
     added = 0
+    read_email = False
 
     for index, upload in enumerate(uploads, start=1):
         if upload.name.lower().endswith(".eml"):
+            before = len(state["submission_order"])
             added += _extract_email(upload)
+            read_email = read_email or len(state["submission_order"]) > before
             progress.progress(index / len(uploads), text=f"Read {upload.name}")
             continue
         try:
@@ -873,8 +876,11 @@ def _extract_uploads(uploads: list[Any]) -> None:
     progress.empty()
     if added:
         state["last_added"] = added
+    if added or read_email:
         # A fresh uploader key so already-processed files disappear from the
-        # tray instead of sitting there ready to be re-added by accident.
+        # tray instead of sitting there ready to be re-added by accident -- an
+        # email whose attachments were all rejected is still a submission, and
+        # adding it again would list it twice.
         state["uploader_generation"] = state.get("uploader_generation", 0) + 1
     st.rerun()
 
@@ -1637,6 +1643,26 @@ def _inventory_frame(submission: Submission) -> pd.DataFrame:
     ])
 
 
+def _show_evidence(document_id: str, claim_number: str, page: int | None,
+                   row: int | None) -> None:
+    """Open a document at the page and row a summarised claim was read from."""
+    state = _state()
+    state["open_document"] = document_id
+    st.session_state[f"stage-{document_id}"] = REVIEW
+    result = state["documents"].get(document_id)
+    if result is None:
+        return
+    claim = next((c for c in result.document.claims
+                  if c.claim_number == claim_number
+                  and (c.source_page, c.source_row) == (page, row)), None)
+    if claim is None:
+        return
+    st.session_state[f"evidence-pick-{document_id}"] = f"Claim {claim.claim_number}"
+    if "incurred_total" in claim.raw_cells:
+        st.session_state[f"evidence-field-{document_id}"] = "incurred_total"
+    st.session_state[f"show-evidence-{document_id}"] = True
+
+
 def screen_submission(submission_id: str) -> None:
     state = _state()
     submission = state["submissions"].get(submission_id)
@@ -1732,6 +1758,9 @@ def screen_submission(submission_id: str) -> None:
                               else "Needs review")
             if account.incurred_unavailable:
                 st.caption(f"Total incurred {account.incurred_unavailable}.")
+            elif account.status is not DocumentStatus.CLEAN:
+                st.caption("These figures come from documents that still need review; "
+                           "check them before relying on the total.")
             st.text(
                 "Valuation dates: "
                 + (", ".join(d.isoformat() for d in account.valuation_dates) or "not stated")
@@ -1755,7 +1784,8 @@ def screen_submission(submission_id: str) -> None:
                     )
                     if row[3].button("Evidence",
                                      key=f"ev-{submission_id}-{account.name}-{index}"):
-                        state["open_document"] = claim.provenance.document_id
+                        _show_evidence(claim.provenance.document_id, claim.claim_number,
+                                       claim.provenance.page, claim.provenance.row)
                         st.rerun()
 
     st.markdown("### Export")
@@ -1914,7 +1944,10 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     with st.expander("Review findings", expanded=bool(result.reconciliation.findings)):
         _review_workspace(result, document_id)
 
-    with st.expander("Source evidence", expanded=False):
+    # Opened from a submission's Evidence button, the panel starts open on
+    # the claim it was asked about.
+    with st.expander("Source evidence",
+                     expanded=bool(st.session_state.pop(f"show-evidence-{document_id}", False))):
         _evidence_panel(result, document_id)
 
     st.markdown("**Claims**")

@@ -43,11 +43,16 @@ SHEETS = ("Submission", "Attachments", "Documents", "Accounts", "Claims",
           "Large Claims", "Blockers")
 
 
-def _redaction(submission: Submission, results: Mapping[str, Any]) -> RedactionPolicy:
-    """Every sensitive value the workbook could carry, for the soft scrub."""
+def _identifying(submission: Submission, results: Mapping[str, Any]) -> RedactionPolicy:
+    """The email, file, insured and policy values, for scrubbing quoted text.
+
+    Applied only to the free-text cells that can quote them (blockers,
+    reasons, notes) -- never to headers or LossLift's own labels, where a
+    short subject such as "Claim" would otherwise scrub "Claim number" out of
+    every sheet. The cells that hold these values directly are replaced whole.
+    """
     documents = [r.document for r in results.values()]
-    base = RedactionPolicy.from_documents(documents)
-    values: set[str] = set(base.values)
+    values: set[str] = set()
     for value in (submission.sender, submission.subject):
         if value and value.strip():
             values.add(value.strip())
@@ -62,10 +67,7 @@ def _redaction(submission: Submission, results: Mapping[str, Any]) -> RedactionP
             for value in (run.named_insured, run.policy_number):
                 if value and value.strip():
                     values.add(value.strip())
-    return RedactionPolicy(
-        values=tuple(sorted(values, key=len, reverse=True)),
-        name_tokens=base.name_tokens,
-    )
+    return RedactionPolicy(values=tuple(sorted(values, key=len, reverse=True)))
 
 
 def _utc(value: datetime | None) -> str | None:
@@ -89,13 +91,24 @@ def build_submission_workbook(
 
     ``results`` maps the submission's document ids to ``ExtractionResult``.
     """
-    policy = TextPolicy(redaction=_redaction(submission, results) if redact else None)
+    documents = [r.document for r in results.values()]
+    # Claimant names and loss descriptions: scrubbed from every cell, as in the
+    # document workbook.
+    policy = TextPolicy(
+        redaction=RedactionPolicy.from_documents(documents) if redact else None)
+    identifying = _identifying(submission, results) if redact else None
 
     def hidden(value: Any) -> Any:
         """A cell that identifies someone: withheld whole when redacting."""
         if redact and value not in (None, ""):
             return REDACTED_VALUE
         return value
+
+    def quoted(text: Any) -> Any:
+        """Free text that may quote a file name, the insured or the email."""
+        if identifying is None or not isinstance(text, str):
+            return text
+        return identifying.scrub(text)
 
     workbook = Workbook()
     properties = workbook.properties
@@ -119,7 +132,7 @@ def build_submission_workbook(
         ("Status", status_label(summary)),
         ("Every attachment accounted for", "yes" if summary.intake_complete else "no"),
         ("Email read completely", "yes" if submission.inventory_complete else "no"),
-        ("Named insured", hidden(summary.named_insured) or summary.named_insured_note),
+        ("Named insured", hidden(summary.named_insured) or quoted(summary.named_insured_note)),
         ("Attachments", len(submission.attachments)),
         *[(f"Attachments {label.lower()}", n) for label, n in counts.items()],
         ("Set aside by a reviewer", submission.set_aside_count),
@@ -143,9 +156,9 @@ def build_submission_workbook(
     for index, a in enumerate(submission.attachments, start=2):
         _fill_row(sheet, index, [
             a.position, a.attachment_id, hidden(a.display_filename), a.declared_mime,
-            a.size_bytes, a.sha256, OUTCOME_LABELS[a.outcome], a.reason, a.duplicate_of,
-            "yes" if a.set_aside else "no", PROCESSING_LABELS[a.processing],
-            a.processing_reason, a.document_id,
+            a.size_bytes, a.sha256, OUTCOME_LABELS[a.outcome], quoted(a.reason),
+            a.duplicate_of, "yes" if a.set_aside else "no", PROCESSING_LABELS[a.processing],
+            quoted(a.processing_reason), a.document_id,
         ], widths, policy)
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
@@ -199,12 +212,12 @@ def build_submission_workbook(
             hidden(account.name) if account.established else account.name,
             "Reconciled" if account.status.value == "CLEAN" else "Needs review",
             account.claims, account.open_claims, _float(account.incurred_total),
-            account.incurred_unavailable,
+            quoted(account.incurred_unavailable),
             ", ".join(d.isoformat() for d in account.valuation_dates) or None,
             "; ".join(account.policy_periods) or None,
-            "; ".join(account.period_notes) or None,
+            quoted("; ".join(account.period_notes)) or None,
             ", ".join(account.dropped_claims) or None,
-            "; ".join(account.reasons) or None,
+            quoted("; ".join(account.reasons)) or None,
         ], widths, policy)
     _autosize(sheet, widths)
 
@@ -263,7 +276,7 @@ def build_submission_workbook(
     sheet = workbook.create_sheet("Blockers")
     widths = _header_row(sheet, ["#", "Outstanding"], policy)
     for index, blocker in enumerate(summary.blockers or ("None",), start=2):
-        _fill_row(sheet, index, [index - 1 if summary.blockers else None, blocker],
+        _fill_row(sheet, index, [index - 1 if summary.blockers else None, quoted(blocker)],
                   widths, policy)
     _autosize(sheet, widths)
     return workbook

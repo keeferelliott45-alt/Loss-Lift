@@ -207,3 +207,23 @@ def test_a_calendar_year_is_never_presented_as_a_policy_term(read):
     (account,) = summarise_submission(submission, results).accounts
     assert account.policy_periods == ()
     assert account.period_notes[0].startswith("No document prints a policy term")
+
+
+def test_a_document_awaiting_mapping_withholds_the_total(read):
+    submission, results = read([("a.pdf", "application/pdf", PDF_2022),
+                                ("b.pdf", "application/pdf", PDF_2023)])
+    waiting = results[submission.attachments[1].document_id]
+    waiting.mapping.fields = {}
+    (account,) = summarise_submission(submission, results).accounts
+    assert account.claims == 4  # only the mapped document's claims
+    assert account.incurred_total is None
+    assert "columns mapped" in account.incurred_unavailable
+
+
+def test_an_unnamed_insured_is_said_out_loud(read):
+    unnamed = loss_run_pdf(insured="", rows=claim_rows(2, start=66000000))
+    submission, results = read([("a.pdf", "application/pdf", unnamed)])
+    summary = summarise_submission(submission, results)
+    assert summary.named_insured is None
+    assert summary.status == "needs_review"
+    assert any("No document names the insured" in b for b in summary.blockers)

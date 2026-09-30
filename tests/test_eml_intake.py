@@ -543,3 +543,77 @@ def test_a_packet_pdf_is_one_attachment_with_its_runs_intact(tmp_path):
             discard(direct_staged)
     finally:
         _cleanup(done)
+
+
+# --------------------------------------------------------------------------
+# Review fixes
+# --------------------------------------------------------------------------
+
+
+def test_an_owner_password_pdf_reads_exactly_as_a_direct_upload(tmp_path):
+    """Print/copy restrictions do not stop reading; only a needed password does."""
+    from core.ingest import stage_and_run
+
+    document = pymupdf.open(stream=PDF_B, filetype="pdf")
+    restricted = document.tobytes(encryption=pymupdf.PDF_ENCRYPT_AES_256,
+                                  owner_pw="owner-only", user_pw="",
+                                  permissions=pymupdf.PDF_PERM_ACCESSIBILITY)
+    runner = run(tmp_path / "profiles")
+    submission, done = read_submission(
+        eml([("restricted.pdf", "application/pdf", restricted)]), runner)
+    direct_staged, direct = stage_and_run(restricted, "restricted.pdf", runner)
+    try:
+        assert submission.attachments[0].outcome is IntakeOutcome.ACCEPTED
+        (_s, via_email), = done.values()
+        assert _signature(via_email) == _signature(direct)
+    finally:
+        discard(direct_staged)
+        _cleanup(done)
+
+
+def test_every_attached_message_type_is_refused_and_never_walked():
+    raw = (
+        "From: a@example.test\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: multipart/mixed; boundary="B"\r\n\r\n'
+        '--B\r\nContent-Type: message/external-body; access-type=URL; '
+        'URL="https://remote.example.test/losses.pdf"\r\n\r\n'
+        "Content-Type: application/pdf\r\n\r\n\r\n"
+        "--B\r\nContent-Type: message/partial; id=\"x\"; number=1\r\n\r\n"
+        "Content-Type: application/pdf\r\n\r\n%PDF-1.4 fragment\r\n"
+        "--B--\r\n"
+    ).encode()
+    submission = parse_eml(raw).submission
+    assert [a.declared_mime for a in submission.attachments] == [
+        "message/external-body", "message/partial"]
+    assert all(a.outcome is IntakeOutcome.REJECTED for a in submission.attachments)
+    assert all(a.reason == eml_intake.REASON_UNSUPPORTED for a in submission.attachments)
+
+
+def test_a_copy_of_a_pdf_that_was_not_read_says_so_and_is_one_blocker(profiles):
+    from core.submission import summarise_submission
+
+    broken = b"%PDF-1.7\n not really a pdf"
+    submission, done = read_submission(
+        eml([("one.pdf", "application/pdf", broken),
+             ("two.pdf", "application/pdf", broken)]), profiles)
+    first, copy = submission.attachments
+    assert first.outcome is IntakeOutcome.REJECTED
+    assert copy.outcome is IntakeOutcome.DUPLICATE
+    assert "read once" not in copy.reason and "not read" in copy.reason
+    blockers = summarise_submission(submission, {}).blockers
+    assert sum("two.pdf" in b for b in blockers) == 0
+    assert sum("one.pdf" in b for b in blockers) == 1
+    assert submission.set_attachment_aside(first.attachment_id)
+    assert submission.intake_complete
+
+
+def test_a_copy_of_a_pdf_the_pipeline_failed_on_says_so(tmp_path):
+    def fail(_source):
+        raise RuntimeError("synthetic")
+
+    submission, done = read_submission(
+        eml([("one.pdf", "application/pdf", PDF_A), ("two.pdf", "application/pdf", PDF_A)]),
+        fail)
+    first, copy = submission.attachments
+    assert first.processing is ProcessingState.FAILED
+    assert "could not be read as a loss run" in copy.reason
