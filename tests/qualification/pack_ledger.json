@@ -67,7 +67,7 @@
       "shortfalls": [
         "status_differs"
       ],
-      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+      "followup": "Phase 2: the two runs now settle (E9), but the printed totals of a packet whose second run is read by the vision model stay at document level and raise false R-04/R-25. Safe (review), over-flagged."
     },
     "multiline-descriptions": {
       "met": true,
@@ -82,11 +82,8 @@
       "shortfalls": []
     },
     "run-counts-packet": {
-      "met": false,
-      "shortfalls": [
-        "status_differs"
-      ],
-      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+      "met": true,
+      "shortfalls": []
     },
     "same-number-two-carriers": {
       "met": true,
@@ -101,11 +98,8 @@
       "shortfalls": []
     },
     "two-series-digital-packet": {
-      "met": false,
-      "shortfalls": [
-        "status_differs"
-      ],
-      "followup": "Phase 2: every carrier's page prints the same named insured, so headings partially overlap and run 2 is left unsettled (R-28); printed totals and counts then stay at document level and raise false R-04/R-25/R-27. Safe (review), over-flagged."
+      "met": true,
+      "shortfalls": []
     },
     "wrapped-headers": {
       "met": true,

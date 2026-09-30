@@ -15,7 +15,7 @@ prints; the missing-replay case points at an empty recordings directory.
 | cover-page-then-report | a cover letter before a two-page report | supported |
 | foreign-page-bridged | another carrier's page inside a report's numbering | supported |
 | missing-replay | a scanned report with no recording | review |
-| same-number-two-carriers | one claim number printed by two carriers | review |
+| same-number-two-carriers | one claim number printed by two carriers | supported |
 | run-counts-packet | each report prints its own claim count | supported |
 | section-counts-only | per-section counts and no report count | review |
 | printed-count-mismatch | the printed count disagrees with the rows | review |
@@ -156,7 +156,9 @@ def _missing_replay() -> tuple[list[Page], dict[str, Any]]:
 
 def _same_number() -> tuple[list[Page], dict[str, Any]]:
     """The same claim number printed by two carriers: two occurrences, never
-    one. Repeats across runs are flagged by policy (R-11), so it needs review."""
+    one. Two carriers may issue the same number (R-11 is scoped to one carrier
+    and policy), and the loss dates differ, so it is not one claim counted
+    twice: two settled reports read CLEAN."""
     first = _rows("5500", 101, 4, digits=True)
     repeat = Row(("5500103", "06/02/2024", "OPEN", "2,200.00", "1,800.00", "4,000.00"),
                  "5500103")
@@ -165,9 +167,9 @@ def _same_number() -> tuple[list[Page], dict[str, Any]]:
         Page(_top(ASHGROVE, "GL-7007"), first, total_of(first), footer=("Page 1 of 1",)),
         Page(_top(BLUE_LEDGER, "CA-3307"), second, total_of(second), footer=("Page 1 of 1",)),
     ]
-    runs = [_run("r1", [1], None, total_of(first), "NEEDS_REVIEW"),
-            _run("r2", [2], None, total_of(second), "NEEDS_REVIEW")]
-    return pages, document_spec(pages, status="NEEDS_REVIEW", runs=runs, family="digital")
+    runs = [_run("r1", [1], None, total_of(first)),
+            _run("r2", [2], None, total_of(second))]
+    return pages, document_spec(pages, status="CLEAN", runs=runs, family="digital")
 
 
 def _run_counts() -> tuple[list[Page], dict[str, Any]]:
@@ -221,7 +223,7 @@ def build_cases(root: Path) -> list[QualificationCase]:
         _case(root, "foreign-page-bridged", *_foreign_page()),
         _case(root, "missing-replay", *_missing_replay(), expectation=review,
               replay=root / "missing-replay-recordings"),
-        _case(root, "same-number-two-carriers", *_same_number(), expectation=review),
+        _case(root, "same-number-two-carriers", *_same_number()),
         _case(root, "run-counts-packet", *_run_counts()),
         _case(root, "section-counts-only", *_section_counts(), expectation=review),
         _case(root, "printed-count-mismatch", *_count_mismatch(), expectation=review),
