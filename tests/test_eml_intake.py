@@ -448,10 +448,10 @@ def test_an_interruption_while_staging_discards_everything_staged(monkeypatch):
     real_ingest = eml_intake.ingest
     made: list[Path] = []
 
-    def ingest_then_interrupt(data, name, workdir=None):
+    def ingest_then_interrupt(data, name, workdir=None, **limits):
         if made:
             raise KeyboardInterrupt
-        staged = real_ingest(data, name, workdir)
+        staged = real_ingest(data, name, workdir, **limits)
         made.append(staged.path)
         return staged
 

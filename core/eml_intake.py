@@ -6,7 +6,7 @@ Three steps, each separately callable and testable:
    package and lists every attachment with its intake outcome. It decides from
    the bytes alone; nothing is written to disk and no attachment is opened.
 2. :func:`stage_attachments` validates each accepted PDF through the same path
-   a direct upload takes (``core.ingest.ingest``) plus a page check, and stages
+   a direct upload takes (``core.ingest.ingest`` and its preflight), and stages
    it under a generated name. A failure part-way through discards everything
    this call staged.
 3. :func:`process_attachments` runs each staged PDF through the pipeline with
@@ -36,8 +36,20 @@ from email.message import EmailMessage, Message
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator
 
-from core.ingest import MAX_UPLOAD_BYTES, PDF_MAGIC, IngestError, IngestedFile, discard, ingest
-from core.ingest import run_or_discard, sha256_bytes
+from core.ingest import (
+    MAX_PDF_PAGES,
+    MAX_UPLOAD_BYTES,
+    PDF_MAGIC,
+    PREFLIGHT_MESSAGES,
+    IngestedFile,
+    IngestError,
+    PdfPreflightError,
+    PreflightReason,
+    discard,
+    ingest,
+    run_or_discard,
+    sha256_bytes,
+)
 from core.submission import (
     Attachment,
     IntakeOutcome,
@@ -57,7 +69,7 @@ class EmlLimits:
     max_attachments: int = 25
     max_total_attachment_bytes: int = 200 * 1024 * 1024
     max_pdf_bytes: int = MAX_UPLOAD_BYTES
-    max_pdf_pages: int = 1000
+    max_pdf_pages: int = MAX_PDF_PAGES
 
 
 DEFAULT_LIMITS = EmlLimits()
@@ -81,10 +93,13 @@ REASON_EMPTY = "It is empty."
 REASON_DUPLICATE = "The same file as attachment {position}; it is read once."
 REASON_DUPLICATE_OF_REFUSED = ("The same file as attachment {position}, which was not read: "
                                "{reason}")
-REASON_ENCRYPTED = "It is password-protected. Upload an unprotected copy."
-REASON_DAMAGED = "It could not be opened as a PDF; the file may be damaged."
+# The PDF refusals are the shared preflight's own sentences (core.ingest), so
+# a file refused here reads exactly as it would refused as a direct upload.
+REASON_ENCRYPTED = PREFLIGHT_MESSAGES[PreflightReason.PASSWORD]
+REASON_DAMAGED = PREFLIGHT_MESSAGES[PreflightReason.DAMAGED]
+REASON_NO_PAGES = PREFLIGHT_MESSAGES[PreflightReason.NO_PAGES]
 REASON_TOO_LARGE = "It is larger than the {limit} MB limit for one PDF."
-REASON_TOO_MANY_PAGES = "It has more than the {limit}-page limit for one PDF."
+REASON_TOO_MANY_PAGES = PREFLIGHT_MESSAGES[PreflightReason.TOO_MANY_PAGES]
 REASON_OVER_TOTAL = ("The email's attachments exceed the {limit} MB limit in total; this and "
                      "any later attachments were not read.")
 REASON_OVER_COUNT = ("The email has more than {limit} attachments; this and any later "
@@ -412,24 +427,16 @@ def _explain_copies(submission: Submission, original: Attachment, reason: str) -
                 position=original.position, reason=reason)
 
 
-def _page_problem(data: bytes, limits: EmlLimits) -> str | None:
-    """Open the PDF in memory: refuse it if protected, damaged or too long."""
-    import pymupdf
-
-    try:
-        with pymupdf.open(stream=data, filetype="pdf") as document:
-            # Only a password that is needed to open the file refuses it. An
-            # owner password (print or copy restrictions) is common on carrier
-            # PDFs and does not stop reading -- a direct upload reads them too.
-            if document.needs_pass:
-                return REASON_ENCRYPTED
-            if document.page_count > limits.max_pdf_pages:
-                return REASON_TOO_MANY_PAGES.format(limit=limits.max_pdf_pages)
-            if document.page_count == 0:
-                return REASON_DAMAGED
-    except Exception:  # noqa: BLE001 - never surface parser detail
-        return REASON_DAMAGED
-    return None
+def _refusal_reason(error: PdfPreflightError, limits: EmlLimits) -> str:
+    """The inventory's sentence for a PDF the shared preflight refused."""
+    if error.reason is PreflightReason.NOT_PDF:
+        return REASON_NOT_PDF
+    if error.reason is PreflightReason.EMPTY:
+        return REASON_EMPTY
+    if error.reason is PreflightReason.TOO_LARGE:
+        return REASON_TOO_LARGE.format(limit=limits.max_pdf_bytes // (1024 * 1024))
+    # Password, damaged, no pages, too many pages: already a fixed sentence.
+    return str(error)
 
 
 def stage_attachments(
@@ -456,13 +463,16 @@ def stage_attachments(
     try:
         for pending in parsed.accepted():
             attachment = pending.attachment
-            problem = _page_problem(pending.data or b"", limits)
-            if problem is not None:
-                refuse(attachment, IntakeOutcome.REJECTED, problem)
+            try:
+                # The same preflight a direct upload passes: signature, size,
+                # an opening password, damage, no pages, too many pages.
+                pending.staged = ingest(
+                    pending.data or b"", attachment.display_filename, workdir,
+                    max_bytes=limits.max_pdf_bytes, max_pages=limits.max_pdf_pages)
+            except PdfPreflightError as refused_pdf:
+                refuse(attachment, IntakeOutcome.REJECTED, _refusal_reason(refused_pdf, limits))
                 pending.data = None
                 continue
-            try:
-                pending.staged = ingest(pending.data or b"", attachment.display_filename, workdir)
             except IngestError:
                 refuse(attachment, IntakeOutcome.REJECTED, REASON_NOT_PDF)
                 pending.data = None
