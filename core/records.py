@@ -58,6 +58,13 @@ MIN_IDENTIFIER_LENGTH = 3
 #: A whole cell that is just a date. Claim numbers are not dates.
 DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
 
+#: A whole cell that is an amount: a currency mark, or digits grouped in
+#: thousands. Claim numbers carry neither, and a column whose gutters collapse
+#: can put an amount where the claim number should be.
+MONEY_SHAPED = re.compile(
+    r"\(?-?\s*(?:[$€£]\s*-?\s*\d[\d,.]*|\d{1,3}(?:[,.]\d{3})+(?:[.,]\d+)?)\)?-?"
+)
+
 
 #: A worded label that names the claim number itself: "Claim No:",
 #: "Claim Number:", "File No:", "Occurrence:". Some carriers print the label
@@ -118,6 +125,8 @@ def is_identifier_candidate(text: str) -> bool:
     # not resolve without document evidence and so parses to None, which would
     # otherwise read as "not a date" and let a date column bleed in as an
     # identifier.
+    if MONEY_SHAPED.fullmatch(text.strip()):
+        return False
     return not DATE_SHAPED.fullmatch(text)
 
 

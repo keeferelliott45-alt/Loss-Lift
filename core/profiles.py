@@ -69,7 +69,7 @@ LABEL_SYNONYMS: dict[str, str] = {
     "notice date": "date_reported", "date rptd": "date_reported",
     # status and parties
     "status": "claim_status", "stat": "claim_status", "st": "claim_status",
-    "claim status": "claim_status", "open closed": "claim_status",
+    "claim status": "claim_status", "open closed": "claim_status", "o c": "claim_status",
     "claimant": "claimant_name", "claimant name": "claimant_name",
     "injured worker": "claimant_name", "employee": "claimant_name",
     "employee name": "claimant_name", "name": "claimant_name",

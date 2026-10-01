@@ -31,6 +31,7 @@ from core.extract_digital import (
     pages_metadata,
 )
 from core.ingest import IngestedFile, discard, ingest_path, verify_source_unchanged
+from core import labelled_rows
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -1203,9 +1204,31 @@ def build_claims(
         table_mapping = mapping_for(table, mapping)
         shapes = shapes_by_run[_run_of(table, runs)]
         context = table_money_context(table, table_mapping, shapes)
+        # Lines printed under a labelled subtotal or grand total belong to
+        # that total, which is read where printed totals are read.
+        in_totals = {
+            row.line_index
+            for joined in labelled_rows.total_blocks(table, table_mapping.headers).values()
+            for row in joined
+        }
+        # The claim whose labelled money lines may still follow (see
+        # _attach_labelled). Closed by anything that is not one of them.
+        block: dict[str, Any] | None = None
 
         run = _run_of(table, runs)
         for row in table.rows:
+            pending, block = block, None
+            if pending is not None:
+                line = labelled_rows.read_line(row.cells, table_mapping.headers)
+                if line is not None and _attach_labelled(
+                    pending, line, row, locale, dash_means_zero
+                ):
+                    block = pending
+                    continue
+                if line is not None or pending["labels"]:
+                    pending = None  # only a wrapped description may come between
+            if row.line_index in in_totals:
+                continue
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
                 # belongs to the document and not to any claim. It is trusted
@@ -1263,6 +1286,9 @@ def build_claims(
                     previous.loss_description = clean_text(
                         f"{previous.loss_description or ''} {extra}"
                     )
+                    if pending is not None and pending["claim"] is previous:
+                        pending["last_line"] = row.line_index
+                        block = pending
                 elif extra:
                     held_back = bool(
                         claims and not refusal
@@ -1286,6 +1312,7 @@ def build_claims(
                 if claim.claim_number != identifier:
                     claim.claim_number = identifier
                 claims.append(claim)
+                block = {"claim": claim, "labels": set(), "last_line": row.line_index}
                 continue
 
             extra = _continuation_text(row, table_mapping)
@@ -1301,6 +1328,83 @@ def build_claims(
                     context=context, whole=bool(extra and claims),
                 )
     return claims, warnings, unplaced
+
+
+def _settle_labelled_contests(
+    decisions: Sequence[ColumnMappingRecord],
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+) -> list[ColumnMappingRecord]:
+    """Clear a contest a column's own cells have settled as labelled money.
+
+    A detail report heads its money columns Total / Claim / Medical /
+    Expense, and "Claim" alone reads as a claim-number label. Where that
+    column's cells are read as amounts on labelled money lines -- each an
+    amount under a component heading, beside an ``Inc:``/``Pd:``/``O/S:``
+    label -- the document has answered the question R-21 asks. A contested
+    column holding anything else is not touched.
+    """
+    settled: set[str] = set()
+    for table in tables:
+        headers = mapping_for(table, mapping).headers
+        for row in [*table.rows, *table.total_rows]:
+            line = labelled_rows.read_line(row.cells, headers)
+            if line is None:
+                continue
+            settled.update(
+                headers[i] for i in range(len(row.cells))
+                if i < len(headers) and row.cells[i].strip()
+                and labelled_rows.component(headers[i]) is not None
+            )
+    return [
+        record.model_copy(update={"state": MappingState.UNMAPPED, "contested_field": None})
+        if record.state is MappingState.AMBIGUOUS and record.contested_field
+        and record.source_header_raw in settled
+        else record
+        for record in decisions
+    ]
+
+
+def _attach_labelled(
+    block: dict[str, Any],
+    line: labelled_rows.LabelledLine,
+    row: RawRow,
+    locale: str | None,
+    dash_means_zero: bool,
+) -> bool:
+    """Give a claim the money printed on a labelled line beneath it.
+
+    Only the very next printed line after the claim (or after its wrapped
+    description, or its previous labelled line), only a kind of money the
+    claim has not had yet, and only into fields its own line left empty.
+    Anything else is refused whole and stays what it was: unplaced money a
+    rule reports. A line attached to the wrong claim would be money nobody
+    could ever find again.
+    """
+    claim: Claim = block["claim"]
+    if row.page != claim.source_page or row.line_index != block["last_line"] + 1:
+        return False
+    if line.kind in block["labels"]:
+        return False
+    parsed = {}
+    for name, cell in line.values.items():
+        if getattr(claim, name) is not None or claim.raw_cells.get(name, "").strip():
+            return False
+        value = parse_money(cell, locale, dash_means_zero=dash_means_zero)
+        if value.value is None:
+            return False
+        parsed[name] = (cell, value)
+    for name, (cell, value) in parsed.items():
+        setattr(claim, name, value.value)
+        claim.raw_cells[name] = cell
+        claim.field_issues.pop(name, None)
+        claim.field_confidence[name] = 1.0
+    claim.source_lines = [*claim.source_lines, *row.source_lines]
+    if line.text:
+        claim.loss_description = clean_text(f"{claim.loss_description or ''} {line.text}")
+    block["labels"].add(line.kind)
+    block["last_line"] = row.line_index
+    return True
 
 
 def _same_run(claim: Claim, run: int, runs: Mapping[int, int] | None) -> bool:
@@ -1565,6 +1669,33 @@ def collect_printed_totals(
     return _document_total(tables, mapping, locale, claim_count)[0]
 
 
+def _total_cells(
+    row: RawRow, table: RawTable, mapping: ColumnMapping
+) -> list[tuple[str, str]]:
+    """Each money field a printed total row states, with the cell stating it.
+
+    A total printed as a stack of labelled lines (``Inc:``, ``Pd:``, ``O/S:``)
+    is read through the label and the column together, the lines under it
+    included; any other total row through the column mapping alone.
+    """
+    blocks = labelled_rows.total_blocks(table, mapping.headers)
+    if (row.page, -row.line_index) in blocks:
+        return []  # part of another total's stack, read there
+    joined = blocks.get((row.page, row.line_index))
+    if joined is not None:
+        values = labelled_rows.block_values(row, joined, mapping.headers)
+        return [(name, cell.strip()) for name, cell in values.items() if cell.strip()]
+    cells = []
+    for index, field_name in mapping.fields.items():
+        if field_name not in MONEY_FIELDS:
+            continue
+        cell = row.cell(index).strip()
+        if not cell or _is_the_claim_count(row, index):
+            continue
+        cells.append((field_name, cell))
+    return cells
+
+
 def _document_total(
     tables: Sequence[RawTable],
     mapping: ColumnMapping,
@@ -1587,12 +1718,7 @@ def _document_total(
         for row in table.total_rows:
             totals: dict[str, Decimal | None] = {}
             unreadable: dict[str, str] = {}
-            for index, field_name in table_mapping.fields.items():
-                if field_name not in MONEY_FIELDS:
-                    continue
-                cell = row.cell(index).strip()
-                if not cell or _is_the_claim_count(row, index):
-                    continue
+            for field_name, cell in _total_cells(row, table, table_mapping):
                 if _is_smeared(cell):
                     # Refusing it is right; losing it is not. The other columns
                     # of this row tying says nothing about this one, and R-04
@@ -1689,12 +1815,7 @@ def collect_printed_sections(
 
             totals: dict[str, Decimal | None] = {}
             unreadable: dict[str, str] = {}
-            for index, field_name in table_mapping.fields.items():
-                if field_name not in MONEY_FIELDS:
-                    continue
-                cell = row.cell(index).strip()
-                if not cell or _is_the_claim_count(row, index):
-                    continue
+            for field_name, cell in _total_cells(row, table, table_mapping):
                 if _is_smeared(cell):
                     # Refusing the cell is right; losing it is not. The column
                     # stops being checked either way, and only the printed text
@@ -2686,7 +2807,7 @@ def _run_pipeline(
         ),
         policy_periods=declared_periods,
         rows_seen_per_page=rows_seen_per_page,
-        column_mapping=mapping.decisions,
+        column_mapping=_settle_labelled_contests(mapping.decisions, tables, mapping),
         printed_sections=printed_sections,
         runs=runs,
         incomplete_report=plan.incomplete,
