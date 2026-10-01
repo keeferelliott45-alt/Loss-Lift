@@ -182,19 +182,83 @@ def page_words(page: pdfplumber.page.Page) -> list[Word]:
     if sizes:
         scale = statistics.median(sizes) / NOMINAL_TEXT_SIZE
         tolerance = min(NOMINAL_WORD_TOLERANCE, NOMINAL_WORD_TOLERANCE * scale)
-    return _to_words(
+    return join_currency_marks(_to_words(
         page.extract_words(
             use_text_flow=False,
             keep_blank_chars=False,
             x_tolerance=tolerance,
             y_tolerance=tolerance,
         )
-    )
+    ))
+
+
+#: A currency mark standing as a word of its own.
+_CURRENCY_MARK = re.compile(r"[$€£]")
+#: A piece of a printed amount: digits, separators, sign, parentheses, a dash.
+_AMOUNT_PIECE = re.compile(r"\(?-?[\d,.]*\d[\d,.]*\)?-?|-+|\(|\)")
+#: How many stand-alone marks show a page is set in accounting format.
+ACCOUNTING_EVIDENCE = 3
+
+
+def join_currency_marks(words: list[Word]) -> list[Word]:
+    """Join a stand-alone currency mark to the amount it introduces.
+
+    Spreadsheet accounting format prints the mark at the left edge of the
+    cell and the amount at the right, so the widest space on the line can be
+    the one *inside* a cell. Read as a gutter, it splits every money column in
+    two and files the mark as a value. A page shows the format by printing
+    several marks as words of their own; there, each mark joins the amount
+    that follows it on its line -- the next word, if it is a piece of an
+    amount, and any pieces kerned hard against it ("3" "70.50"). A mark
+    followed by anything else, or by another mark, is left as it was.
+    """
+    marks = [w for w in words if _CURRENCY_MARK.fullmatch(w.text)]
+    if len(marks) < ACCOUNTING_EVIDENCE:
+        return words
+    char_width = _median_char_width(words)
+    used: set[int] = set()
+    joined: dict[int, Word] = {}
+    order = sorted(range(len(words)), key=lambda i: (words[i].x0, words[i].top))
+    for i, mark in enumerate(words):
+        if not _CURRENCY_MARK.fullmatch(mark.text) or i in used:
+            continue
+        height = max(mark.bottom - mark.top, 1e-6)
+        same_line = [
+            j for j in order
+            if j != i and j not in used and words[j].x0 >= mark.x1 - 1e-6
+            and abs(words[j].centre - mark.centre) < height / 2
+        ]
+        pieces: list[int] = []
+        for j in same_line:
+            word = words[j]
+            if _CURRENCY_MARK.fullmatch(word.text) or not _AMOUNT_PIECE.fullmatch(word.text):
+                break
+            if pieces and word.x0 - words[pieces[-1]].x1 > char_width:
+                break
+            pieces.append(j)
+        if not pieces:
+            continue
+        last = words[pieces[-1]]
+        joined[i] = Word(
+            text=f"{mark.text} " + "".join(words[j].text for j in pieces),
+            x0=mark.x0, x1=last.x1,
+            top=min(mark.top, *(words[j].top for j in pieces)),
+            bottom=max(mark.bottom, *(words[j].bottom for j in pieces)),
+        )
+        used.update(pieces)
+        used.add(i)
+    if not joined:
+        return words
+    return [joined.get(i, w) for i, w in enumerate(words) if i in joined or i not in used]
 
 
 def _median_char_width(words: Sequence[Word]) -> float:
+    # A word holding a space is an amount joined to its currency mark across
+    # the cell (see join_currency_marks): its width is the cell's, not its
+    # characters', and would inflate every threshold measured from this.
     widths = [
-        (word.x1 - word.x0) / len(word.text) for word in words if word.text
+        (word.x1 - word.x0) / len(word.text)
+        for word in words if word.text and " " not in word.text
     ]
     return statistics.median(widths) if widths else 4.0
 

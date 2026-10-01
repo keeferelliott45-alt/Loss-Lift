@@ -89,6 +89,9 @@ LABEL_SYNONYMS: dict[str, str] = {
     "total payment": "paid_total", "total payments": "paid_total",
     "reserve": "reserve_total", "reserves": "reserve_total",
     "outstanding": "reserve_total", "rsv tot": "reserve_total",
+    # What is still held: the reserve outstanding, named as such.
+    "rem reserve": "reserve_total", "remaining reserve": "reserve_total",
+    "reserve remaining": "reserve_total", "outstanding reserve": "reserve_total",
     "recovery": "recovery_total", "recoveries": "recovery_total",
     "recov": "recovery_total", "subrogation": "recovery_total",
     "subro": "recovery_total", "salvage": "recovery_total",
@@ -154,6 +157,14 @@ class FieldGuess:
     contested_field: str | None = None
 
 
+#: Bare words that name a field only loosely. A register printing a bare
+#: "Reserve" beside "Rem Reserve" uses the bare one for something else --
+#: commonly the reserve first set, paid included -- so where both claim the
+#: reserve, the qualified label keeps it and the bare one is left contested
+#: for a person to place (R-21). Alone, the bare word still maps.
+_BARE_RANK = {"reserve": 0.95, "reserves": 0.95}
+
+
 def guess_field(label: str) -> FieldGuess:
     """Map one printed column label onto a canonical field.
 
@@ -165,7 +176,8 @@ def guess_field(label: str) -> FieldGuess:
         return FieldGuess(None, 0.0, "unmapped")
 
     if normalized in LABEL_SYNONYMS:
-        return FieldGuess(LABEL_SYNONYMS[normalized], 1.0, "synonym")
+        return FieldGuess(LABEL_SYNONYMS[normalized], _BARE_RANK.get(normalized, 1.0),
+                          "synonym")
 
     tokens = normalized.split()
     token_set = set(tokens)

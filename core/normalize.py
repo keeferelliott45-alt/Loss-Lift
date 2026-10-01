@@ -215,6 +215,19 @@ def parse_money(
             return NumberParse(value=Decimal("0"), raw=original)
         return _fail(original, NullReason.DASH_PLACEHOLDER)
 
+    # Spreadsheet accounting format sets the currency mark apart at the left
+    # of the cell: "$   -" is how it prints zero, and "$ (1,000.00)" a
+    # negative. A bare dash stays a placeholder; one introduced by a currency
+    # mark is that format's zero and nothing else.
+    accounting = re.fullmatch(r"([$€£])\s*(.*)", text)
+    if accounting:
+        rest = accounting.group(2).strip()
+        if re.fullmatch(r"-+", rest):
+            return NumberParse(value=Decimal("0"), raw=original,
+                               currency=CURRENCY_SYMBOLS[accounting.group(1)])
+        if rest.startswith("(") and rest.endswith(")"):
+            text = f"({accounting.group(1)}{rest[1:-1].strip()})"
+
     sign = Decimal(1)
 
     # Credit / debit suffix or prefix: "1,234.56 CR"
