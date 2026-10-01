@@ -158,7 +158,42 @@ def consensus_shapes(candidates: Sequence[str]) -> set[str]:
     # claim on it is ordinary. Requiring two would extract nothing from it.
     most_common = shapes.most_common(1)[0][1]
     floor = min(most_common, max(2, int(most_common * 0.25)))
-    return {shape for shape, count in shapes.items() if count >= floor}
+    admitted = {shape for shape, count in shapes.items() if count >= floor}
+    # A series whose numbers grew or lost a digit -- "AL201406511-1" in one
+    # year, "AL20158493-2" the next -- is still the series. Its shape differs
+    # from an admitted one only in how long its runs are, and where it
+    # recurs it is admitted beside it, however small its share. A one-off
+    # stays a one-off, and a shape of another pattern earns nothing here.
+    series = set(admitted)
+    admitted |= {
+        shape for shape, count in shapes.items()
+        if count >= 2 and any(same_series(shape, known) for known in series)
+    }
+    return admitted
+
+
+def _runs(shape: str) -> list[tuple[str, int]]:
+    return [(match.group(0)[0], len(match.group(0))) for match in re.finditer(r"(.)\1*", shape)]
+
+
+def same_series(shape: str, other: str) -> bool:
+    """One series whose numbers grew or lost a digit: AA99999999-9 / AA999999999-9.
+
+    The runs must line up one for one: letters and punctuation exactly, each
+    run of digits within one digit of its counterpart. A three-digit office
+    code is not a twelve-digit claim number's series.
+    """
+    mine, theirs = _runs(shape), _runs(other)
+    if len(mine) != len(theirs):
+        return False
+    for (kind, length), (other_kind, other_length) in zip(mine, theirs):
+        if kind != other_kind:
+            return False
+        if kind == "9" and abs(length - other_length) > 1:
+            return False
+        if kind != "9" and length != other_length:
+            return False
+    return True
 
 
 def leading_identifier(cell: str, shapes: set[str]) -> str | None:
