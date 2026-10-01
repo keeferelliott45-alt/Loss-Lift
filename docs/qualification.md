@@ -105,6 +105,37 @@ to its page.
 **Errors.** A validation error names positions and field names only, never a
 value, claim number or file name.
 
+## Labelling: writing truth from the page
+
+Truth is written from the printed page, never from LossLift's output. The
+helper in `tools/qualification/label.py` never imports the pipeline; a test
+enforces that.
+
+```
+python -m tools.qualification skeleton --manifest M --corpus C --out T
+python -m tools.qualification review --manifest M --corpus C --truth T --out DIR
+python -m tools.qualification sign-off --truth T --document ID [--note TEXT]
+```
+
+1. **skeleton** writes a blank entry per manifest document. It holds only
+   what the bytes say: id, hash, page count, one entry per page. Every
+   judgement (format family, page roles, statuses, printed counts) is
+   `"TODO"`, which `validate` refuses. It never overwrites a truth file.
+2. Labels are filled in from the page. Until a person has checked them the
+   document stays `provisional`.
+3. **review** writes one self-contained HTML sheet per document. Each page
+   image sits beside the labels anchored to it, with the printed facts, the
+   completeness check and a list of what is still `TODO`. It reads the truth
+   leniently, so a half-written file can be reviewed.
+4. **sign-off** marks one document `adjudicated` after the person who checked
+   the sheet confirms it. It refuses incomplete truth, and appends the time,
+   id and hash to `T.signoff.log` beside the truth file.
+
+Every output holds real document content (the sheets hold page images). Like
+the corpus and truth, it must live outside the repository, and the commands
+refuse a path inside it. Sheets are delivered to the reviewer privately,
+never published.
+
 ## How a document is scored
 
 **Matching** is one to one, by printed identifier and page anchor, never by
