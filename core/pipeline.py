@@ -2556,13 +2556,17 @@ def _run_pipeline(
         # Count rows that carry a claim number: those are the rows that ought
         # to survive stitching. A row skipped for having no claim number is
         # already reported on its own, and counting it here would make R-19
-        # repeat that warning as a phantom stitching loss.
+        # repeat that warning as a phantom stitching loss. Nor is a wrapped
+        # description whose words run across the claim-number column: prose
+        # there is not a claim number, and every claim row passes the same
+        # candidate test whether or not the reading kept it.
         index = table_mapping.index_of("claim_number")
         rows_seen_per_page[table.page] = sum(
             1
             for row in table.rows
             if index is not None
             and row.cell(index).strip()
+            and is_identifier_candidate(strip_identifier_label(row.cell(index).strip()))
             and not is_structural_row(row, table_mapping)
             and (text := _normalised(row))
             and text not in furniture

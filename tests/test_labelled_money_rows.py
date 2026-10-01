@@ -216,3 +216,13 @@ def test_a_contested_column_holding_text_is_still_reported():
     headers = ("Claim Number", "O/C", "Total", "Claim")
     assert read_line(("", "Pd:", "$5.00", "$5.00"), headers) is not None
     assert read_line(("", "Pd:", "$5.00", "AB1234"), headers) is None
+
+
+def test_a_description_crossing_the_claim_number_column_is_not_a_claim_row(tmp_path):
+    long = tuple(
+        (*claim[:6], "PATIENT STATED THAT WHILE WORKING AS A SUPERINTENDANT HE FELL", *claim[7:])
+        for claim in CLAIMS
+    )
+    result = _read(tmp_path, claims=long)
+    assert len(result.document.claims) == len(CLAIMS)
+    assert "R-19" not in result.reconciliation.rule_ids()
