@@ -1398,6 +1398,55 @@ def _extract_record_table(
         column_bounds=[bound for bounds, _ in slices for bound in bounds],
     )
 
+def header_continuations_below(
+    lines: Sequence[Line], header: Line, char_width: float
+) -> list[Line]:
+    """Label lines printed directly under the header, inside its labels.
+
+    A line belongs when it carries no digit, sits at most two line-heights
+    below the line before it, and every word on it centres within one of the
+    header's words (give or take a character). A heading set under the
+    table's left edge, or the first claim, fails one of those.
+    """
+    if not header.words:
+        return []
+    height = max(word.bottom - word.top for word in header.words)
+    found: list[Line] = []
+    previous = header
+    for line in sorted((l for l in lines if l.index > header.index), key=lambda l: l.index):
+        if not line.words or any(ch.isdigit() for w in line.words for ch in w.text):
+            break
+        gap = min(w.top for w in line.words) - min(w.top for w in previous.words)
+        if not 0 < gap <= 2 * height:
+            break
+        if not all(
+            any(h.x0 - char_width <= w.middle <= h.x1 + char_width for h in header.words)
+            for w in line.words
+        ):
+            break
+        found.append(line)
+        previous = line
+    return found
+
+
+def fold_below(header: Line, below: Sequence[Line], char_width: float) -> Line:
+    """The header with each continuation word appended to the label above it."""
+    extra: dict[int, list[str]] = {}
+    for line in below:
+        for word in sorted(line.words, key=lambda w: w.x0):
+            owner = min(
+                range(len(header.words)),
+                key=lambda i: abs(header.words[i].middle - word.middle),
+            )
+            extra.setdefault(owner, []).append(word.text)
+    words = tuple(
+        Word(text=" ".join([w.text, *extra.get(i, [])]), x0=w.x0, x1=w.x1,
+             top=w.top, bottom=w.bottom)
+        for i, w in enumerate(header.words)
+    )
+    return Line(words=words, index=header.index)
+
+
 def _extract_positioned_table(
     page: pdfplumber.page.Page, page_number: int
 ) -> RawTable | None:
@@ -1432,6 +1481,25 @@ def _extract_positioned_table(
         )
         if reconstructed is not None:
             return reconstructed
+
+    # A label can also wrap downward: "Total" on the header line, then
+    # "Outstanding" and "Reserve" beneath it in the same column. Those lines
+    # are labels, not claims, and the column is the whole of them. (A block
+    # that looked like one label line per record line, and whose body bore no
+    # records out, reaches here too: its lower lines are then this.)
+    header_raw = next((line for line in lines if line.index == header_index), None)
+    below = (
+        [] if header_raw is None
+        else header_continuations_below(lines, header_raw, char_width)
+    )
+    if below:
+        folded = fold_below(header_raw, below, char_width)
+        before = [text for text, _, _ in split_cells(header_raw, char_width)]
+        after = [text for text, _, _ in split_cells(folded, char_width)]
+        if header_score(after) >= header_score(before):
+            block_end = max(block_end, below[-1].index)
+        else:
+            below = []
 
     body = [line for line in lines if line.index > block_end]
     # A strapline set well below the last row is not part of the table: not a
@@ -1471,6 +1539,9 @@ def _extract_positioned_table(
             index=header_index,
         ),
     )
+    if below:
+        header_line = fold_below(header_line, below, char_width)
+        header_cells = split_cells(header_line, char_width)
 
     # Three ways to find the columns, each with its own failure mode, and the
     # one that names the most of them wins. The third reads the whole header
