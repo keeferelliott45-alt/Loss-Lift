@@ -31,6 +31,7 @@ from core.extract_digital import (
     pages_metadata,
 )
 from core.ingest import IngestedFile, discard, ingest_path, verify_source_unchanged
+from core import labelled_rows
 from core.normalize import (
     DateOrderInference,
     LocaleInference,
@@ -62,6 +63,7 @@ from core.records import (
     consensus_shapes,
     is_identifier_candidate,
     leading_identifier,
+    strip_identifier_label,
 )
 from core.reconcile import ReconcileConfig, reconcile
 from core.review import (
@@ -1020,7 +1022,7 @@ def accepted_identifier_shapes(
         if index is None:
             continue
         for row in table.rows:
-            cell = row.cell(index).strip()
+            cell = strip_identifier_label(row.cell(index))
             if cell and is_identifier_candidate(cell):
                 candidates.append(cell)
     return consensus_shapes(candidates)
@@ -1069,7 +1071,7 @@ def identifier_shapes_by_run(
         if index is None:
             continue
         for row in table.rows:
-            cell = row.cell(index).strip()
+            cell = strip_identifier_label(row.cell(index))
             if not cell or not is_identifier_candidate(cell):
                 continue
             printed[run].append(cell)
@@ -1129,11 +1131,21 @@ def is_structural_row(row: RawRow, mapping: ColumnMapping) -> bool:
     how much of the value follows the colon depends on where the column
     boundary happens to fall. A claim number contains no colon at all, so a
     worded label ahead of one marks the row as printed furniture.
+
+    Except where the label names the claim number itself. "Claim No: WC-1004"
+    is a claim some carriers print with its label in the cell, and dropping it
+    here removed it from the claims and from the per-page row count alike, so
+    nothing disagreed and the document could read clean with a claim missing.
+    Such a row goes on to be judged as a claim like any other; whether it
+    becomes one is still the identifier vote's decision.
     """
     index = mapping.index_of("claim_number")
     if index is None:
         return False
-    label, separator, _ = row.cell(index).strip().partition(":")
+    cell = row.cell(index).strip()
+    if strip_identifier_label(cell) != cell:
+        return False
+    label, separator, _ = cell.partition(":")
     return bool(separator) and bool(label) and label.replace(" ", "").isalpha()
 
 
@@ -1192,9 +1204,31 @@ def build_claims(
         table_mapping = mapping_for(table, mapping)
         shapes = shapes_by_run[_run_of(table, runs)]
         context = table_money_context(table, table_mapping, shapes)
+        # Lines printed under a labelled subtotal or grand total belong to
+        # that total, which is read where printed totals are read.
+        in_totals = {
+            row.line_index
+            for joined in labelled_rows.total_blocks(table, table_mapping.headers).values()
+            for row in joined
+        }
+        # The claim whose labelled money lines may still follow (see
+        # _attach_labelled). Closed by anything that is not one of them.
+        block: dict[str, Any] | None = None
 
         run = _run_of(table, runs)
         for row in table.rows:
+            pending, block = block, None
+            if pending is not None:
+                line = labelled_rows.read_line(row.cells, table_mapping.headers)
+                if line is not None and _attach_labelled(
+                    pending, line, row, locale, dash_means_zero
+                ):
+                    block = pending
+                    continue
+                if line is not None or pending["labels"]:
+                    pending = None  # only a wrapped description may come between
+            if row.line_index in in_totals:
+                continue
             if row.kind == "meta" or is_structural_row(row, table_mapping):
                 # ``meta`` is the extractor's own finding that this line
                 # belongs to the document and not to any claim. It is trusted
@@ -1252,6 +1286,9 @@ def build_claims(
                     previous.loss_description = clean_text(
                         f"{previous.loss_description or ''} {extra}"
                     )
+                    if pending is not None and pending["claim"] is previous:
+                        pending["last_line"] = row.line_index
+                        block = pending
                 elif extra:
                     held_back = bool(
                         claims and not refusal
@@ -1275,6 +1312,7 @@ def build_claims(
                 if claim.claim_number != identifier:
                     claim.claim_number = identifier
                 claims.append(claim)
+                block = {"claim": claim, "labels": set(), "last_line": row.line_index}
                 continue
 
             extra = _continuation_text(row, table_mapping)
@@ -1290,6 +1328,83 @@ def build_claims(
                     context=context, whole=bool(extra and claims),
                 )
     return claims, warnings, unplaced
+
+
+def _settle_labelled_contests(
+    decisions: Sequence[ColumnMappingRecord],
+    tables: Sequence[RawTable],
+    mapping: ColumnMapping,
+) -> list[ColumnMappingRecord]:
+    """Clear a contest a column's own cells have settled as labelled money.
+
+    A detail report heads its money columns Total / Claim / Medical /
+    Expense, and "Claim" alone reads as a claim-number label. Where that
+    column's cells are read as amounts on labelled money lines -- each an
+    amount under a component heading, beside an ``Inc:``/``Pd:``/``O/S:``
+    label -- the document has answered the question R-21 asks. A contested
+    column holding anything else is not touched.
+    """
+    settled: set[str] = set()
+    for table in tables:
+        headers = mapping_for(table, mapping).headers
+        for row in [*table.rows, *table.total_rows]:
+            line = labelled_rows.read_line(row.cells, headers)
+            if line is None:
+                continue
+            settled.update(
+                headers[i] for i in range(len(row.cells))
+                if i < len(headers) and row.cells[i].strip()
+                and labelled_rows.component(headers[i]) is not None
+            )
+    return [
+        record.model_copy(update={"state": MappingState.UNMAPPED, "contested_field": None})
+        if record.state is MappingState.AMBIGUOUS and record.contested_field
+        and record.source_header_raw in settled
+        else record
+        for record in decisions
+    ]
+
+
+def _attach_labelled(
+    block: dict[str, Any],
+    line: labelled_rows.LabelledLine,
+    row: RawRow,
+    locale: str | None,
+    dash_means_zero: bool,
+) -> bool:
+    """Give a claim the money printed on a labelled line beneath it.
+
+    Only the very next printed line after the claim (or after its wrapped
+    description, or its previous labelled line), only a kind of money the
+    claim has not had yet, and only into fields its own line left empty.
+    Anything else is refused whole and stays what it was: unplaced money a
+    rule reports. A line attached to the wrong claim would be money nobody
+    could ever find again.
+    """
+    claim: Claim = block["claim"]
+    if row.page != claim.source_page or row.line_index != block["last_line"] + 1:
+        return False
+    if line.kind in block["labels"]:
+        return False
+    parsed = {}
+    for name, cell in line.values.items():
+        if getattr(claim, name) is not None or claim.raw_cells.get(name, "").strip():
+            return False
+        value = parse_money(cell, locale, dash_means_zero=dash_means_zero)
+        if value.value is None:
+            return False
+        parsed[name] = (cell, value)
+    for name, (cell, value) in parsed.items():
+        setattr(claim, name, value.value)
+        claim.raw_cells[name] = cell
+        claim.field_issues.pop(name, None)
+        claim.field_confidence[name] = 1.0
+    claim.source_lines = [*claim.source_lines, *row.source_lines]
+    if line.text:
+        claim.loss_description = clean_text(f"{claim.loss_description or ''} {line.text}")
+    block["labels"].add(line.kind)
+    block["last_line"] = row.line_index
+    return True
 
 
 def _same_run(claim: Claim, run: int, runs: Mapping[int, int] | None) -> bool:
@@ -1315,7 +1430,7 @@ def _note_refusal(
     index = mapping.index_of("claim_number")
     if index is None:
         return False
-    cell = row.cell(index).strip()
+    cell = strip_identifier_label(row.cell(index))
     if not cell or not is_identifier_candidate(cell):
         return False
     values = _row_values(row, mapping)
@@ -1554,6 +1669,33 @@ def collect_printed_totals(
     return _document_total(tables, mapping, locale, claim_count)[0]
 
 
+def _total_cells(
+    row: RawRow, table: RawTable, mapping: ColumnMapping
+) -> list[tuple[str, str]]:
+    """Each money field a printed total row states, with the cell stating it.
+
+    A total printed as a stack of labelled lines (``Inc:``, ``Pd:``, ``O/S:``)
+    is read through the label and the column together, the lines under it
+    included; any other total row through the column mapping alone.
+    """
+    blocks = labelled_rows.total_blocks(table, mapping.headers)
+    if (row.page, -row.line_index) in blocks:
+        return []  # part of another total's stack, read there
+    joined = blocks.get((row.page, row.line_index))
+    if joined is not None:
+        values = labelled_rows.block_values(row, joined, mapping.headers)
+        return [(name, cell.strip()) for name, cell in values.items() if cell.strip()]
+    cells = []
+    for index, field_name in mapping.fields.items():
+        if field_name not in MONEY_FIELDS:
+            continue
+        cell = row.cell(index).strip()
+        if not cell or _is_the_claim_count(row, index):
+            continue
+        cells.append((field_name, cell))
+    return cells
+
+
 def _document_total(
     tables: Sequence[RawTable],
     mapping: ColumnMapping,
@@ -1576,12 +1718,7 @@ def _document_total(
         for row in table.total_rows:
             totals: dict[str, Decimal | None] = {}
             unreadable: dict[str, str] = {}
-            for index, field_name in table_mapping.fields.items():
-                if field_name not in MONEY_FIELDS:
-                    continue
-                cell = row.cell(index).strip()
-                if not cell or _is_the_claim_count(row, index):
-                    continue
+            for field_name, cell in _total_cells(row, table, table_mapping):
                 if _is_smeared(cell):
                     # Refusing it is right; losing it is not. The other columns
                     # of this row tying says nothing about this one, and R-04
@@ -1678,12 +1815,7 @@ def collect_printed_sections(
 
             totals: dict[str, Decimal | None] = {}
             unreadable: dict[str, str] = {}
-            for index, field_name in table_mapping.fields.items():
-                if field_name not in MONEY_FIELDS:
-                    continue
-                cell = row.cell(index).strip()
-                if not cell or _is_the_claim_count(row, index):
-                    continue
+            for field_name, cell in _total_cells(row, table, table_mapping):
                 if _is_smeared(cell):
                     # Refusing the cell is right; losing it is not. The column
                     # stops being checked either way, and only the printed text
@@ -2141,10 +2273,20 @@ def _run_pipeline(
                     unread_image_pages.add(number)
                     if set(left) & set(record.fragment_boxes):
                         partly_recognised.add(number)
-    processed_pages = set(extraction.page_texts) - unread_image_pages
+    # Text in a font that cannot be decoded was withheld from the reading.
+    # It may be a print date or a claim row; nothing can say which, so the
+    # page is not called read.
+    undecodable_pages = set(extraction.undecodable_pages) & set(extraction.page_texts)
+    processed_pages = set(extraction.page_texts) - unread_image_pages - undecodable_pages
     failed_pages: set[int] = set()
     skipped_pages: set[int] = set()
-    unresolved_pages: set[int] = set(unread_image_pages)
+    unresolved_pages: set[int] = set(unread_image_pages) | undecodable_pages
+    if undecodable_pages:
+        joined = ", ".join(str(page) for page in sorted(undecodable_pages))
+        warnings.append(
+            f"Page(s) {joined} print text in a font whose characters cannot be "
+            f"decoded. That text was not read; whether it holds claims is unknown."
+        )
     unrecognised = sorted(unread_image_pages - partly_recognised)
     if unrecognised:
         joined = ", ".join(str(page) for page in unrecognised)
@@ -2323,12 +2465,40 @@ def _run_pipeline(
     runs = plan.runs
     groups, borrowed = vote_plan(runs)
 
+    # Where the planner has established that pages are one report, the text
+    # layer and the scan are two readings of it, and a claim-number vote taken
+    # by each reader alone lets a scanned page's rows vote on themselves: a
+    # dated cause code under a claim, a shape nothing else shares, becomes a
+    # claim. Established means a settled run of a packet, or a single report
+    # every one of whose claim pages prints its own numbering, none of them
+    # joined blind and none missing. Nothing is pooled across reports, or
+    # where a boundary is unsure.
+    both_readers = [*digital_tables, *vision_tables] if digital_tables and vision_tables else None
+    single_report_established = bool(
+        both_readers
+        and groups is None
+        and not runs
+        and plan.bounded
+        and not plan.blind
+        and plan.incomplete is None
+        and all(page_evidence.get(page) is not None and page_evidence[page].paginations
+                for page in claim_table_pages)
+    )
+    pooled_single = (identifier_shapes_by_run(both_readers, mapping)
+                     if single_report_established else None)
+    pooled_runs = (identifier_shapes_by_run(both_readers, mapping, groups)
+                   if both_readers and groups is not None else {})
+
     def shapes_for(reader_tables: list[RawTable]) -> dict[int, set[str]] | None:
-        """Each run's claim-number vote over one reader's tables. An unsettled
-        run reads under the vote of the settled run before it."""
+        """Each run's claim-number vote for one reader's tables. A settled run
+        votes over both readers' tables; an unsettled run reads under the vote
+        of the settled run before it."""
         if groups is None:
-            return None
+            return pooled_single
         shapes = identifier_shapes_by_run(reader_tables, mapping, groups)
+        for index, run in enumerate(runs):
+            if not run.ambiguous and index in shapes and index in pooled_runs:
+                shapes[index] = pooled_runs[index]
         for index, source in borrowed.items():
             if source in shapes:
                 shapes[index] = shapes[source]
@@ -2386,13 +2556,17 @@ def _run_pipeline(
         # Count rows that carry a claim number: those are the rows that ought
         # to survive stitching. A row skipped for having no claim number is
         # already reported on its own, and counting it here would make R-19
-        # repeat that warning as a phantom stitching loss.
+        # repeat that warning as a phantom stitching loss. Nor is a wrapped
+        # description whose words run across the claim-number column: prose
+        # there is not a claim number, and every claim row passes the same
+        # candidate test whether or not the reading kept it.
         index = table_mapping.index_of("claim_number")
         rows_seen_per_page[table.page] = sum(
             1
             for row in table.rows
             if index is not None
             and row.cell(index).strip()
+            and is_identifier_candidate(strip_identifier_label(row.cell(index).strip()))
             and not is_structural_row(row, table_mapping)
             and (text := _normalised(row))
             and text not in furniture
@@ -2573,12 +2747,11 @@ def _run_pipeline(
         row.bounded = plan.bounded and row.page not in plan.blind and (
             run is None or (not run.ambiguous and run.confidence is not RunConfidence.NONE)
         )
-        # A refusal is reported wherever another report's numbering may be why:
-        # in a packet, and wherever the vote was not bounded by what the pages
-        # print. An unsettled run's refusals are named by R-28 instead.
-        row.report = not (run is not None and run.ambiguous) and (
-            bool(runs) or not row.bounded
-        )
+        # A refused row is named by a rule, never dropped quietly. An
+        # unsettled run's refusals are named by R-28 (which lists them); every
+        # other refusal is reported under R-29 -- in a packet, and on a single
+        # report whose vote was bounded, where before no rule named it.
+        row.report = not (run is not None and run.ambiguous)
 
     document = LossRunDocument(
         document_id=ingested.document_id,
@@ -2613,6 +2786,10 @@ def _run_pipeline(
                 "picture holds"
             )
             for page in sorted(unread_image_pages)
+        } | {
+            page: "some of its text is printed in a font whose characters "
+            "cannot be decoded, so what that text says is unknown"
+            for page in sorted(undecodable_pages - unread_image_pages)
         },
         unplaced_rows=unplaced_rows,
         column_split_pages=extraction.column_split_pages,
@@ -2634,7 +2811,7 @@ def _run_pipeline(
         ),
         policy_periods=declared_periods,
         rows_seen_per_page=rows_seen_per_page,
-        column_mapping=mapping.decisions,
+        column_mapping=_settle_labelled_contests(mapping.decisions, tables, mapping),
         printed_sections=printed_sections,
         runs=runs,
         incomplete_report=plan.incomplete,
@@ -3057,6 +3234,22 @@ def _audit_value(claim: Claim, field_name: str) -> str:
     return f"null ({reason.value})"
 
 
+def _added_page(document: LossRunDocument, record: dict[str, Any]) -> int | None:
+    """The page a hand-added claim takes, or None when it names no run.
+
+    In a document binding more than one loss run the page is what ties a claim
+    to its run. A row a person adds without giving a page has none: it must not
+    default to page 1 and be counted into the first run, which can leave the
+    packet reading CLEAN. It is kept out of every run and named by R-11 until
+    the reviewer says which run it belongs to. A single loss run needs no page
+    to place a claim, so it stays page 1 as before.
+    """
+    page = record.get("_page")
+    if page not in (None, ""):
+        return int(page)
+    return None if document.runs else 1
+
+
 def apply_edits(
     document: LossRunDocument,
     records: Sequence[dict[str, Any]],
@@ -3205,7 +3398,7 @@ def apply_edits(
                 # packet is how it joins its loss run.
                 source_page=(
                     original.source_page if original is not None
-                    else int(record.get("_page") or 1)
+                    else _added_page(document, record)
                 ),
                 source_row=record.get("_row") if record.get("_row") is not None else (original.source_row if original else None),
                 source_bbox=original.source_bbox if original else None,

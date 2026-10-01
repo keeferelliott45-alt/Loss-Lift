@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "head": "reliability-phase-1 F1",
+  "cases": {
+    "a4-portrait": {
+      "met": true,
+      "shortfalls": []
+    },
+    "absent-carrier": {
+      "met": true,
+      "shortfalls": []
+    },
+    "blank-versus-zero": {
+      "met": true,
+      "shortfalls": []
+    },
+    "bounded-digital-then-scan": {
+      "met": true,
+      "shortfalls": []
+    },
+    "bounded-scan-then-digital": {
+      "met": true,
+      "shortfalls": []
+    },
+    "cover-page-then-report": {
+      "met": true,
+      "shortfalls": []
+    },
+    "foreign-page-bridged": {
+      "met": false,
+      "shortfalls": [
+        "claims_missing",
+        "status_differs"
+      ],
+      "followup": "Phase 2: another carrier's unnumbered page inside a report is split off but its claim is named (R-23/R-28), not read. Safe (review), claim missing."
+    },
+    "furniture-controls": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-every-row": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-some-rows": {
+      "met": true,
+      "shortfalls": []
+    },
+    "labelled-unreadable": {
+      "met": true,
+      "shortfalls": []
+    },
+    "landscape-components": {
+      "met": true,
+      "shortfalls": []
+    },
+    "letter-portrait": {
+      "met": true,
+      "shortfalls": []
+    },
+    "missing-replay": {
+      "met": true,
+      "shortfalls": []
+    },
+    "mixed-series-packet": {
+      "met": false,
+      "shortfalls": [
+        "status_differs"
+      ],
+      "followup": "Phase 2: the two runs now settle (E9), but the printed totals of a packet whose second run is read by the vision model stay at document level and raise false R-04/R-25. Safe (review), over-flagged."
+    },
+    "multiline-descriptions": {
+      "met": true,
+      "shortfalls": []
+    },
+    "policy-change-boundary": {
+      "met": true,
+      "shortfalls": []
+    },
+    "printed-count-mismatch": {
+      "met": true,
+      "shortfalls": []
+    },
+    "run-counts-packet": {
+      "met": true,
+      "shortfalls": []
+    },
+    "same-number-two-carriers": {
+      "met": true,
+      "shortfalls": []
+    },
+    "section-counts-only": {
+      "met": true,
+      "shortfalls": []
+    },
+    "signed-and-recovery": {
+      "met": true,
+      "shortfalls": []
+    },
+    "two-series-digital-packet": {
+      "met": true,
+      "shortfalls": []
+    },
+    "wrapped-headers": {
+      "met": true,
+      "shortfalls": []
+    }
+  }
+}

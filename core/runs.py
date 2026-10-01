@@ -117,6 +117,21 @@ class PageEvidence:
     #: The header band as printed, shortened, for display.
     heading: str | None = None
     ignored: tuple[str, ...] = ()
+    #: The policy number the header band prints, if it prints one. Digits are
+    #: left out of ``identity``, so without this two reports told apart only
+    #: by their policy numbers carry the same heading.
+    policy: str | None = None
+    #: The insured the header band names, if it names one. Every carrier's
+    #: page in one insured's packet prints it, so where two pages print the
+    #: same insured it does not say whose report either is (see same_heading).
+    insured: str | None = None
+
+
+def same_policy(one: str | None, other: str | None) -> bool | None:
+    """Whether two printed policy numbers are the same policy; None if either is absent."""
+    if not one or not other:
+        return None
+    return "".join(one.upper().split()) == "".join(other.upper().split())
 
 
 def paginations_in(text: str, source: str) -> list[Pagination]:
@@ -179,9 +194,21 @@ def naming_words(identity: str | None) -> set[str]:
     return {word for word in identity.split() if word not in GENERIC_WORDS and len(word) > 1}
 
 
-def same_heading(one: str | None, other: str | None) -> bool | None:
+def same_heading(
+    one: str | None,
+    other: str | None,
+    insured: tuple[str | None, str | None] = (None, None),
+) -> bool | None:
     """Whether two pages' headings name the same report: True when they name
     exactly the same, False when they share no naming word, None otherwise.
+
+    ``insured`` is the insured each page's band names. Where both name the
+    same insured, its words are set aside and the rest -- the carrier --
+    decides: one insured's packet prints its name on every carrier's page, and
+    counted as naming words it made any two carriers' headings "partly the
+    same". Where nothing is left once it is set aside, the insured still
+    confirms, as before. Where the insureds differ, or a page names none, the
+    headings are compared whole, exactly as without it.
 
     A report's pages repeat the words that name it -- its carrier, its insured
     -- whatever generic "ADDENDUM", "CONTINUED" or line-of-business title one
@@ -192,6 +219,11 @@ def same_heading(one: str | None, other: str | None) -> bool | None:
     HARBOR") may be two carriers as easily as one report with an extra line.
     """
     first, second = naming_words(one), naming_words(other)
+    shared = _shared_insured(*insured)
+    if shared:
+        own_first, own_second = first - shared, second - shared
+        if own_first and own_second:
+            first, second = own_first, own_second
     if not first or not second:
         return None
     if first == second:
@@ -199,7 +231,17 @@ def same_heading(one: str | None, other: str | None) -> bool | None:
     return False if not first & second else None
 
 
-def confirms(page: str | None, report: str | None) -> bool:
+def _shared_insured(one: str | None, other: str | None) -> set[str]:
+    """The naming words of an insured both pages name; empty unless they agree."""
+    if not one or not other:
+        return set()
+    words_one = naming_words(" ".join(_tokens(one)))
+    words_two = naming_words(" ".join(_tokens(other)))
+    return words_one if words_one and words_one == words_two else set()
+
+
+def confirms(page: str | None, report: str | None,
+             insured: tuple[str | None, str | None] = (None, None)) -> bool:
     """Whether a page's heading names exactly what the report's heading does.
 
     A heading that drops words the report prints (its carrier's name, with
@@ -207,7 +249,7 @@ def confirms(page: str | None, report: str | None) -> bool:
     only in its logo; one that adds a naming word may be another carrier
     sharing part of the name. Neither confirms the page is that report's.
     """
-    return same_heading(page, report) is True
+    return same_heading(page, report, insured) is True
 
 
 def heading_of(text: str | None, limit: int = 120) -> str | None:
@@ -236,6 +278,10 @@ class _Segment:
     #: The report stopped before its own last page and another began.
     incomplete: str | None = None
     identity: str | None = None
+    #: The first policy number its pages print.
+    policy: str | None = None
+    #: The first insured its pages' bands name.
+    insured: str | None = None
     numbered: bool = False
     tables: bool = False
     #: Pages joined to the segment without a heading confirming it: its
@@ -335,8 +381,9 @@ class _Planner:
         return [label for label in labels if label not in stamped]
 
     def start(self, page: int, **fields) -> _Segment:
-        segment = _Segment(pages=[page], identity=self.page_evidence(page).identity,
-                           tables=page in self.tables, **fields)
+        evidence = self.page_evidence(page)
+        segment = _Segment(pages=[page], identity=evidence.identity, policy=evidence.policy,
+                           insured=evidence.insured, tables=page in self.tables, **fields)
         self.segments.append(segment)
         self.current = segment
         return segment
@@ -344,6 +391,8 @@ class _Planner:
     def add(self, segment: _Segment, page: int) -> None:
         segment.pages.append(page)
         segment.tables = segment.tables or page in self.tables
+        segment.policy = segment.policy or self.page_evidence(page).policy
+        segment.insured = segment.insured or self.page_evidence(page).insured
         self.current = segment
 
     def close_short(self, page: int) -> None:
@@ -410,7 +459,8 @@ class _Planner:
         if (continuing is not None
                 and any(label.count < continuing.count for label in openers)
                 and (not current.tables
-                     or same_heading(page_evidence.identity, current.identity) is False)):
+                     or same_heading(page_evidence.identity, current.identity,
+                                     (page_evidence.insured, current.insured)) is False)):
             # A report's own page 1 inside a larger numbering that carries on
             # -- after pages carrying no claims table, or under a heading
             # naming another report: the numbering followed so far was the
@@ -421,7 +471,8 @@ class _Planner:
         if continuing is not None:
             self.add(current, page)
             current.track = (continuing.index, continuing.count)
-            if same_heading(page_evidence.identity, current.identity) is False:
+            if same_heading(page_evidence.identity, current.identity,
+                            (page_evidence.insured, current.insured)) is False:
                 # The numbering carries on under a heading naming something
                 # else -- a packet-wide count, or a report whose summary and
                 # detail pages differ. Kept together; not confirmed.
@@ -450,7 +501,8 @@ class _Planner:
             # 2"), not this page's number. The page is read as unnumbered.
             index, count = current.track  # type: ignore[misc]
             repeated = [label for label in openers if label.count == count]
-            if repeated and same_heading(page_evidence.identity, current.identity) is not False:
+            if repeated and same_heading(page_evidence.identity, current.identity,
+                                         (page_evidence.insured, current.insured)) is not False:
                 labels = [label for label in labels if label not in repeated]
                 openers = [label for label in openers if label not in repeated]
             elif repeated:
@@ -508,8 +560,9 @@ class _Planner:
         if label is None:
             return False
         moved_first = current.pages[-(label.index - 1)]
-        if same_heading(self.page_evidence(moved_first).identity,
-                        self.page_evidence(page).identity) is False:
+        moved_evidence, page_evidence = self.page_evidence(moved_first), self.page_evidence(page)
+        if same_heading(moved_evidence.identity, page_evidence.identity,
+                        (moved_evidence.insured, page_evidence.insured)) is False:
             return False  # those pages name another report
         back = label.index - 1
         moved = current.pages[-back:]
@@ -540,11 +593,23 @@ class _Planner:
                 text=f"page {page} prints no page number")])
             return
         if not current.numbered:
+            if same_policy(page_evidence.policy, current.policy) is False:
+                # Nothing is numbered, but the page prints another policy's
+                # number than the report before it: printed evidence of another
+                # report, as a positively different heading is. Joined, one
+                # policy's claims would be filed under the other's number.
+                self.start(page, confidence=RunConfidence.INFERRED, evidence=[RunBoundary(
+                    page=page, kind="unnumbered", source="none",
+                    text=f"page {page} prints no page number and names a different "
+                         f"policy from the report on pages {current.span()}, so it "
+                         f"begins another report")])
+                return
             self.add(current, page)
             return
 
         index, count = current.track  # type: ignore[misc]
-        heading = same_heading(page_evidence.identity, current.identity)
+        heading = same_heading(page_evidence.identity, current.identity,
+                               (page_evidence.insured, current.insured))
         if current.exhausted:
             ended = (f"the report on pages {current.span()} printed its last page "
                      f"({index} of {count}); page {page} prints no page number")
@@ -572,7 +637,8 @@ class _Planner:
                 and (next_label is None or next_label.index == 1))
         if exact or fits:
             self.add(current, page)
-            if not confirms(page_evidence.identity, current.identity):
+            if not confirms(page_evidence.identity, current.identity,
+                            (page_evidence.insured, current.insured)):
                 # The page fits the report's count, but nothing on it names the
                 # report: it may be another carrier's page filling the gap, so
                 # its claim-number vote may be pooling two reports. Joined
@@ -652,7 +718,9 @@ def plan_runs(
     for segment in segments:
         previous = merged[-1] if merged else None
         opened = segment.evidence and segment.evidence[0].kind == "opened"
-        heading = same_heading(segment.identity, previous.identity) if previous else None
+        heading = (same_heading(segment.identity, previous.identity,
+                                (segment.insured, previous.insured))
+                   if previous else None)
         restart = (previous is not None and opened and previous.numbered
                    and previous.exhausted and not segment.ambiguous)
         if restart and heading:

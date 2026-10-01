@@ -21,6 +21,8 @@ from core.schema import Claim, ClaimStatus, LossRunDocument, PrintedSection
 
 #: Money columns worth breaking out per term.
 SUMMARY_FIELDS = ("paid_total", "reserve_total", "recovery_total", "incurred_total")
+#: The row holding claims whose loss date falls inside more than one term.
+UNRESOLVED_TERM = "Unresolved policy term - review required"
 
 
 @dataclass(frozen=True)
@@ -192,7 +194,7 @@ def summarise_periods(
         if ambiguous:
             summaries.append(
                 _summarise(
-                    "Unresolved policy term - review required",
+                    UNRESOLVED_TERM,
                     None,
                     None,
                     ambiguous,

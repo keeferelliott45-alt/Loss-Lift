@@ -17,13 +17,14 @@ from core.extract_digital import (
 )
 from core.ingest import ExtractionCache, IngestError, discard, ingest, ingest_path, sha256_bytes
 from core.schema import ExtractionMethod
+from tests.pdf_fixtures import synthetic_pdf
 
 
 # --- Stage 0 ---------------------------------------------------------------
 
 
 def test_ingest_hashes_and_stages(tmp_path):
-    data = b"%PDF-1.7\nnot really a pdf but it starts right"
+    data = synthetic_pdf("ingest hashes and stages")
     staged = ingest(data, "loss run.pdf", tmp_path)
     assert staged.sha256 == sha256_bytes(data)
     assert staged.path.read_bytes() == data
@@ -42,7 +43,7 @@ def test_ingest_refuses_empty(tmp_path):
 
 
 def test_ingest_strips_directory_traversal(tmp_path):
-    staged = ingest(b"%PDF-1.7 x", "../../etc/passwd.pdf", tmp_path)
+    staged = ingest(synthetic_pdf("traversal"), "../../etc/passwd.pdf", tmp_path)
     assert staged.source_filename == "passwd.pdf"
     assert staged.path.parent == tmp_path
 
@@ -65,7 +66,7 @@ def test_cache_is_keyed_by_hash():
 
 
 def test_discard_removes_the_file(tmp_path):
-    staged = ingest(b"%PDF-1.7 x", "a.pdf", tmp_path)
+    staged = ingest(synthetic_pdf("discard"), "a.pdf", tmp_path)
     assert staged.exists
     discard(staged, remove_directory=False)
     assert not staged.exists

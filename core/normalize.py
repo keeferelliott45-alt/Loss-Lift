@@ -215,6 +215,19 @@ def parse_money(
             return NumberParse(value=Decimal("0"), raw=original)
         return _fail(original, NullReason.DASH_PLACEHOLDER)
 
+    # Spreadsheet accounting format sets the currency mark apart at the left
+    # of the cell: "$   -" is how it prints zero, and "$ (1,000.00)" a
+    # negative. A bare dash stays a placeholder; one introduced by a currency
+    # mark is that format's zero and nothing else.
+    accounting = re.fullmatch(r"([$€£])\s*(.*)", text)
+    if accounting:
+        rest = accounting.group(2).strip()
+        if re.fullmatch(r"-+", rest):
+            return NumberParse(value=Decimal("0"), raw=original,
+                               currency=CURRENCY_SYMBOLS[accounting.group(1)])
+        if rest.startswith("(") and rest.endswith(")"):
+            text = f"({accounting.group(1)}{rest[1:-1].strip()})"
+
     sign = Decimal(1)
 
     # Credit / debit suffix or prefix: "1,234.56 CR"
@@ -346,6 +359,14 @@ def _locale_vote(token: str) -> tuple[Locale | None, str | None]:
     """What, if anything, one token proves about the document's convention."""
     text = clean_text(token)
     if not re.search(r"\d", text):
+        return None, None
+    # Only a number votes. A cell of words that happens to hold a digit -- a
+    # footer reading "Report Run Date: Feb 18," under a money column on every
+    # page -- proves nothing about separators, and twelve copies of it once
+    # outvoted every amount on the document.
+    bare, _currency = _strip_currency(re.sub(r"(?i)\b(?:CR|DR)\b", " ", text))
+    bare = bare.strip().strip("()").strip().strip("+-").strip()
+    if not re.fullmatch(r"\d(?:[\d.,\s'’]*\d)?", bare):
         return None, None
     text = re.sub(r"[^\d.,]", "", text)
     comma, dot = text.count(","), text.count(".")

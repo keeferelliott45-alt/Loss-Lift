@@ -44,6 +44,9 @@ is callable without Streamlit.
 | `summary.py` | loss summary by policy term | `summarise_by_period`, `summarise_periods` |
 | `export.py` | workbook (Claim Detail, Loss Summary, Runs, Large Loss, Exceptions, Review History, Source Info), account workbook, JSON | `build_workbook`, `to_bytes`, `build_account_workbook`, `build_json`, `to_json_bytes` |
 | `account.py` | one insured's history across runs; claim identity | `build_accounts`, `sources_of`, `same_claim`, `AccountRollup` |
+| `submission.py` | a saved email's attachments, their intake/processing outcomes, and the merged submission summary (no Streamlit, no email package) | `Submission`, `Attachment`, `IntakeOutcome`, `ProcessingState`, `summarise_submission`, `status_label` |
+| `eml_intake.py` | stdlib `.eml` parsing under limits; byte-sniffed PDFs; staging via `ingest`; reading via `run_or_discard` | `parse_eml`, `stage_attachments`, `process_attachments`, `read_submission`, `EmlLimits`, `EmlFatalError` |
+| `submission_export.py` | submission workbook under the export text/redaction policy | `build_submission_workbook`, `submission_to_bytes`, `submission_filename` |
 | `telemetry.py` | local privacy-safe JSONL events; rates | `document_facts`, `processed_event`, `review_events`, `export_event`, `emit`, `summarize` |
 
 `app.py` — Streamlit screens only (queue, mapping, review, export, accounts);
@@ -61,8 +64,10 @@ no business logic. `prompts/` — LLM prompts (`extract_vision.md`,
 | Reconciliation | `test_reconcile.py`, `test_section_*`, `test_counted_section_totals.py`, `test_unplaced_money.py`, `test_document_claim_count_scope.py`, `test_numeric_evidence_*` |
 | Status / review | `test_status_policy.py`, `test_review*.py`, `test_adversarial_handoff.py` |
 | Export / account | `test_export.py`, `test_spreadsheet_export.py`, `test_accounting_and_json.py`, `test_account.py`, `test_account_safety.py` |
+| Submissions (saved email) | `test_eml_intake.py`, `test_submission_summary.py`, `test_submission_export.py`, `test_submission_app.py` (AppTest); fixtures `submission_fixtures.py` |
 | Gate / telemetry | `test_corpus_gate.py`, `test_gate_runs.py`, `test_cloud_gate*.py`, `test_corpus_intake.py`, `test_telemetry.py` |
 | Tooling | `test_agent_tooling.py` |
+| Fuzz (silent CLEAN) | `tests/fuzz/` — `generator.py` (synthetic loss runs + ground truth), `mutations.py` (hazard operators), `oracle.py` (SAFE/SILENT/LOUD), `shrink.py` (minimal reproducer), `run.py` (CLI); `test_fuzz_smoke.py` |
 | Golden accuracy | `tests/golden/` — `fixtures.py` (definitions), `generate.py` (PDFs), `expected/`, `baseline.py` + `accuracy_baseline.json` (per-carrier ratchet) |
 
 Shared PDF builders for packet tests: `tests/test_packet_claim_series.py`
@@ -117,4 +122,15 @@ scripts/agent_validate.sh                   # all pre-handoff checks
 scripts/agent_worktree.sh create|check|list|remove
 python -m core.telemetry summarize [file]   # local trust rates
 streamlit run app.py
+python -m tests.fuzz.run --family hostile --seed-start 0 --count 60
+python -m tests.fuzz.run --family clean   --seed-start 0 --count 60
+python -m tests.fuzz.run --case 238:add_unnumbered_run,missing_page
+python -m tests.fuzz.run --family hostile --count 50 --vision  # synthetic replay scans
 ```
+
+`tests/fuzz/run.py` writes SAFE/SILENT/LOUD/UNNAMED counts by operator
+combination and exits non-zero if any SILENT case appeared. Every case is
+reproducible from `(seed, operator list)`; the clean family renders documents a
+correct reader should read perfectly (LOUD baseline 0 across seeds 0–49), the
+hostile family applies the hazard operators in `mutations.py`. Scans are
+synthetic replays only — never a live model, never a real document.
