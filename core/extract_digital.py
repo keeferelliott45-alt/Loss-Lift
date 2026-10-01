@@ -1539,6 +1539,8 @@ _VALUATION_PATTERNS = (
     r"as\s*of\s*date\s*[:\-]?\s*(.+)",
     r"(?:data|values?|numbers?|amounts?)\s*as\s*of\s*[:\-]?\s*(.+)",
     r"loss(?:es)?\s*valued\s*[:\-]?\s*(.+)",
+    # "Losses as of: 06/08/2019" at the foot of a detail loss report.
+    r"loss(?:es)?\s*as\s*of\s*[:\-]?\s*(\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4})",
     # A report titled with the date it was struck: "Loss Run as per 13 Sep 2016".
     r"loss\s*runs?\s*(?:as\s*(?:per|of|at)|through|thru)\s*[:\-]?\s*(.+)",
 )
@@ -1555,7 +1557,10 @@ _PERIOD_PATTERN = re.compile(
 #: same two forms _COUNT_PATTERNS accepts.
 GRAND_COUNT_PATTERN = re.compile(
     r"(?:grand|report|overall|final)\s+totals?\s*:?[\s#]*"
-    r"claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)",
+    # "Report Grand Totals" over "Total Claim Count: 46", possibly with the
+    # total's own labelled "Inc:" line printed between them.
+    r"(?:(?:inc|incurred|pd|paid|o/s)\s*:[^\n]*\n\s*)?"
+    r"(?:total\s+)?claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)",
     re.IGNORECASE,
 )
 
