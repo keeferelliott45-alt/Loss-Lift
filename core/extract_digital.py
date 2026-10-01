@@ -216,11 +216,29 @@ def join_currency_marks(words: list[Word]) -> list[Word]:
     if len(marks) < ACCOUNTING_EVIDENCE:
         return words
     char_width = _median_char_width(words)
+    order = sorted(range(len(words)), key=lambda i: (words[i].x0, words[i].top))
+
+    def suffix(mark: Word) -> bool:
+        """The mark closes the amount printed hard against its left: "1.234 €"."""
+        height = max(mark.bottom - mark.top, 1e-6)
+        left = [
+            w for w in words
+            if w.x1 <= mark.x0 + 1e-6 and abs(w.centre - mark.centre) < height / 2
+        ]
+        if not left:
+            return False
+        nearest = max(left, key=lambda w: w.x1)
+        return (_AMOUNT_PIECE.fullmatch(nearest.text) is not None
+                and mark.x0 - nearest.x1 <= char_width)
+
+    # A page that writes its currency after the amount is not in accounting
+    # format, however many marks stand alone on it.
+    if sum(suffix(mark) for mark in marks) * 2 >= len(marks):
+        return words
     used: set[int] = set()
     joined: dict[int, Word] = {}
-    order = sorted(range(len(words)), key=lambda i: (words[i].x0, words[i].top))
     for i, mark in enumerate(words):
-        if not _CURRENCY_MARK.fullmatch(mark.text) or i in used:
+        if not _CURRENCY_MARK.fullmatch(mark.text) or i in used or suffix(mark):
             continue
         height = max(mark.bottom - mark.top, 1e-6)
         same_line = [
