@@ -324,8 +324,13 @@ def _csv_bytes(rows) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
+def _xlsx_run(rows) -> bytes:
+    """One default sheet named "Run", from a list of rows."""
+    return _xlsx({"Run": rows})
+
+
 _XLSX_AND_CSV = pytest.mark.parametrize(
-    "build", [_xlsx, _csv_bytes], ids=["xlsx", "csv"]
+    "build", [_xlsx_run, _csv_bytes], ids=["xlsx", "csv"]
 )
 
 
