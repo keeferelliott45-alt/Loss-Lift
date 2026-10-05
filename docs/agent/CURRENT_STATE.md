@@ -50,7 +50,10 @@ ledgered, and they are the top of Phase 2:
    leaves the page out) and which names another carrier or another policy is
    read as its own settled run; its claim is read there. A page whose heading
    or policy the vision model read, or which shares the report's heading, is
-   still unsettled (R-28).
+   still unsettled (R-28). A page the report's count instead *claims* (it
+   fills a numbered slot exactly) but whose own letterhead names another
+   carrier is refused: its rows are never read under the count's report --
+   they are recorded and named by R-29.
 
 **Real documents:** no adjudicated truth exists yet. The 10-document corpus is
 unlabelled, so no real accuracy figure exists, and the charging thresholds in

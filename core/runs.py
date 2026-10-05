@@ -291,6 +291,9 @@ class _Segment:
     #: Pages joined to the segment without a heading confirming it: its
     #: claim-number vote may be pooling two reports.
     blind: set[int] = field(default_factory=set)
+    #: Blind pages whose own letterhead names another report: whatever their
+    #: shape, their rows are never read under this run's vote.
+    foreign: set[int] = field(default_factory=set)
 
     @property
     def exhausted(self) -> bool:
@@ -673,6 +676,13 @@ class _Planner:
                 # its claim-number vote may be pooling two reports. Joined
                 # blind, its refused rows are named by R-29 rather than lost.
                 current.blind.add(page)
+                if (heading is False
+                        and page_evidence.method is SourceMethod.DIGITAL):
+                    # Its own letterhead names another report while the count
+                    # it fills claims it: its rows are never read under this
+                    # run's vote. They are refused and named -- counted under
+                    # another report is the one reading nothing printed allows.
+                    current.foreign.add(page)
             current.track = (index + 1, count)
             current.evidence.append(RunBoundary(
                 page=page, kind="continued", source="none",
@@ -699,6 +709,7 @@ def _merge(into: _Segment, other: _Segment, boundary: RunBoundary | None = None)
     into.tables = into.tables or other.tables
     into.incomplete = other.incomplete
     into.blind |= other.blind
+    into.foreign |= other.foreign
     if other.ambiguous and not into.ambiguous:
         into.ambiguous, into.ambiguity = True, other.ambiguity
 
@@ -810,6 +821,9 @@ class Plan:
     bounded: bool
     #: Pages joined to a run with nothing confirming they belong to it.
     blind: set[int]
+    #: Blind pages whose own letterhead names another report: their rows are
+    #: refused, never read under the run they were joined to.
+    foreign: set[int]
     #: A single report whose own numbering stops before its declared last page:
     #: pages it holds are absent from the PDF. None when the document binds
     #: several runs (each run carries its own incompleteness) or when nothing
@@ -843,6 +857,7 @@ def plan_packet(
         runs=runs,
         bounded=any(item.paginations for item in evidence.values()),
         blind={page for segment in segments for page in segment.blind},
+        foreign={page for segment in segments for page in segment.foreign},
         incomplete=incomplete,
     )
 

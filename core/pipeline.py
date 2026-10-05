@@ -1174,6 +1174,7 @@ def build_claims(
     runs: Mapping[int, int] | None = None,
     shapes_by_run: Mapping[int, set[str]] | None = None,
     refused: list[RefusedClaimRow] | None = None,
+    refuse_pages: set[int] | None = None,
 ) -> tuple[list[Claim], list[str], list[UnplacedRow]]:
     """Normalise every row of every page, folding wrapped lines into their claim.
 
@@ -1192,6 +1193,12 @@ def build_claims(
     identifier and a loss date or status of its own -- whose identifier the
     vote refused. Whatever else becomes of such a row, it is recorded there
     and never only folded into the claim above it.
+
+    ``refuse_pages`` skips the vote altogether: pages joined to a run blind
+    whose own letterhead names another report. However well their identifiers
+    fit the run's numbering, the neighbouring count claiming them is
+    contradicted by the letterhead they print, so their rows are refused and
+    named rather than read into another report's table.
     """
     claims: list[Claim] = []
     warnings: list[str] = []
@@ -1216,6 +1223,10 @@ def build_claims(
         block: dict[str, Any] | None = None
 
         run = _run_of(table, runs)
+        # Rows on a page the planner joined blind while its own letterhead
+        # names another report never take this run's vote: whatever fits is
+        # refused with the rest, or the letterhead would lose to the count.
+        foreign_page = bool(refuse_pages) and table.page in refuse_pages
         for row in table.rows:
             pending, block = block, None
             if pending is not None:
@@ -1254,7 +1265,8 @@ def build_claims(
             # identifier is the continuation of the claim above it, not a new
             # one. Folding it in keeps its text; treating it as a claim
             # multiplies the count by however many lines each claim occupies.
-            identifier = claim_identifier(row, table_mapping, shapes)
+            identifier = (None if foreign_page
+                          else claim_identifier(row, table_mapping, shapes))
             if identifier is None:
                 refusal = refused is not None and _note_refusal(
                     row, table_mapping, source_method, refused, date_order,
@@ -1279,7 +1291,7 @@ def build_claims(
                         row, table_mapping, locale, warnings, unplaced, extra,
                         context=context,
                     )
-                elif (extra and claims and not refusal
+                elif (extra and claims and not refusal and not foreign_page
                       and _continuation_text(row, table_mapping)
                       and _same_run(claims[-1], run, runs)):
                     previous = claims[-1]
@@ -2509,6 +2521,7 @@ def _run_pipeline(
     claims, row_warnings, unplaced_rows = build_claims(
         digital_tables, mapping, locale, date_order, dash_means_zero=dash_means_zero,
         runs=groups, shapes_by_run=shapes_for(digital_tables), refused=refused_rows,
+        refuse_pages=plan.foreign,
     )
     warnings.extend(row_warnings)
 
@@ -2519,6 +2532,7 @@ def _run_pipeline(
             source_method=SourceMethod.VISION,
             confidence_cap=0.85,
             runs=groups, shapes_by_run=shapes_for(vision_tables), refused=refused_rows,
+            refuse_pages=plan.foreign,
         )
         claims.extend(vision_claims)
         warnings.extend(vision_warnings)
