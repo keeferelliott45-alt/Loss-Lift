@@ -31,9 +31,13 @@ def test_ingest_hashes_and_stages(tmp_path):
     assert staged.size_bytes == len(data)
 
 
-def test_ingest_refuses_non_pdf(tmp_path):
-    with pytest.raises(IngestError, match="not a PDF"):
+def test_ingest_refuses_content_no_reader_can_read(tmp_path):
+    # Zip bytes that are not an OOXML workbook fail closed; so does any
+    # binary format the app cannot parse (legacy .xls, OLE containers).
+    with pytest.raises(IngestError, match="not a readable Excel workbook"):
         ingest(b"PK\x03\x04 spreadsheet", "claims.xlsx", tmp_path)
+    with pytest.raises(IngestError, match="not a supported loss-run file"):
+        ingest(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16, "legacy.xls", tmp_path)
 
 
 def test_ingest_refuses_empty(tmp_path):

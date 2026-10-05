@@ -69,12 +69,18 @@ def _cached_formula(xlsx: bytes, sheet_name: str, cell: str, value: str) -> byte
     )
     assert match, f"sheet {sheet_name!r} not found"
     rels = source.read("xl/_rels/workbook.xml.rels").decode("utf-8")
-    target = re.search(
-        r'<Relationship[^>]*Id="' + re.escape(match.group(1)) +
-        r'"[^>]*Target="([^"]+)"',
-        rels,
-    ).group(1)
-    if not target.startswith("xl/"):
+    relationships = {
+        id_match.group(1): target_match.group(1)
+        for id_match, target_match in (
+            (re.search(r'Id="(rId\d+)"', tag), re.search(r'Target="([^"]+)"', tag))
+            for tag in re.findall(r"<Relationship\b[^>]*/>", rels)
+        )
+        if id_match and target_match
+    }
+    target = relationships[match.group(1)]
+    if target.startswith("/"):
+        target = target.lstrip("/")
+    elif not target.startswith("xl/"):
         target = "xl/" + target
     xml = source.read(target).decode("utf-8")
     cell_xml = re.search(r'<c r="' + cell + r'"[^>]*>.*?</c>', xml)
@@ -195,7 +201,9 @@ def test_empty_visible_sheet_is_recorded_never_a_zero_run(tmp_path):
     document = result.document
     assert document.ignored_sheets.get("Spare") == "empty"
     assert all(claim.source_page == 1 for claim in document.claims)
-    assert [run.run_id for run in document.runs] == ["run-1"]
+    # One visible non-empty sheet: a single loss run, and the empty sheet is
+    # a recorded fact on the document, not a clean empty run.
+    assert document.runs == []
     assert any("Spare" in warning for warning in result.warnings)
 
 
@@ -304,12 +312,12 @@ def test_row_with_money_and_no_claim_number_is_recorded_not_dropped(tmp_path):
 def test_provenance_points_at_the_sheet_cell(tmp_path):
     result = _result(tmp_path, _workbook({
         "West": [["Title line"],
-                 [HEADERS[0], HEADERS[4]],
-                 ["C-1001", "500.00"]],
+                 ["Claim Number", "Paid", "Incurred"],
+                 ["C-1001", "500.00", "500.00"]],
     }), "prov.xlsx")
     claim = result.document.claims[0]
     assert claim.source_page == 1
-    assert claim.source_row is not None
+    assert claim.source_row == 2  # 0-based: title, header, then this row
     assert claim.source_method is SourceMethod.SHEET
 
 

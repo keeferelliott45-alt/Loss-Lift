@@ -713,14 +713,15 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs — one or a hundred at once. Files are held in "
-        "memory for this session and deleted after you export."
+        "Drop in carrier loss runs as PDF, XLSX or CSV — one or a hundred at "
+        "once. Files are held in memory for this session and deleted after "
+        "you export."
     )
 
     state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
-        "Choose PDF files",
-        type=["pdf"],
+        "Choose loss run files",
+        type=["pdf", "xlsx", "csv"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"uploader-{state['uploader_generation']}",

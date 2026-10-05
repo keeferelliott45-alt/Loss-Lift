@@ -18,7 +18,12 @@ from typing import Any, Mapping, Sequence
 import pymupdf
 
 from core import extract_digital
-from core.classify import DocumentClassification, classify_pdf
+from core import extract_sheet
+from core.classify import (
+    DocumentClassification,
+    PageClassification,
+    classify_pdf,
+)
 from core.extract_digital import (
     _COUNT_PATTERNS,
     document_claim_count,
@@ -72,12 +77,14 @@ from core.review import (
 )
 from core.schema import (
     DATE_FIELDS,
+    ExtractionMethod,
     Finding,
     FindingScope,
     MONEY_FIELDS,
     Claim,
     ClaimStatus,
     LineOfBusiness,
+    LogicalRun,
     LossRunDocument,
     ColumnMappingRecord,
     MappingState,
@@ -87,6 +94,7 @@ from core.schema import (
     RawTable,
     ReconciliationResult,
     RefusedClaimRow,
+    RunBoundary,
     RunConfidence,
     UnplacedRow,
     Resolution,
@@ -2057,7 +2065,17 @@ def _run_pipeline(
     use_llm: bool = False,
     llm_client: Any | None = None,
 ) -> ExtractionResult:
-    """Run extraction against a stable staged PDF."""
+    """Run extraction against a stable staged document."""
+    if ingested.kind in ("xlsx", "csv"):
+        return _run_sheet_pipeline(
+            ingested,
+            profile=profile,
+            profiles_dir=profiles_dir,
+            mapping_override=mapping_override,
+            reconcile_config=reconcile_config,
+            use_llm=use_llm,
+            llm_client=llm_client,
+        )
     clock = _StageClock()
     classification = classify_pdf(ingested.path)
     clock.mark("classify")
@@ -2669,6 +2687,465 @@ def _run_pipeline(
         profile=profile,
         warnings=warnings,
     )
+
+
+def _sheet_classification(sources: Sequence[extract_sheet.SheetSource]) -> DocumentClassification:
+    """Per-source page records for a spreadsheet: every sheet reads digital.
+
+    There is no text layer to measure, so classification is a statement about
+    how the sheets were read (a cell grid, fully read) rather than a
+    character count.
+    """
+    return DocumentClassification(
+        pages=tuple(
+            PageClassification(page=source.page, char_count=1, is_scanned=False)
+            for source in sources
+        )
+    )
+
+
+def _sheet_runs(sources: Sequence[extract_sheet.SheetSource]) -> list[LogicalRun]:
+    """One logical run per worksheet, bounded by the workbook's own structure.
+
+    Worksheets are separate sources by construction -- the workbook says so --
+    so the boundary carries structural confidence, and each run's facts are
+    read only from its own sheet. A workbook with a single source is one
+    loss run and carries no run at all, as a single-report PDF does.
+    """
+    if len(sources) < 2:
+        return []
+    return [
+        LogicalRun(
+            run_id=f"run-{number}",
+            pages=[source.page],
+            confidence=RunConfidence.STRUCTURAL,
+            evidence=[
+                RunBoundary(
+                    page=source.page,
+                    kind="sheet",
+                    source="none",
+                    text=f"worksheet '{source.name}' is its own source",
+                )
+            ],
+            source_methods=[SourceMethod.SHEET],
+            table_pages=[source.page],
+        )
+        for number, source in enumerate(sources, start=1)
+    ]
+
+
+def _run_sheet_pipeline(
+    ingested: IngestedFile,
+    *,
+    profile: CarrierProfile | None = None,
+    profiles_dir: Path | None = None,
+    mapping_override: ColumnMapping | None = None,
+    reconcile_config: ReconcileConfig | None = None,
+    use_llm: bool = False,
+    llm_client: Any | None = None,
+) -> ExtractionResult:
+    """Run extraction over a staged XLSX or CSV loss run.
+
+    The claim-building, mapping, inference and reconciliation stages are the
+    PDF ones; only extraction and run binding differ. Each visible,
+    non-empty worksheet is one source and one logical run; a CSV is one
+    source. Nothing is ever combined across worksheets.
+    """
+    clock = _StageClock()
+    if ingested.kind == "xlsx":
+        sheets = extract_sheet.extract_workbook(ingested.path)
+    else:
+        sheets = extract_sheet.extract_csv(
+            ingested.path, name=Path(ingested.source_filename).stem or "CSV"
+        )
+    clock.mark("extract")
+
+    warnings: list[str] = list(sheets.header_issues)
+    for name, reason in sorted(sheets.ignored_sheets.items()):
+        warnings.append(
+            f"Worksheet '{name}' "
+            + (
+                "is hidden and was not read; it may hold claims nobody has seen."
+                if reason == "hidden"
+                else "is visible but holds no cells; it contributed no claims."
+            )
+        )
+
+    tables: list[RawTable] = []
+    for source in sheets.sources:
+        tables.append(
+            RawTable(
+                page=source.page,
+                headers=source.headers,
+                rows=[
+                    RawRow(
+                        cells=cells,
+                        page=source.page,
+                        line_index=index,
+                        source_lines=[index],
+                    )
+                    for index, cells in source.rows
+                ],
+                total_rows=[
+                    RawRow(
+                        cells=cells,
+                        page=source.page,
+                        line_index=index,
+                        kind="total",
+                        source_lines=[index],
+                    )
+                    for index, cells in source.total_rows
+                ],
+                strategy="sheet",
+                header_line_index=source.header_row if source.headers else None,
+            )
+        )
+
+    metadata = extract_metadata(sheets.title_text)
+    headers = tables[0].headers if tables else []
+    fingerprint_value = fingerprint(sheets.title_text, headers, metadata.carrier)
+
+    if profile is None:
+        profile = load_profile(fingerprint_value, profiles_dir)
+    mapping = mapping_override or build_mapping(
+        headers,
+        profile,
+        fingerprint_value,
+        samples=sample_rows(tables),
+        use_llm=use_llm,
+        llm_client=llm_client,
+    )
+    clock.mark("mapping")
+
+    # Number and date conventions, derived from the document itself, exactly
+    # as the PDF path derives them.
+    locale_inference = infer_locale(_money_tokens(tables, mapping))
+    if profile and profile.number_locale:
+        locale_inference = LocaleInference(
+            profile.number_locale, True, "carrier profile"
+        )
+    date_inference, header_date_inference = resolve_date_order(
+        tables, mapping, metadata, locale_inference.for_parsing
+    )
+    if profile and profile.date_order:
+        date_inference = DateOrderInference(
+            profile.date_order, True, "carrier profile", source="evidence"
+        )
+        header_date_inference = date_inference
+    locale = locale_inference.for_parsing
+    date_order = date_inference.for_parsing
+    dash_means_zero = bool(profile and profile.dash_means_zero)
+
+    runs = _sheet_runs(sheets.sources)
+    groups, borrowed = vote_plan(runs)
+
+    def shapes_for(reader_tables: list[RawTable]) -> dict[int, set[str]] | None:
+        if groups is None:
+            return None
+        shapes = identifier_shapes_by_run(reader_tables, mapping, groups)
+        for index, source in borrowed.items():
+            if source in shapes:
+                shapes[index] = shapes[source]
+        return shapes
+
+    refused_rows: list[RefusedClaimRow] = []
+    claims, row_warnings, unplaced_rows = build_claims(
+        tables, mapping, locale, date_order,
+        dash_means_zero=dash_means_zero,
+        source_method=SourceMethod.SHEET,
+        runs=groups,
+        shapes_by_run=shapes_for(tables),
+        refused=refused_rows,
+    )
+    warnings.extend(row_warnings)
+    _apply_formula_gaps(sheets, claims, mapping, warnings)
+    clock.mark("claims")
+
+    # Document-level facts.
+    document_issues: dict[str, NullReason] = {}
+    header_order = header_date_inference.for_parsing or date_order
+    valuation = parse_date(metadata.valuation_date_text or "", header_order)
+    if valuation.value is None and metadata.valuation_date_text:
+        document_issues["valuation_date"] = valuation.reason or NullReason.UNPARSEABLE
+
+    stated = read_document_columns(tables)
+    declared_periods = [
+        (start_value, end_value)
+        for start_text, end_text in metadata.policy_periods
+        if (start_value := parse_date(start_text, header_order).value) is not None
+        and (end_value := parse_date(end_text, header_order).value) is not None
+    ]
+    if not declared_periods:
+        declared_periods = stated_periods(stated, date_order)
+
+    rows_seen_per_page: dict[int, int] = {}
+    furniture = page_furniture(tables)
+    for table in tables:
+        table_mapping = mapping_for(table, mapping)
+        index = table_mapping.index_of("claim_number")
+        rows_seen_per_page[table.page] = sum(
+            1
+            for row in table.rows
+            if index is not None
+            and row.cell(index).strip()
+            and not is_structural_row(row, table_mapping)
+            and (text := _normalised(row))
+            and text not in furniture
+        )
+
+    per_run_evidence = split_is_settled(runs)
+    run_tables: dict[str, list[RawTable]] = {
+        run.run_id: [table for table in tables if run.holds(table.page)]
+        for run in runs
+    }
+    run_totals: dict[str, tuple[dict, tuple[int, int] | None, dict[str, str]]] = {}
+    if per_run_evidence:
+        printed_totals: dict[str, Decimal | None] = {}
+        document_total_row: tuple[int, int] | None = None
+        unreadable_totals: dict[str, str] = {}
+        for run in runs:
+            run_totals[run.run_id] = _document_total(
+                run_tables[run.run_id], mapping, locale,
+                sum(1 for claim in claims if run.holds(claim.source_page)),
+            )
+    else:
+        printed_totals, document_total_row, unreadable_totals = _document_total(
+            tables, mapping, locale, len(claims)
+        )
+
+    recovery_sign = infer_recovery_sign(
+        (
+            claim.claim_number,
+            claim.paid_total,
+            claim.reserve_total,
+            claim.recovery_total,
+            claim.incurred_total,
+        )
+        for claim in claims
+    )
+    if profile and profile.recovery_convention:
+        recovery_sign = RecoverySignInference(
+            credit_convention=profile.recovery_convention == "credit",
+            confident=True,
+            evidence="carrier profile",
+        )
+    if per_run_evidence:
+        printed_sections = [
+            section
+            for run in runs
+            for section in collect_printed_sections(
+                run_tables[run.run_id],
+                mapping,
+                locale_inference.locale,
+                date_inference.order,
+                document_row=run_totals[run.run_id][1],
+            )
+        ]
+    else:
+        printed_sections = collect_printed_sections(
+            tables, mapping, locale_inference.locale, date_inference.order,
+            document_row=document_total_row,
+        )
+    if recovery_sign.should_negate:
+        for claim in claims:
+            if claim.recovery_total is not None:
+                claim.recovery_total = -claim.recovery_total
+        printed_totals = {
+            name: (-value if name == "recovery_total" and value is not None else value)
+            for name, value in printed_totals.items()
+        }
+        for run_id, (totals, row, unreadable) in list(run_totals.items()):
+            run_totals[run_id] = (
+                {
+                    name: (-value if name == "recovery_total" and value is not None else value)
+                    for name, value in totals.items()
+                },
+                row,
+                unreadable,
+            )
+        for section in printed_sections:
+            value = section.printed_totals.get("recovery_total")
+            if value is not None:
+                section.printed_totals["recovery_total"] = -value
+
+    # Currency: what the rows actually show, not what the default assumes.
+    declared = (metadata.currency or "").strip().upper()[:3]
+    declared = declared if len(declared) == 3 and declared.isalpha() else ""
+    symbols = {claim.currency for claim in claims if claim.currency}
+    stated_currency = agreed(stated.get("currency", []))
+    if stated_currency and len(stated_currency) == 3 and stated_currency.isalpha():
+        currency = stated_currency.upper()
+    elif declared:
+        currency = declared
+    elif len(symbols) == 1:
+        currency = next(iter(symbols))
+    else:
+        currency = "USD"
+    currencies_seen = sorted(symbols | ({declared} if declared else set()))
+
+    column_carrier = agreed(stated.get("carrier", []))
+    column_insured = agreed(stated.get("named_insured", []))
+    column_policy = agreed(stated.get("policy_number", []))
+    column_lob = agreed(stated.get("line_of_business", []))
+    column_start = parse_date(
+        agreed(stated.get("policy_period_start", [])) or "", date_order
+    ).value
+    column_end = parse_date(
+        agreed(stated.get("policy_period_end", [])) or "", date_order
+    ).value
+    letterhead_carrier = metadata.carrier
+    if letterhead_carrier and _reads_as_column_labels(letterhead_carrier, headers):
+        letterhead_carrier = None
+    if "carrier" in stated:
+        letterhead_carrier = None
+
+    # Each run's facts come from its own sheet's cells, never another's.
+    for run in runs:
+        run_stated = read_document_columns(run_tables[run.run_id])
+        run.carrier = agreed(run_stated.get("carrier", []))
+        run.named_insured = agreed(run_stated.get("named_insured", []))
+        run.policy_number = agreed(run_stated.get("policy_number", []))
+        run.line_of_business = _line_of_business(
+            agreed(run_stated.get("line_of_business", []))
+        )
+        run_start = parse_date(
+            agreed(run_stated.get("policy_period_start", [])) or "", date_order
+        ).value
+        run_end = parse_date(
+            agreed(run_stated.get("policy_period_end", [])) or "", date_order
+        ).value
+        run.policy_period_start, run.policy_period_end = run_start, run_end
+        if per_run_evidence:
+            totals, total_row, unreadable = run_totals[run.run_id]
+            run.printed_totals = totals
+            run.unreadable_totals = unreadable
+            run.unreadable_totals_page = total_row[0] if total_row else None
+            run.unreadable_totals_row = total_row[1] if total_row else None
+        run.borrowed_conventions = _borrowed_conventions(
+            run_tables[run.run_id], mapping, locale_inference, date_inference,
+            profile, run.carrier,
+        )
+    for row in refused_rows:
+        run = next((item for item in runs if item.holds(row.page)), None)
+        row.bounded = run is None or (
+            not run.ambiguous and run.confidence is not RunConfidence.NONE
+        )
+        row.report = not (run is not None and run.ambiguous) and (
+            bool(runs) or not row.bounded
+        )
+
+    document = LossRunDocument(
+        document_id=ingested.document_id,
+        source_filename=ingested.source_filename,
+        file_sha256=ingested.sha256,
+        carrier=column_carrier or letterhead_carrier,
+        named_insured=column_insured or metadata.named_insured,
+        policy_number=column_policy or metadata.policy_number,
+        policy_period_start=_period_start_of(declared_periods, column_start),
+        policy_period_end=_period_end_of(declared_periods, column_end),
+        line_of_business=_line_of_business(metadata.line_of_business)
+        or _line_of_business(column_lob),
+        valuation_date=valuation.value,
+        currency=currency,
+        locale_hint=locale_inference.locale,
+        locale_confident=locale_inference.confident,
+        date_order=date_inference.order,
+        date_order_confident=date_inference.confident,
+        page_count=len(sheets.sources),
+        extraction_method=ExtractionMethod.DIGITAL,
+        processed_pages=sorted({source.page for source in sheets.sources}),
+        ignored_sheets=dict(sheets.ignored_sheets),
+        unplaced_rows=unplaced_rows,
+        printed_totals=printed_totals,
+        printed_claim_count=None,
+        unreadable_totals=unreadable_totals,
+        unreadable_totals_page=(
+            document_total_row[0] if document_total_row else None
+        ),
+        unreadable_totals_row=(
+            document_total_row[1] if document_total_row else None
+        ),
+        policy_periods=declared_periods,
+        rows_seen_per_page=rows_seen_per_page,
+        column_mapping=mapping.decisions,
+        printed_sections=printed_sections,
+        runs=runs,
+        refused_claim_rows=refused_rows,
+        claims=claims,
+        currencies_seen=currencies_seen,
+        document_issues=document_issues,
+        profile_fingerprint=fingerprint_value,
+        profile_name=profile.profile_name if profile else None,
+        recovery_convention="credit" if recovery_sign.should_negate else None,
+    )
+    scope_sections(document.printed_sections, document.claims)
+
+    config = reconcile_config or _config_for(profile)
+    clock.mark("assemble")
+    reconciliation = reconcile(document, config)
+    clock.mark("reconcile")
+    return ExtractionResult(
+        document=document,
+        reconciliation=reconciliation,
+        timings=clock.done(),
+        mapping=mapping,
+        classification=_sheet_classification(sheets.sources),
+        source_path=ingested.path,
+        locale=locale_inference,
+        date_order=date_inference,
+        recovery_sign=recovery_sign,
+        tables=tables,
+        profile=profile,
+        warnings=warnings,
+    )
+
+
+def _apply_formula_gaps(
+    sheets: extract_sheet.SheetExtraction,
+    claims: Sequence[Claim],
+    mapping: ColumnMapping,
+    warnings: list[str],
+) -> None:
+    """Fail closed on formula cells with no stored result.
+
+    The value is unknown, never zero. On a claim row the field is null with
+    ``UNPARSEABLE`` -- which R-15 reports and which blocks trust -- and the
+    formula text is kept beside the claim as the cell's raw reading. Anywhere
+    else it is named in a warning: the value nobody read is on the record.
+    """
+    by_position = {
+        (claim.source_page, claim.source_row): claim for claim in claims
+    }
+    for source in sheets.sources:
+        for gap in source.formula_gaps:
+            field = mapping.fields.get(gap.column)
+            claim = by_position.get((source.page, gap.row))
+            if (
+                claim is not None
+                and field is not None
+                and (field in MONEY_FIELDS or field in DATE_FIELDS)
+            ):
+                claim.field_issues[field] = NullReason.UNPARSEABLE
+                claim.field_confidence[field] = 0.0
+                claim.raw_cells[field] = gap.formula
+                continue
+            location = f"'{source.name}' row {gap.row + 1}, column {gap.column + 1}"
+            warnings.append(
+                f"Worksheet {location} holds the formula {gap.formula!r} with "
+                "no stored result. Its value is unknown; it was not evaluated."
+            )
+
+
+def _period_start_of(
+    declared: Sequence[tuple[date, date]], column_start: date | None
+) -> date | None:
+    return min(start for start, _ in declared) if declared else column_start
+
+
+def _period_end_of(
+    declared: Sequence[tuple[date, date]], column_end: date | None
+) -> date | None:
+    return max(end for _, end in declared) if declared else column_end
 
 
 def _config_for(profile: CarrierProfile | None) -> ReconcileConfig:
