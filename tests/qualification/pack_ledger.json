@@ -27,12 +27,8 @@
       "shortfalls": []
     },
     "foreign-page-bridged": {
-      "met": false,
-      "shortfalls": [
-        "claims_missing",
-        "status_differs"
-      ],
-      "followup": "Phase 2: another carrier's unnumbered page inside a report is split off but its claim is named (R-23/R-28), not read. Safe (review), claim missing."
+      "met": true,
+      "shortfalls": []
     },
     "furniture-controls": {
       "met": true,

@@ -560,8 +560,10 @@ def test_r3_3_packet_stamp_is_the_first_reports_only_numbering(tmp_path):
 
 def test_r3_4_resume_after_another_carriers_unnumbered_report(tmp_path):
     """A "Page 1 of 3" / B (other carrier, unnumbered) / A "2 of 3", "3 of 3"
-    with A's grand total. B's page is left out of A's count as unsettled: its
-    claim is read or named, and the packet needs review."""
+    with A's grand total. A's count resumes right after B's page, so its
+    pagination itself leaves B out, and B's page names another carrier: B is
+    a report of its own, its claim read into that run (never silently lost),
+    and the packet -- each run tying what it printed -- is CLEAN."""
     large = _large_run(12)
     result = _read(tmp_path, [
         {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": large[:4]},
@@ -573,7 +575,12 @@ def test_r3_4_resume_after_another_carriers_unnumbered_report(tmp_path):
     ])
     ok, _ = _claim_read_or_named(result, SMALL_RUN[0][0])
     assert ok, _msg(result)
-    assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW, _msg(result)
+    runs = result.document.runs
+    assert [(run.pages, run.ambiguous) for run in runs] == [
+        ([1, 3, 4], False), ([2], False)], _msg(result)
+    assert [claim.claim_number for claim in result.document.run_claims(runs[1])] == [
+        SMALL_RUN[0][0]], _msg(result)
+    assert result.reconciliation.status is DocumentStatus.CLEAN, _msg(result)
 
 
 def test_r3_5_single_report_sections_by_line_of_business(tmp_path):

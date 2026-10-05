@@ -26,7 +26,11 @@ What the evidence settles, and what it does not:
   which: it is unsettled.
 * A page with no numbering after a report stopped short of its last page is
   unsettled -- it may be the report's page with its footer missing, or the
-  first page of another.
+  first page of another. One thing can settle it: the report's own count
+  resuming after the gap ("1 of 2", an unnumbered page, "2 of 2") leaves the
+  gap out of the count it printed. Under a heading naming another report, or
+  printing another policy, the gap holds that report's page; under the same
+  heading, or none, it stays unsettled.
 
 An unsettled run is kept apart and marked ambiguous: its pages are listed, its
 claims are kept, and the document needs review. It does not get a claim-number
@@ -631,6 +635,31 @@ class _Planner:
         # after it account for it exactly, or when nothing after it contradicts
         # that and it is not under another report's heading.
         ahead, next_label = self.unnumbered_run_ahead(position)
+        # One page (or a gap of them) the report's own count leaves out: the
+        # numbering after the gap resumes the same count at the page that
+        # follows the last one seen, so the report's pagination itself says
+        # the gap is not its pages with their number unread. Under a heading
+        # naming another report, or printing another policy, the gap holds
+        # that report's page -- a settled boundary on printed evidence, read
+        # as its own run rather than left ambiguous. A heading or policy the
+        # vision model read does not settle it: that is a reading, not a
+        # measurement.
+        skips = (next_label is not None and next_label.count == count
+                 and next_label.index == index + ahead)
+        if (skips and page_evidence.method is SourceMethod.DIGITAL
+                and (heading is False
+                     or same_policy(page_evidence.policy, current.policy) is False)):
+            decided = ("names another report" if heading is False
+                       else "prints another policy's number")
+            self.close_short(page)
+            self.start(page, confidence=RunConfidence.PRINTED, evidence=[RunBoundary(
+                page=page, kind="unnumbered", source="none",
+                text=(f"page {page} prints no page number; the report on pages "
+                      f"{current.span()} resumes at page {next_label.index} of "
+                      f"{next_label.count}, so its count leaves this page out, "
+                      f"and it {decided}: it begins another report"),
+            )])
+            return
         exact = (next_label is not None and next_label.count == count
                  and next_label.index == index + ahead + 1)
         fits = (heading is not False and index + ahead <= count

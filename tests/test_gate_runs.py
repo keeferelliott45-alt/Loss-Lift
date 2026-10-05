@@ -40,12 +40,13 @@ def _single(tmp_path):
 
 
 def _packet_with_a_refused_row(tmp_path):
-    """Report A "Page 1 of 3", another carrier's unnumbered page, A resumes:
-    the interleaved page's claim is refused and named (adversarial r3-4)."""
+    """A page printed under A's heading but numbering its claims another way,
+    unnumbered, inside A's count: the boundary stays unsettled, so the page's
+    claim is refused and named -- the shape the gate must keep measuring."""
     large = _large_run(12)
     return _read(tmp_path, [
         {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": large[:4]},
-        {"top": ("HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+        {"top": (LARGE_CARRIER, *LETTER),
          "headers": SMALL_HEADERS, "rows": list(SMALL_RUN[:1])},
         {"top": ("Page 2 of 3", LARGE_CARRIER, *LETTER), "rows": large[4:8]},
         {"top": ("Page 3 of 3", LARGE_CARRIER, *LETTER), "rows": large[8:],

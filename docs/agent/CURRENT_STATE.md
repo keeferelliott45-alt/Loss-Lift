@@ -31,7 +31,7 @@ in `Remember.md`).
 
 ## Qualification status
 
-**Packs on F1: 19 of 24 cases met.** The five that are not met are
+**Packs on F1: 20 of 24 cases met.** The four that are not met are
 ledgered, and they are the top of Phase 2:
 
 1. **False CLEAN** (`policy-change-boundary`). Two unnumbered reports under
@@ -45,8 +45,12 @@ ledgered, and they are the top of Phase 2:
    - Printed totals and counts then stay at document level and raise false
      R-04, R-25 and R-27 findings.
    - The result is safe, but it will be the common case on real packets.
-3. **Foreign page inside a report** (`foreign-page-bridged`). The page is
-   split off, but its claim is named (R-23/R-28) rather than read.
+3. ~~Foreign page inside a report~~ (`foreign-page-bridged`): met. An
+   unnumbered page the report's own count resumes after (so its pagination
+   leaves the page out) and which names another carrier or another policy is
+   read as its own settled run; its claim is read there. A page whose heading
+   or policy the vision model read, or which shares the report's heading, is
+   still unsettled (R-28).
 
 **Real documents:** no adjudicated truth exists yet. The 10-document corpus is
 unlabelled, so no real accuracy figure exists, and the charging thresholds in

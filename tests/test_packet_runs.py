@@ -291,6 +291,37 @@ def test_a_report_that_stops_short_then_an_unnumbered_page_fails_closed(tmp_path
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
+def test_a_foreign_page_bridged_inside_a_report_is_read_as_its_own_run(tmp_path):
+    """A "Page 1 of 2", another carrier's unnumbered page, a "Page 2 of 2": the
+    report's own count resumes right after the foreign page, so its pagination
+    itself leaves that page out -- it is not the report's page with its footer
+    missing -- and the page names another carrier. It is a report of its own:
+    its claim is read into that run, and the packet, whose two runs each tie
+    what they printed, is CLEAN -- not a review that only names the claim."""
+    large = _large_run(6)
+    foreign = SMALL_RUN[:1]
+    result = _read(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, large[:3], {"number": 1, "of": 2}),
+        (SMALL_CARRIER, SMALL_HEADERS, foreign),
+        (LARGE_CARRIER, LARGE_HEADERS, (*large[3:], _total(large)), {"number": 2, "of": 2}),
+    ])
+    document = result.document
+    runs = document.runs
+    assert [(run.pages, run.ambiguous) for run in runs] == [([1, 3], False), ([2], False)]
+    foreign_run = runs[1]
+    foreign_claims = document.run_claims(foreign_run)
+    assert [claim.claim_number for claim in foreign_claims] == [SMALL_RUN[0][0]]
+    assert foreign_claims[0].source_page == 2
+    assert [claim.claim_number for claim in document.run_claims(runs[0])] == [
+        row[0] for row in large]
+    assert document.refused_claim_rows == []
+    assert document.unplaced_rows == []
+    rules = sorted({finding.rule_id for finding in result.reconciliation.findings})
+    assert "R-23" not in rules and "R-28" not in rules
+    assert result.reconciliation.run_status["run-2"] is DocumentStatus.CLEAN
+    assert canonical_status(result.reconciliation) is DocumentStatus.CLEAN
+
+
 def test_two_numbers_in_one_count_on_one_page_keep_the_continuing_one():
     evidence = {
         1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 2", "header"))),
