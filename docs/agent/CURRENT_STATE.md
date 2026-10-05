@@ -18,8 +18,29 @@ reconciliation; canonical status policy (`core/review.py`) used everywhere;
 run-level metadata in `run_view` and exports; run-aware corpus gate
 measurements (runs, refused, review_status; `run_id` in finding identity);
 vision record/replay; account rollup identity + trust; local telemetry and
-trust class; claim-accounting view; JSON export; corpus labels; per-run
+trust class; claim-accounting view; JSON export; per-run
 "borrowed convention" R-15.
+
+## Stage F — CSV/XLSX intake (this branch, unmerged)
+
+`core/ingest.py` sniffs the upload kind from bytes — PDF magic, a zip
+carrying `[Content_Types].xml` (xlsx), or delimited UTF-8 text (csv) — and
+stages under the right extension; extension/magic mismatch and legacy
+`.xls`/`.xlsm` fail closed. `core/extract_sheet.py` reads a workbook
+(openpyxl `read_only`, `data_only`): each visible non-empty worksheet is one
+source (`SourceMethod.SHEET`), formulas are never evaluated — a stored
+cached result is used, a missing one is a null + `UNPARSEABLE` field issue
+(R-15) on the claim row or a named warning elsewhere — and hidden/empty
+sheets are recorded by name in `LossRunDocument.ignored_sheets`. Duplicate,
+blank or absent headers are flagged, not guessed. `core/pipeline.py` routes
+xlsx/csv to `_run_sheet_pipeline`, which reuses the PDF path's mapping,
+parsing, inference and reconciliation unchanged; each worksheet binds as its
+own logical run (`run-N`, new `RunConfidence.STRUCTURAL`, settled by
+construction), so printed totals are checked per sheet and nothing is ever
+combined across sheets. Uploader accepts pdf/xlsx/csv. Additive only: no
+PDF-path behaviour change (golden 108/108; full suite failure set identical
+to base). Synthetic fixtures only; the corpus gate is not required for this
+feature (the gate measures real PDFs, which this branch does not change).
 
 ## Corpus gate
 
