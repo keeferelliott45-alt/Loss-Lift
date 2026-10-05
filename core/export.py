@@ -32,7 +32,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from core.summary import summarise_by_period
+from core.summary import PeriodSummary, summarise_by_period, summarise_run
 
 if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
     from core.account import AccountRollup
@@ -52,6 +52,7 @@ from core.schema import (
     Claim,
     DocumentStatus,
     LossRunDocument,
+    LogicalRun,
     ReconciliationResult,
     Severity,
     SourceMethod,
@@ -485,17 +486,69 @@ def _write_runs_sheet(
     _autosize(sheet, widths)
 
 
+_SUMMARY_HEADERS = ["Policy term", "Claims", "Open", "Closed", "Paid", "Reserves",
+                    "Recoveries", "Incurred", "Frequency", "Severity",
+                    "Largest loss", "Carrier printed", "Ties to carrier"]
+
+
+def _summary_row_values(period: PeriodSummary) -> list[Any]:
+    printed = period.printed_totals.get("incurred_total")
+    ties = period.ties()
+    return [
+        period.label,
+        period.claims,
+        period.open_claims,
+        period.closed_claims,
+        float(period.totals["paid_total"]),
+        float(period.totals["reserve_total"]),
+        float(period.totals["recovery_total"]),
+        float(period.totals["incurred_total"]),
+        # Frequency is the claim count for the term; severity is the mean
+        # incurred per claim. No exposure base is on a loss run, so neither
+        # is rated per unit of payroll or revenue -- that is the broker's
+        # own number to divide by.
+        period.claims,
+        (
+            float(period.totals["incurred_total"] / period.claims)
+            if period.claims
+            else None
+        ),
+        float(period.largest_loss) if period.largest_loss is not None else None,
+        float(printed) if printed is not None else None,
+        "not printed" if ties is None else "yes" if ties else "no",
+    ]
+
+
+def _write_summary_row(
+    sheet: Worksheet,
+    row_index: int,
+    period: PeriodSummary,
+    widths: dict[int, int],
+) -> None:
+    ties = period.ties()
+    for column_index, value in enumerate(_summary_row_values(period), start=1):
+        cell = sheet.cell(row=row_index, column=column_index, value=value)
+        if isinstance(value, float):
+            cell.number_format = MONEY_FORMAT
+        if ties is False:
+            cell.fill = _ERROR_FILL
+        if value is not None:
+            widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+
+
 def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
     """Claims by policy term — the loss history a submission asks for.
 
     "Ties to carrier" is the column that matters: it says, per term, whether
     these numbers match the subtotal the carrier printed for that term.
+
+    A packet also gets one block per logical run, under that run's own
+    letterhead: its term, its claims, its printed subtotal. The document
+    roll-up above mixes the runs' claims by loss date; the blocks below keep
+    each carrier's report to its own facts.
     """
-    headers = ["Policy term", "Claims", "Open", "Closed", "Paid", "Reserves",
-               "Recoveries", "Incurred", "Frequency", "Severity",
-               "Largest loss", "Carrier printed", "Ties to carrier"]
     widths: dict[int, int] = {}
-    for column_index, title in enumerate(headers, start=1):
+    for column_index, title in enumerate(_SUMMARY_HEADERS, start=1):
         cell = sheet.cell(row=1, column=column_index, value=title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
@@ -503,45 +556,53 @@ def _write_summary_sheet(sheet: Worksheet, document: LossRunDocument) -> None:
 
     periods = summarise_by_period(document)
     for row_index, period in enumerate(periods, start=2):
-        ties = period.ties()
-        printed = period.printed_totals.get("incurred_total")
-        values = [
-            period.label,
-            period.claims,
-            period.open_claims,
-            period.closed_claims,
-            float(period.totals["paid_total"]),
-            float(period.totals["reserve_total"]),
-            float(period.totals["recovery_total"]),
-            float(period.totals["incurred_total"]),
-            # Frequency is the claim count for the term; severity is the mean
-            # incurred per claim. No exposure base is on a loss run, so neither
-            # is rated per unit of payroll or revenue -- that is the broker's
-            # own number to divide by.
-            period.claims,
-            (
-                float(period.totals["incurred_total"] / period.claims)
-                if period.claims
-                else None
-            ),
-            float(period.largest_loss) if period.largest_loss is not None else None,
-            float(printed) if printed is not None else None,
-            "not printed" if ties is None else "yes" if ties else "no",
-        ]
-        for column_index, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row_index, column=column_index, value=value)
-            if isinstance(value, float):
-                cell.number_format = MONEY_FORMAT
-            if ties is False:
-                cell.fill = _ERROR_FILL
-            if value is not None:
-                widths[column_index] = max(widths[column_index], len(str(value)) + 2)
+        _write_summary_row(sheet, row_index, period, widths)
+
+    if document.is_packet:
+        _write_per_run_summary_blocks(sheet, document, widths)
 
     if not periods:
         sheet.cell(row=2, column=1, value="No claims to summarise.")
 
     sheet.freeze_panes = "A2"
     _autosize(sheet, widths)
+
+
+def _run_letterhead(run: LogicalRun) -> str:
+    """The run's own facts as one line -- never another run's."""
+    valuation = (
+        run.valuation_date.isoformat()
+        if run.valuation_date
+        else (run.valuation_date_text or "not printed")
+    )
+    facts = [
+        f"Carrier: {run.carrier or 'not printed'}",
+        f"Named insured: {run.named_insured or 'not printed'}",
+        f"Policy: {run.policy_number or 'not printed'}",
+        f"Valuation: {valuation}",
+    ]
+    return f"Run {run.run_id} (pages {run.page_range}) — " + " — ".join(facts)
+
+
+def _write_per_run_summary_blocks(
+    sheet: Worksheet,
+    document: LossRunDocument,
+    widths: dict[int, int],
+) -> None:
+    """One Loss Summary block per logical run, from that run's pages only."""
+    row_index = sheet.max_row + 2
+    for run in document.runs:
+        sheet.cell(row=row_index, column=1, value=_run_letterhead(run)).font = Font(bold=True)
+        header_row = row_index + 1
+        for column_index, title in enumerate(_SUMMARY_HEADERS, start=1):
+            cell = sheet.cell(row=header_row, column=column_index, value=title)
+            cell.fill = _HEADER_FILL
+            cell.font = _HEADER_FONT
+            widths[column_index] = max(widths[column_index], len(title) + 2)
+        for period in summarise_run(document, run):
+            header_row += 1
+            _write_summary_row(sheet, header_row, period, widths)
+        row_index = header_row + 2
 
 
 def _write_large_loss_sheet(
@@ -711,7 +772,60 @@ def _write_source_sheet(
     if row_index == header_row + 1:
         sheet.cell(row=row_index, column=1, value="The document printed no column totals.")
 
+    if document.is_packet:
+        _write_per_run_source_block(sheet, document)
+
     _autosize(sheet, {1: 34, 2: 46, 3: 20, 4: 18})
+
+
+def _write_per_run_source_block(sheet: Worksheet, document: LossRunDocument) -> None:
+    """Each logical run's own facts, read from that run's pages only.
+
+    The document rows above carry page 1's letterhead; a packet binds several
+    carriers' reports, so each run is named here with its own carrier,
+    insured, policy, term, valuation, counts and printed total. A run that
+    does not print a fact says so -- it is never given another run's.
+    """
+    row_index = sheet.max_row + 2
+    sheet.cell(row=row_index, column=1, value="Per-run facts").font = Font(bold=True)
+    headers = ["Run", "Pages", "Carrier", "Named insured", "Policy number",
+               "Policy period", "Valuation date", "Line of business",
+               "Claims extracted", "Printed claim count", "Printed incurred total"]
+    header_row = row_index + 1
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=header_row, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+
+    for offset, run in enumerate(document.runs, start=header_row + 1):
+        start, end = run.policy_period_start, run.policy_period_end
+        if start or end:
+            period = f"{start.isoformat() if start else '?'} to {end.isoformat() if end else '?'}"
+        else:
+            period = "not printed"
+        valuation = (
+            run.valuation_date
+            if run.valuation_date
+            else (run.valuation_date_text or "not printed")
+        )
+        printed = run.printed_totals.get("incurred_total")
+        values: list[Any] = [
+            run.run_id,
+            run.page_range,
+            run.carrier or "not printed",
+            run.named_insured or "not printed",
+            run.policy_number or "not printed",
+            period,
+            valuation,
+            run.line_of_business.value if run.line_of_business else "not printed",
+            len(document.run_claims(run)),
+            run.printed_claim_count if run.printed_claim_count is not None else "not printed",
+            float(printed) if printed is not None else "not printed",
+        ]
+        for column_index, value in enumerate(values, start=1):
+            cell = sheet.cell(row=offset, column=column_index, value=value)
+            if isinstance(value, date):
+                cell.number_format = DATE_FORMAT
 
 
 def _period(document: LossRunDocument) -> str:

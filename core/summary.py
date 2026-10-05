@@ -17,7 +17,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Sequence
 
-from core.schema import Claim, ClaimStatus, LossRunDocument, PrintedSection
+from core.schema import Claim, ClaimStatus, LossRunDocument, LogicalRun, PrintedSection
 
 #: Money columns worth breaking out per term.
 SUMMARY_FIELDS = ("paid_total", "reserve_total", "recovery_total", "incurred_total")
@@ -129,6 +129,31 @@ def summarise_by_period(document: LossRunDocument) -> list[PeriodSummary]:
     return summarise_periods(
         document.claims, document.policy_periods, document.printed_sections
     )
+
+
+def summarise_run(document: LossRunDocument, run: LogicalRun) -> list[PeriodSummary]:
+    """One logical run's claims by that run's own policy term.
+
+    Only this run's claims, this run's term and what this run's own pages
+    printed enter the breakdown. A packet binds several carriers' reports, so
+    run 2 must never be summarised under run 1's term or checked against run
+    1's subtotal. A claim of this run dated outside its own term is shown as
+    outside it, never folded under the term to make the printed check tie; a
+    run that prints no term falls back to the calendar year grouping a
+    reviewer would use by hand, over this run's claims only.
+    """
+    claims = document.run_claims(run)
+    start, end = run.policy_period_start, run.policy_period_end
+    if start is None or end is None:
+        return summarise_periods(claims)
+    section = PrintedSection(
+        label=run.run_id,
+        period_start=start,
+        period_end=end,
+        printed_totals=run.printed_totals,
+        printed_claim_count=run.printed_claim_count,
+    )
+    return summarise_periods(claims, [(start, end)], [section])
 
 
 def summarise_periods(
