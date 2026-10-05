@@ -75,6 +75,11 @@ class SheetExtraction:
     sources: list[SheetSource] = field(default_factory=list)
     #: Worksheets that produced no source, named with why: "hidden" or "empty".
     ignored_sheets: dict[str, str] = field(default_factory=dict)
+    #: The source page each ignored worksheet occupies, in workbook order. A
+    #: worksheet exists in the file whether or not it was read, so it keeps a
+    #: page: a hidden sheet's page is unreads source content, and page
+    #: accounting (R-22) names it.
+    ignored_sheet_pages: dict[str, int] = field(default_factory=dict)
     #: Text printed above the header of the first source, for carrier detection.
     title_text: str = ""
     #: Header defects seen and refused: blank cells, repeated labels, none.
@@ -94,10 +99,16 @@ def extract_workbook(path: str | Path) -> SheetExtraction:
     try:
         formula_book = load_workbook(path, read_only=True, data_only=False)
         try:
-            for index, name in enumerate(values_book.sheetnames):
+            # Every worksheet occupies a page, in workbook order -- read or
+            # not. A page nothing read is unaccounted source content unless
+            # the pipeline records why, which it does from these numbers.
+            page = 0
+            for name in values_book.sheetnames:
+                page += 1
                 state = values_book[name].sheet_state
                 if state != "visible":
                     extraction.ignored_sheets[name] = "hidden"
+                    extraction.ignored_sheet_pages[name] = page
                     continue
                 source = _read_sheet(
                     name,
@@ -106,8 +117,9 @@ def extract_workbook(path: str | Path) -> SheetExtraction:
                 )
                 if source is None:
                     extraction.ignored_sheets[name] = "empty"
+                    extraction.ignored_sheet_pages[name] = page
                     continue
-                source.page = len(extraction.sources) + 1
+                source.page = page
                 extraction.sources.append(source)
                 if not extraction.title_text and source.header_row > 0:
                     _collect_title(values_book[name], source.header_row, extraction)
@@ -261,9 +273,17 @@ def _formula_text(cell: Any) -> str:
 
 
 def _is_header(row: list[Any]) -> bool:
-    """A header row names at least three recognisable loss-run columns."""
+    """A header row names recognisable loss-run columns.
+
+    Two named columns are enough on a spreadsheet, where the grid has no
+    typography to lean on: a title row carries none, and a data row carries
+    at most a cell that happens to spell like a label. Requiring three would
+    silently unmap the amount of a two-label-plus-one-unreadable header --
+    exactly the header a spreadsheet that stopped being edited produces --
+    and the unmapped column would be flagged, not guessed, either way.
+    """
     cells = [_cell_text(cell) for cell in row]
-    return header_score(cells) >= 3
+    return header_score(cells) >= 2
 
 
 def _is_total_row(cells: list[str]) -> bool:

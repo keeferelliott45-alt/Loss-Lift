@@ -84,11 +84,14 @@ def sniff_kind(data: bytes) -> str:
 
 
 def _kind_for(filename: str, sniffed: str) -> str:
-    """Check the filename agrees with the bytes, and stage under the right kind.
+    """Check the filename does not contradict the bytes; stage under a kind.
 
-    A name that contradicts the magic means the file was renamed or saved
-    wrong; neither reading is safe, so the upload is refused. Legacy Excel
-    formats are refused before anything else about them is asked.
+    The bytes decide what a file is. A *recognised* extension that contradicts
+    the magic means the file was renamed or saved wrong, and neither reading
+    is safe, so the upload is refused. An unrecognised or missing extension
+    contradicts nothing: the magic carries the kind and the file is staged as
+    what it is. Legacy Excel formats are refused before anything else about
+    them is asked.
     """
     suffix = Path(filename).suffix.lower()
     if suffix in UNSUPPORTED_SUFFIXES:
@@ -98,11 +101,7 @@ def _kind_for(filename: str, sniffed: str) -> str:
         )
     declared = SUFFIX_KIND.get(suffix)
     if declared is None:
-        raise IngestError(
-            f"{Path(filename).name} does not have a .pdf, .xlsx or .csv "
-            "extension. Rename the file with its true extension and upload "
-            "it again."
-        )
+        return sniffed
     if declared != sniffed:
         raise IngestError(
             f"{Path(filename).name} is named {suffix} but its contents are "

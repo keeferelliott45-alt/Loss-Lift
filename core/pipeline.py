@@ -3034,6 +3034,24 @@ def _run_sheet_pipeline(
             bool(runs) or not row.bounded
         )
 
+    # Each worksheet occupies a page in workbook order, read or not. A hidden
+    # worksheet is source content the app chose not to read, so its page is
+    # unresolved and R-22 names it; a visible-but-empty one was read and
+    # holds nothing, which is recorded on the document and in the warnings.
+    empty_pages = [
+        sheets.ignored_sheet_pages[name]
+        for name, reason in sheets.ignored_sheets.items()
+        if reason == "empty"
+    ]
+    hidden_pages = {
+        sheets.ignored_sheet_pages[name]: (
+            f"the worksheet '{name}' is hidden, so it was not read; whether "
+            "it holds claims is unknown"
+        )
+        for name, reason in sheets.ignored_sheets.items()
+        if reason == "hidden"
+    }
+
     document = LossRunDocument(
         document_id=ingested.document_id,
         source_filename=ingested.source_filename,
@@ -3051,9 +3069,13 @@ def _run_sheet_pipeline(
         locale_confident=locale_inference.confident,
         date_order=date_inference.order,
         date_order_confident=date_inference.confident,
-        page_count=len(sheets.sources),
+        page_count=len(sheets.sources) + len(sheets.ignored_sheets),
         extraction_method=ExtractionMethod.DIGITAL,
-        processed_pages=sorted({source.page for source in sheets.sources}),
+        processed_pages=sorted(
+            {source.page for source in sheets.sources} | set(empty_pages)
+        ),
+        unresolved_pages=sorted(hidden_pages),
+        unresolved_reasons=hidden_pages,
         ignored_sheets=dict(sheets.ignored_sheets),
         unplaced_rows=unplaced_rows,
         printed_totals=printed_totals,
