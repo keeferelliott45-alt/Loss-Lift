@@ -90,7 +90,12 @@ Catastrophic blind spots found:
 
 - Number format, date order, recovery sign, saved profile and column mapping
   are per document; per run they are only *checked* (borrowed-convention R-15).
-- Packet document header, Source Info and Loss Summary show page 1's facts.
+- ~~Packet document header, Source Info and Loss Summary show page 1's
+  facts.~~ Closed (D1): Source Info carries a per-run facts block and Loss
+  Summary one block per logical run, each from that run's own pages, and the
+  app header lists each run's facts under the document headline. The
+  document-level roll-up rows themselves remain page 1's facts, labelled as
+  the document's.
 - Refused rows on a bounded single report are recorded but named by no rule.
 - A claim-like row whose identifier cell carries a worded label before a colon
   (e.g. `Claim No: ...`) is taken for printed furniture by

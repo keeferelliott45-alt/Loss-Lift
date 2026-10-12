@@ -319,6 +319,22 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     )
     st.caption(" · ".join(meta))
 
+    if document.is_packet:
+        # The headline above is page 1's letterhead. Each run's own facts are
+        # shown here, from that run's pages -- never borrowed across runs.
+        for run in document.runs:
+            valuation = (
+                run.valuation_date.isoformat()
+                if run.valuation_date
+                else (run.valuation_date_text or "not printed")
+            )
+            facts = [
+                f"Carrier: {run.carrier or 'not printed'}",
+                f"Policy: {run.policy_number or 'not printed'}",
+                f"Valuation: {valuation}",
+            ]
+            st.caption(f"{run.run_id} (pages {run.page_range}) — " + " · ".join(facts))
+
     if passed:
         st.markdown(
             '<div class="ll-status ll-status-pass">✓ <b>Reconciled to carrier</b></div>',
