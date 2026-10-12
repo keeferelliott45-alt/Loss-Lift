@@ -1,0 +1,77 @@
+{
+  "name": "board_packet_per_run_totals",
+  "description": "Board packet: three carriers' loss runs bound into one document, one page each, every run's own footer tying to its own rows",
+  "carrier": "Cascadia Marine Insurance",
+  "named_insured": "Harborline Charters Inc",
+  "policy_number": "CM-712304-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 8,
+  "printed_claim_count": 8,
+  "printed_totals": {},
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "date_reported",
+    "claim_status",
+    "claimant_name",
+    "loss_description",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ],
+  "runs": [
+    {
+      "carrier": "Cascadia Marine Insurance",
+      "named_insured": "Harborline Charters Inc",
+      "policy_number": "CM-712304-24",
+      "policy_period_start": "2024-01-01",
+      "policy_period_end": "2024-12-31",
+      "valuation_date": "2024-12-31",
+      "line_of_business": "GL",
+      "claim_count": 3,
+      "printed_totals": {
+        "paid_total": "30600.00",
+        "reserve_total": "44300.00",
+        "recovery_total": "600.00",
+        "incurred_total": "74300.00"
+      }
+    },
+    {
+      "carrier": "Meridian Ocean Casualty",
+      "named_insured": "Harborline Charters Inc",
+      "policy_number": "MOC-88512-24",
+      "policy_period_start": "2024-01-01",
+      "policy_period_end": "2024-12-31",
+      "valuation_date": "2024-12-31",
+      "line_of_business": "GL",
+      "claim_count": 2,
+      "printed_totals": {
+        "paid_total": "5950.00",
+        "reserve_total": "11000.00",
+        "incurred_total": "16950.00"
+      }
+    },
+    {
+      "carrier": "Tidewater Bloom Underwriters",
+      "named_insured": "Harborline Charters Inc",
+      "policy_number": "TBU-4471",
+      "policy_period_start": "2024-01-01",
+      "policy_period_end": "2024-12-31",
+      "valuation_date": "2024-12-31",
+      "line_of_business": "GL",
+      "claim_count": 3,
+      "printed_totals": {
+        "paid_total": "14870.00",
+        "reserve_total": "26600.00",
+        "incurred_total": "41470.00"
+      }
+    }
+  ]
+}

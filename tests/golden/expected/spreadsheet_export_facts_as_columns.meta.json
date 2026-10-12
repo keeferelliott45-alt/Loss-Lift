@@ -1,0 +1,32 @@
+{
+  "name": "spreadsheet_export_facts_as_columns",
+  "description": "Spreadsheet-style export: no letterhead, the company, insured, policy, term and currency repeat as columns on every claim",
+  "carrier": "Granite Peak Specialty",
+  "named_insured": "Boulder Outfitters LLC",
+  "policy_number": "GP-441027-24",
+  "policy_period_start": "2024-01-01",
+  "policy_period_end": "2024-12-31",
+  "valuation_date": "2024-12-31",
+  "line_of_business": "GL",
+  "currency": "USD",
+  "locale_hint": "us",
+  "claim_count": 5,
+  "printed_claim_count": 5,
+  "printed_totals": {
+    "paid_total": "40520.00",
+    "reserve_total": "61000.00",
+    "recovery_total": "300.00",
+    "incurred_total": "101220.00"
+  },
+  "scanned": false,
+  "fields": [
+    "claim_number",
+    "date_of_loss",
+    "claim_status",
+    "claimant_name",
+    "paid_total",
+    "reserve_total",
+    "recovery_total",
+    "incurred_total"
+  ]
+}
