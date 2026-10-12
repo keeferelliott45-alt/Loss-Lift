@@ -33,6 +33,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from core.intelligence import AppetiteRules, TriageSummary, triage_summary
 from core.summary import PeriodSummary, summarise_by_period, summarise_run
 
 if TYPE_CHECKING:  # imported for typing only; core.account imports nothing here
@@ -1241,6 +1242,144 @@ def build_batch_zip(
 
 def _float(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
+
+
+# --------------------------------------------------------------------------
+# Account triage workbook
+#
+# The same merged account, as the underwriter triage layer (core.intelligence)
+# sees it: whether the account can be used as it stands, what sits outside
+# appetite, and what triage could not evaluate at all. Nothing is recomputed
+# here -- period figures are the account's PeriodSummary values verbatim, and
+# every flag repeats its provenance once per source it was derived from.
+# --------------------------------------------------------------------------
+
+
+def _section_header(
+    sheet: Worksheet, row_index: int, headers: Sequence[str]
+) -> dict[int, int]:
+    """A header row anywhere on a sheet, styled like a first-row header.
+
+    Widths are merged with whatever is already measured (``max``), so a later
+    section can never shrink a column an earlier section needs wider.
+    """
+    widths: dict[int, int] = {}
+    for column_index, title in enumerate(headers, start=1):
+        cell = sheet.cell(row=row_index, column=column_index, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        widths[column_index] = max(widths.get(column_index, 0), len(title) + 2)
+    return widths
+
+
+def build_account_triage_workbook(
+    account: "AccountRollup", rules: "AppetiteRules"
+) -> Workbook:
+    """The account-triage workbook: trust first, then appetite, then gaps.
+
+    Sibling of ``build_account_workbook`` -- same header styling, number
+    formats and column-width discipline. The trust block leads because it
+    decides whether anything else on the sheet can be used as it stands; the
+    status reads the same way the Account Status sheet reads it. No accuracy
+    claims and no marketing numbers: what is here is either the account's own
+    values or triage's explicit statements of what it could and could not
+    evaluate.
+    """
+    summary: TriageSummary = triage_summary(account, rules)
+    workbook = Workbook()
+
+    triage_sheet = workbook.active
+    triage_sheet.title = "Triage Summary"
+    widths = _header_row(triage_sheet, ["Account", "Status", "Reason"])
+    # Same display convention as the Account Status sheet: "Reconciled" when
+    # the canonical account status is CLEAN, "Needs review" otherwise.
+    reasons = summary.reasons or [""]
+    for row_index, reason in enumerate(reasons, start=2):
+        _fill_row(triage_sheet, row_index, [
+            account.name if row_index == 2 else None,
+            ("Reconciled" if summary.status is DocumentStatus.CLEAN else "Needs review")
+            if row_index == 2 else None,
+            reason,
+        ], widths)
+
+    # One blank row, then the per-term table: the account's PeriodSummary
+    # objects verbatim -- counts, totals, largest loss -- never recomputed.
+    row_index = len(reasons) + 3
+    widths.update(_section_header(triage_sheet, row_index, [
+        "Term", "Start", "End", "Claims", "Open", "Closed", "Paid", "Reserve",
+        "Recovery", "Incurred", "Largest loss", "Largest claim",
+    ]))
+    for period in summary.periods:
+        row_index += 1
+        _fill_row(triage_sheet, row_index, [
+            period.label, period.start, period.end, period.claims,
+            period.open_claims, period.closed_claims,
+            float(period.totals["paid_total"]),
+            float(period.totals["reserve_total"]),
+            float(period.totals["recovery_total"]),
+            float(period.totals["incurred_total"]),
+            _float(period.largest_loss),
+            period.largest_claim_number,
+        ], widths)
+
+    # One blank row, then coverage gaps. Absent gaps write no gap rows.
+    row_index += 2
+    widths.update(_section_header(triage_sheet, row_index, ["Coverage period gaps", ""]))
+    for gap in summary.period_gaps:
+        row_index += 1
+        _fill_row(triage_sheet, row_index, [gap, None], widths)
+    triage_sheet.freeze_panes = "A2"
+    _autosize(triage_sheet, widths)
+
+    flags_sheet = workbook.create_sheet("Triage Flags")
+    headers = ["Rule", "Severity", "Claim number(s)", "Evaluated", "Reason",
+               "Not-evaluated reason", "Source file", "Run ID", "Page", "Row ID",
+               "Source claim"]
+    widths = _header_row(flags_sheet, headers)
+    row_index = 1
+    for flag in summary.flags:
+        # One row per (flag, source) pair, so provenance stays explicit; a
+        # flag with no sources still gets its row, with empty source columns.
+        sources = [
+            (source.source_filename, source.run_id, source.page, source.row_id,
+             source.claim_number)
+            for source in flag.sources
+        ] or [(None, None, None, None, None)]
+        for source_filename, run_id, page, row_id, claim_number in sources:
+            row_index += 1
+            _fill_row(flags_sheet, row_index, [
+                flag.rule,
+                flag.severity.value,
+                ", ".join(flag.claim_numbers) or None,
+                flag.evaluated,
+                flag.reason,
+                flag.not_evaluated_reason,
+                source_filename, run_id, page, row_id, claim_number,
+            ], widths)
+            if not flag.evaluated:
+                # "Cannot evaluate" is visually loud, the way the account
+                # workbook shades what needs review.
+                fill = _ERROR_FILL if flag.severity is Severity.ERROR else _FINDING_FILL
+                for column_index in range(1, len(headers) + 1):
+                    flags_sheet.cell(row=row_index, column=column_index).fill = fill
+    flags_sheet.freeze_panes = "A2"
+    _autosize(flags_sheet, widths)
+
+    notes_sheet = workbook.create_sheet("Not Evaluated")
+    widths = _header_row(notes_sheet, ["Could not be evaluated"])
+    for row_index, item in enumerate(summary.not_evaluated, start=2):
+        _fill_row(notes_sheet, row_index, [item], widths)
+    _autosize(notes_sheet, widths)
+    return workbook
+
+
+def account_triage_to_bytes(
+    account: "AccountRollup", rules: "AppetiteRules", **kwargs: Any
+) -> bytes:
+    """The account-triage workbook as bytes, for a Streamlit download button."""
+    buffer = io.BytesIO()
+    build_account_triage_workbook(account, rules, **kwargs).save(buffer)
+    return buffer.getvalue()
 
 
 def write_xlsx(
