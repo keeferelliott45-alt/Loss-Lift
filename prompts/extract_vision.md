@@ -51,6 +51,12 @@ Return exactly this JSON shape:
 Set `printed_claim_count` and `valuation_date` to `null` if the page does not
 print them.
 
+`printed_claim_count` is the claim count exactly as the page prints it, as a
+number. Copy the number the page shows; never compute it from the rows, and
+never infer a count the page does not print. The rows you transcribe are what
+reconciliation checks that count against: report both faithfully, and the row
+evidence adjudicates whether the count is adopted.
+
 A PDF can bind several loss runs, so also report the page's furniture:
 
 - `page_label`: the page numbering the page prints about itself, such as

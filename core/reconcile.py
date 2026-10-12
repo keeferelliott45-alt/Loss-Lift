@@ -1342,6 +1342,42 @@ def r26_unreadable_printed_totals(
     return findings
 
 
+def _safe_vision_count_adoption(
+    doc: LossRunDocument, vision: list[dict[str, int]]
+) -> int | None:
+    """The model's claim count, when the rows read off the scanned pages
+    corroborate it -- else None.
+
+    Three things must hold, and all three are row evidence, never the count
+    alone. Rows were parsed from a scanned page that states a count. The
+    parsed claim count equals the model's stated count -- every stated count,
+    so the counts must agree with one another too. And the page accounting
+    closes: the rows seen per page equal the rows recovered, the same check
+    R-19 runs, so no claim-like row was refused, left unplaced, or lost
+    between reading and claims.
+
+    Counts read from pages with a text layer are not adopted here: their
+    wording scopes them, and where such a count stands beside the model's,
+    neither is the report's. A count of zero on a page whose rows were not
+    read is a page that was not read, not a verified empty report.
+    """
+    if not vision:
+        return None
+    parsed = len(doc.claims)
+    counts = {entry["count"] for entry in vision}
+    if len(counts) != 1:
+        return None
+    count = next(iter(counts))
+    seen = doc.rows_seen_per_page
+    if not any(seen.get(entry["page"], 0) > 0 for entry in vision):
+        return None
+    if parsed != count:
+        return None
+    if sum(seen.values()) != parsed:
+        return None
+    return next(iter(counts))
+
+
 @rule("R-27")
 def r27_unresolved_claim_count(
     doc: LossRunDocument, config: ReconcileConfig
@@ -1355,16 +1391,97 @@ def r27_unresolved_claim_count(
     nothing distinguishes that document from one that never said how many
     claims it holds. The strongest available check silently did not happen.
 
+    A scanned page states its count as a bare integer with no wording around
+    it, so on its own it never says what it counts. But the rows the vision
+    model read can corroborate it: when the parsed claims match the stated
+    count and the page accounting closes, the count is adopted for the count
+    check and recorded as such (:func:`_safe_vision_count_adoption`). Where
+    the rows disagree -- a different parsed count, no rows read on the page
+    that states the count, accounting that does not close -- the count stays
+    unresolved and both values, the model's and the parsed one, are reported.
+
     So the counts are kept and reported. Blocking, because the alternative is
     a green badge on a document whose printed claim count was read, was not
     checkable, and was thrown away.
     """
     if doc.printed_claim_count is not None or not doc.printed_count_evidence:
         return []
+    scanned = set(doc.scanned_pages)
+    vision = [
+        entry for entry in doc.printed_count_evidence
+        if entry["page"] in scanned
+    ]
+    digital = [
+        entry for entry in doc.printed_count_evidence
+        if entry["page"] not in scanned
+    ]
     stated = ", ".join(
         f"{entry['count']} on page {entry['page']}"
         for entry in doc.printed_count_evidence
     )
+    adopted = None if digital else _safe_vision_count_adoption(doc, vision)
+    if adopted is not None:
+        pages = sorted({entry["page"] for entry in vision})
+        parsed = len(doc.claims)
+        seen = sum(doc.rows_seen_per_page.values())
+        return [
+            Finding(
+                rule_id="R-27",
+                category=FindingCategory.UNDERWRITING,
+                severity=Severity.INFO,
+                scope=FindingScope.DOCUMENT,
+                subject="document",
+                condition="claim-count-adopted-vision",
+                field="claim_count",
+                message=(
+                    f"The claim count of {adopted} printed on scanned page(s) "
+                    f"{pages} was adopted for the count check on the rows' "
+                    f"evidence, not on the count alone: {parsed} claim(s) were "
+                    f"parsed, the parsed count equals the model's stated count, "
+                    f"and the page accounting closes ({seen} row(s) seen, "
+                    f"{parsed} recovered). Provenance stays vision; this record "
+                    f"says the scanned run's printed count was verified against "
+                    f"the rows the vision model read."
+                ),
+                expected=adopted,
+                actual=parsed,
+            )
+        ]
+    message = (
+        f"The document prints more than one claim count and none of "
+        f"them states the report's scope: {stated}. The extracted "
+        f"{len(doc.claims)} claim(s) could not be checked against any "
+        f"of them. Confirm from the document how many claims it "
+        f"covers."
+    )
+    if vision:
+        parsed = len(doc.claims)
+        model_counts = sorted({entry["count"] for entry in vision})
+        seen = doc.rows_seen_per_page
+        if digital or len(model_counts) > 1:
+            why = (
+                "a count read from a text-layer page stands beside it and "
+                "neither names its scope"
+                if digital
+                else "the printed counts disagree about how many claims the report holds"
+            )
+        elif not any(seen.get(entry["page"], 0) > 0 for entry in vision):
+            why = "no rows were read on the page that states it"
+        elif parsed != model_counts[0]:
+            why = (
+                f"the model read {model_counts[0]} but {parsed} claim(s) "
+                f"were parsed"
+            )
+        else:
+            why = (
+                f"the rows seen ({sum(seen.values())}) do not match the "
+                f"claims recovered ({parsed})"
+            )
+        message += (
+            f" The vision model's count on scanned page(s) "
+            f"{sorted({entry['page'] for entry in vision})} is not adopted: "
+            f"{why}. Model count {model_counts} vs parsed {parsed}."
+        )
     return [
         Finding(
             rule_id="R-27",
@@ -1374,13 +1491,7 @@ def r27_unresolved_claim_count(
             condition="unresolved-claim-count",
             severity=Severity.ERROR,
             field="claim_count",
-            message=(
-                f"The document prints more than one claim count and none of "
-                f"them states the report's scope: {stated}. The extracted "
-                f"{len(doc.claims)} claim(s) could not be checked against any "
-                f"of them. Confirm from the document how many claims it "
-                f"covers."
-            ),
+            message=message,
             expected="a printed claim count covering the whole report",
             actual=stated,
         )
@@ -1570,6 +1681,10 @@ def run_view(doc: LossRunDocument, run: LogicalRun) -> LossRunDocument:
         "printed_totals": dict(run.printed_totals),
         "printed_claim_count": run.printed_claim_count,
         "printed_count_evidence": list(run.printed_count_evidence),
+        # The run's own scanned pages only: which of a run's printed counts
+        # were read off a scan decides whether R-27 can adopt one, and a
+        # neighbour's scan says nothing about this run's counts.
+        "scanned_pages": [page for page in doc.scanned_pages if run.holds(page)],
         "unreadable_totals": dict(run.unreadable_totals),
         "unreadable_totals_page": run.unreadable_totals_page,
         "unreadable_totals_row": run.unreadable_totals_row,

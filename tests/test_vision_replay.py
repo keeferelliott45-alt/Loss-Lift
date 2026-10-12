@@ -59,6 +59,25 @@ def test_a_replay_reproduces_the_recorded_run_without_a_model(recorded):
     assert _view(replayed) == _view(live)
 
 
+def test_an_adopted_scanned_count_replays_identically(recorded):
+    """The recorded fixture's count is corroborated by its rows, so R-27
+    adopts it. Replay must reach the same adoption record as the live call:
+    identical finding, identical status, nothing decided differently."""
+    path, directory, live = recorded
+    replayed = run_pipeline(path, use_vision=True, vision_extractor=replay_extractor(directory))
+    assert _view(replayed) == _view(live)
+    adopted = [
+        f for f in live.reconciliation.findings
+        if f.rule_id == "R-27" and f.condition == "claim-count-adopted-vision"
+    ]
+    assert adopted, "the corroborated count must be adopted, live"
+    again = [
+        f for f in replayed.reconciliation.findings
+        if f.rule_id == "R-27" and f.condition == "claim-count-adopted-vision"
+    ]
+    assert again == adopted
+
+
 def test_replaying_twice_measures_identically(recorded):
     path, directory, _live = recorded
     first = run_pipeline(path, use_vision=True, vision_extractor=replay_extractor(directory))
