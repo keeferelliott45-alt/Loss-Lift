@@ -63,8 +63,8 @@ field, stop and re-scope.
 - No rule-id/field/sheet renames; no new product features; no refactors.
 
 ## Environment
-- Python: `C:\Users\keefe\AppData\Local\Python\pythoncore-3.14-64\python.exe`
-- pytest basetemp: `--basetemp=C:\Users\keefe\AppData\Local\Temp\kilo\pytest-d1`
+- Python: the local Python 3.14 interpreter with every dependency installed (`py -3`)
+- pytest basetemp: `--basetemp=%TEMP%\kilo\pytest-d1` (fresh per run)
 - Git Bash: `C:\Program Files\Git\bin\bash.exe`
 
 ## Handoff

@@ -129,9 +129,8 @@ the artifact stays in a private repository.
 
 ## Adding loss runs from the browser
 
-The intake folder on the Windows machine
-(`C:\Users\keefe\Downloads\Real test loss run reports`) is never read by
-anything here. After the one ZIP is made, every step is in the browser.
+The owner's local staging folder is never read by anything here. After the
+one ZIP is made, every step is in the browser.
 
 1. **Zip the new files.** In Explorer, select the files (or the folder) →
    *Send to → Compressed (zipped) folder*. Any layout; non-PDFs may be

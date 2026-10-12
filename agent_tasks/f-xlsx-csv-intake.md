@@ -70,8 +70,8 @@ state the reasoning. Do not claim a gate pass. Synthetic fixtures only in git.
   (fail closed); no real workbook bytes committed.
 
 ## Environment
-- Python: `C:\Users\keefe\AppData\Local\Python\pythoncore-3.14-64\python.exe`
-- pytest basetemp: `--basetemp=C:\Users\keefe\AppData\Local\Temp\kilo\pytest-f`
+- Python: the local Python 3.14 interpreter with every dependency installed (`py -3`)
+- pytest basetemp: `--basetemp=%TEMP%\kilo\pytest-f` (fresh per run)
 - Golden: `python -m tests.golden.baseline`
 
 ## Handoff
