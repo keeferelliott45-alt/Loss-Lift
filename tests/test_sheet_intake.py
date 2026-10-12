@@ -85,9 +85,11 @@ def _cached_formula(xlsx: bytes, sheet_name: str, cell: str, value: str) -> byte
     xml = source.read(target).decode("utf-8")
     cell_xml = re.search(r'<c r="' + cell + r'"[^>]*>.*?</c>', xml)
     assert cell_xml and "<f>" in cell_xml.group(0), f"formula cell {cell} not found"
+    # The empty value element is serialised as ``<v></v>`` or ``<v />``
+    # depending on which XML writer openpyxl finds (lxml or the stdlib).
     patched = xml.replace(
         cell_xml.group(0),
-        cell_xml.group(0).replace("<v></v>", f"<v>{value}</v>"),
+        re.sub(r"<v\s*/>|<v></v>", f"<v>{value}</v>", cell_xml.group(0), count=1),
     )
     assert patched != xml, "cached value was not inserted"
     out = io.BytesIO()
