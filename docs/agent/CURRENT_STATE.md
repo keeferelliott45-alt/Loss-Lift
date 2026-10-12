@@ -1,129 +1,154 @@
-# CURRENT_STATE — LossLift as of 2026-09-30
+# CURRENT_STATE — LossLift as of 2026-09-27
 
 Rewrite this file when a milestone changes; do not append history (that goes
 in `Remember.md`).
 
 ## Where the code is
 
-- `main`: PR #9 (logical runs, `ff76bfc`) and PR #12 (bridged foreign page,
-  `c7de782`) are merged.
-- `agent/lead/reliability-phase-1` is the phase-1 integration branch
-  (draft, not merged to `main`). It holds:
-  - B0 `0f13c5c`: the submission workspace plus PRs #12, #13, #17 and #16;
-  - the six phase-1 tasks E1–E6 (below), integrated in order.
-  Its head is F1.
-- PRs #13, #16, #17 and #18 are still open against `main`. Their code is in
-  B0.
-- Tests on F1:
-  - the full suite passes (see the F1 handoff for the counts);
-  - golden ratchet 108/108 rows, money and text 100%;
-  - 5 strict xfails remain (known gaps).
+- Branch `claude/packet-series-and-signed-totals` (PR #9, **draft, unmerged**),
+  product code at `470b883`; agent docs/tooling committed on top. `main` is
+  `7f86de8` (cloud corpus gate, PR #10).
+- Tests: 2,594 collected — 2,581 pass, 7 skipped, 6 strict xfail (known gaps).
+  Golden ratchet: 108/108 rows, money and text 100%.
 
-## Reliability phase 1 (integrated on F1)
+## Submission workspace (pilot, branch `claude/mga-submission-workspace`)
 
-| Task | What changed |
-|---|---|
-| E1 Q1 | `tools/qualification`: truth v1, `score_result`, the `validate`/`run` CLI (committed checkout only, offline, sealed public report), the frozen `build_cases` interface. Docs: `docs/qualification.md`. |
-| E2 L1 | A claim printed as `Claim No: X` is read, not dropped as furniture (closed label vocabulary). A column header or claim row is never taken for the carrier. |
-| E4 M1 | Within an established report (a settled run, or a single report whose every page prints its own numbering), the digital and vision readers share one claim-number vote. The bounded P1-3 xfail is fixed. |
-| E3 | One PDF preflight on every intake path (direct, path, email): empty, over 64 MB, not a PDF, damaged, no pages, opening password, over 1000 pages. It uses fixed reason codes. Owner-only encryption is allowed. |
-| E5 / E6 | Two synthetic packs of 12 cases each, with truth authored from construction. Both are registered in `tests/qualification/registry.py` and pinned by `pack_ledger.json`. |
+Saved-email (`.eml`) intake into a submission: attachment inventory with
+outcomes, the normal pipeline per PDF, a merged summary with provenance and a
+redactable workbook. No extraction or reconciliation behaviour changed.
+Workflow, limits, privacy boundaries and limitations: `docs/submission-workspace.md`.
 
-## Qualification status
+## Recently completed (logical-run propagation cycle)
 
-**Packs on F1: 20 of 24 cases met.** The four that are not met are
-ledgered, and they are the top of Phase 2:
+Logical runs (`core/runs.py`) with furniture-only boundaries; per-run
+reconciliation; canonical status policy (`core/review.py`) used everywhere;
+run-level metadata in `run_view` and exports; run-aware corpus gate
+measurements (runs, refused, review_status; `run_id` in finding identity);
+vision record/replay; account rollup identity + trust; local telemetry and
+trust class; claim-accounting view; JSON export; per-run
+"borrowed convention" R-15.
 
-1. **False CLEAN** (`policy-change-boundary`). Two unnumbered reports under
-   one generic heading, told apart only by their printed policy numbers, are
-   merged into one report and auto-accepted. One policy's claims are then
-   filed under the other.
-2. **Over-review of real-shaped packets** (`two-series-digital-packet`,
-   `mixed-series-packet`, `run-counts-packet`).
-   - Each carrier's page prints the same named insured, so the headings
-     "partially overlap" and run 2 is left unsettled (R-28).
-   - Printed totals and counts then stay at document level and raise false
-     R-04, R-25 and R-27 findings.
-   - The result is safe, but it will be the common case on real packets.
-3. ~~Foreign page inside a report~~ (`foreign-page-bridged`): met. An
-   unnumbered page the report's own count resumes after (so its pagination
-   leaves the page out) and which names another carrier or another policy is
-   read as its own settled run; its claim is read there. A page whose heading
-   or policy the vision model read, or which shares the report's heading, is
-   still unsettled (R-28). A page the report's count instead *claims* (it
-   fills a numbered slot exactly) but whose own letterhead names another
-   carrier is refused: its rows are never read under the count's report --
-   they are recorded and named by R-29.
+## Stage F — CSV/XLSX intake (this branch, unmerged)
 
-**Real documents:** no adjudicated truth exists yet. The 10-document corpus is
-unlabelled, so no real accuracy figure exists, and the charging thresholds in
-CLAUDE.md §10 are unmeasured.
+`core/ingest.py` sniffs the upload kind from bytes — PDF magic, a zip
+carrying `[Content_Types].xml` (xlsx), or delimited UTF-8 text (csv) — and
+stages under the right extension; extension/magic mismatch and legacy
+`.xls`/`.xlsm` fail closed. `core/extract_sheet.py` reads a workbook
+(openpyxl `read_only`, `data_only`): each visible non-empty worksheet is one
+source (`SourceMethod.SHEET`), formulas are never evaluated — a stored
+cached result is used, a missing one is a null + `UNPARSEABLE` field issue
+(R-15) on the claim row or a named warning elsewhere — and hidden/empty
+sheets are recorded by name in `LossRunDocument.ignored_sheets`. Duplicate,
+blank or absent headers are flagged, not guessed. `core/pipeline.py` routes
+xlsx/csv to `_run_sheet_pipeline`, which reuses the PDF path's mapping,
+parsing, inference and reconciliation unchanged; each worksheet binds as its
+own logical run (`run-N`, new `RunConfidence.STRUCTURAL`, settled by
+construction), so printed totals are checked per sheet and nothing is ever
+combined across sheets. Uploader accepts pdf/xlsx/csv. Additive only: no
+PDF-path behaviour change (golden 108/108; full suite failure set identical
+to base). Synthetic fixtures only; the corpus gate is not required for this
+feature (the gate measures real PDFs, which this branch does not change).
 
 ## Corpus gate
 
-- corpus-v1 has 10 real documents: 2 packets and 8 single reports.
-- `main` 7f86de8 → B0 lineage: 179 approved corpus-gate differences, all from
-  PR #9 (R-28 naming, run-tagged findings, claim-free text as warnings). Claim
-  counts, statuses, money and printed figures are unchanged.
-- E3 was measured separately: B0 → `bc7bf58`, PASS 10/10 unchanged.
-- E2 and E4, and B0 → F1 as a whole, need the owner's local runs. Approvals
-  never transfer to new commits.
-- The cloud workflow runs `main`'s collector. Cloud runs have vision off.
+- 10 real documents (corpus-v1). Inferred: 2 packets, 8 single reports.
+- main → `470b883`: 2 changed (both packets: per-run printed facts and
+  findings; one also a folded description line), 8 unchanged, no claim-count
+  or engine-status change anywhere. Owner has not yet confirmed the two
+  packets' run splits locally.
+- `51789cc` → `470b883` (the run-propagation cycle): **no change** on any
+  document.
+- The cloud workflow runs main's collector: run-aware measurements, the
+  canonical review status and vision replay take effect there only after
+  merge. Cloud runs have vision off. No real-corpus rates exist yet (the gate
+  publishes changes, not values).
+
+## Test coverage audit (2026-09-27, read-only)
+
+Grades: A strong · B reasonable · C weak · D effectively unprotected.
+
+| Invariant | Grade |
+|---|---|
+| Claim belongs to exactly one run | B |
+| No silent claim disappearance | **D** (see blind spot 1) |
+| Packet/run separation | B |
+| Unsettled boundaries (R-28) | A |
+| Refused rows | C |
+| Unplaced rows (R-23) | A |
+| Run-specific metadata | B |
+| Printed count reconciliation (R-05) | B single / **C per run** |
+| Printed totals reconciliation (R-04) | A |
+| Signed financial semantics | B |
+| Duplicates without wrong merging | B |
+| Canonical status consistency | A |
+| One unsafe run → packet unsafe | A |
+| Unsafe data kept out of trusted account | B |
+| Digital extraction | A |
+| Vision / replayed vision | C |
+| Provenance | B |
+| Edits / review resolution | A |
+| Single-run backward compatibility | A |
+
+Catastrophic blind spots found:
+1. ~~A claim row can vanish into another claim's description and the
+   document reads CLEAN.~~ Closed after `2e62e69` (Codex P1s): a refused row
+   is judged under the settled date order (either order when none is
+   settled), recorded and never folded; R-19 blocks trust.
+2. Per-run R-05 (printed count per run) works but no test pins it; one
+   changed line in `run_view` would disable it silently.
+3. Vision: a clean scan always reads NEEDS_REVIEW (R-27; the model's count
+   is not adopted), and nothing real-corpus protects the scanned path.
+4. `detect_carrier` can take a column-label line as a carrier; account
+   identity then treats a repeated claim as two claims without flagging it.
+5. ~~A single report whose own numbering stopped short (e.g. `Page 1 of 3`
+   with pages 2-3 absent) carried no run, so nothing recorded that it was
+   incomplete and it read CLEAN with part of its table missing.~~ Closed on
+   this branch: `LossRunDocument.incomplete_report` from the run planner and
+   R-28 (ERROR) name the missing pages (synthetic regression in
+   `test_packet_runs.py`).
 
 ## Known architectural gaps
 
-- **Per-document conventions.** Number format, date order, recovery sign,
-  profile and column mapping are per document; per run they are only checked
-  (the borrowed-convention R-15).
-- **Page-1 facts in packets.** The packet document header, Source Info and
-  Loss Summary show page 1's facts.
-- **Refused rows on a single report.** On a bounded single report they are
-  recorded but named by no rule.
-- **R-19.** It is categorised as underwriting (the spec's WARN) but blocks
+- Number format, date order, recovery sign, saved profile and column mapping
+  are per document; per run they are only *checked* (borrowed-convention R-15).
+- ~~Packet document header, Source Info and Loss Summary show page 1's
+  facts.~~ Closed (D1): Source Info carries a per-run facts block and Loss
+  Summary one block per logical run, each from that run's own pages, and the
+  app header lists each run's facts under the document headline. The
+  document-level roll-up rows themselves remain page 1's facts, labelled as
+  the document's.
+- Refused rows on a bounded single report are recorded but named by no rule.
+- A claim-like row whose identifier cell carries a worded label before a colon
+  (e.g. `Claim No: ...`) is taken for printed furniture by
+  `pipeline.is_structural_row` and dropped before it is parsed, so it is
+  neither a claim nor in `rows_seen_per_page`; with no printed total to
+  disagree with, the document can read CLEAN. Found by this campaign's
+  synthetic probe; not fixed on this branch (see the handoff).
+- R-19 (row-count gap) is categorised underwriting (spec WARN) but blocks
   trust through `UNACCOUNTED_RULES`.
-- **Scanned reports.** A clean scan that prints several counts reads
-  NEEDS_REVIEW (R-27; the model's count is not adopted). Nothing on the real
-  corpus protects the scanned path until vision recordings exist.
-- **Truth v1.** It scores claims, critical fields, runs, printed facts and
-  status. It does not score document facts (carrier, insured, valuation).
 
 ## Intentional limitations
 
-- Cross-run R-11 flags repeated claim numbers even across carriers; the
-  account rollup keeps them apart.
-- A restart under a heading that names nothing is ambiguous (NEEDS_REVIEW).
-- The unnumbered mixed-reader report keeps per-reader votes
-  (`test_packet_adversarial.py::test_d1`, strict xfail).
+- Reconcile's cross-run R-11 flags repeats even across carriers; account
+  rollup keeps them apart (different questions, fail closed on each).
+- A restart under a heading that names nothing is ambiguous (NEEDS_REVIEW),
+  including a single report exported page by page.
+- A single report read partly by text and partly by vision keeps separate
+  per-reader votes (strict xfail).
 
-## Highest-value next tasks (the approved plan)
+## Highest-value next tasks
 
-1. **Phase 0 exit.**
-   - The owner runs the corpus gates: E2 (Q1 → L1), E4 (L1 → M1) and
-     B0 → F1.
-   - Fix the policy-change false CLEAN. Phase 0 cannot exit with a false
-     CLEAN.
-2. **Phase 1.**
-   - Build a blind labelling helper, then label the 10 documents (packets
-     first) and run the first real qualification report.
-   - Grow the corpus to 30–50 documents.
-   - Produce aggregate-only gate output.
-3. **Phase 2:**
-   - fix the shared-insured run boundary;
-   - read the claim on a foreign page;
-   - add per-run packet facts;
-   - make R-19's category consistent;
-   - fix whatever the real qualification report finds.
-4. **Then:**
-   - Phase 3: scanned path;
-   - Phase 4: per-run conventions;
-   - Phase 5: XLSX/CSV with cell provenance.
-
-   UI, connectors and billing wait for the release gate.
+1. Pin per-run R-05 and per-run printed facts with tests; mutation-check
+   `run_view`.
+2. Make the real corpus measurable (aggregate-only gate output; merge so the
+   run-aware collector runs in the cloud).
+3. Scanned path: adopt the model's claim count safely (R-27); carry vision
+   recordings into the cloud gate.
+4. Stop column labels being read as carrier names (run facts, account
+   identity).
 
 ## Explicitly deferred
 
-These wait until the release gate:
-- any spec §13 item;
-- analytics UI;
-- live inbox connectors;
-- XLS and standalone images.
+Per-run profiles/conventions; per-run recovery sign; analytics UI; any
+spec §13 item; Codex review of `470b883` (usage-limited; a retry is
+scheduled).

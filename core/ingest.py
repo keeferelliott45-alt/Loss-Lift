@@ -11,11 +11,13 @@ session — persistent storage of claim data is out of scope (spec section 13).
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,6 +29,17 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 #: The most pages one PDF may have, on every intake path.
 MAX_PDF_PAGES = 1000
 PDF_MAGIC = b"%PDF-"
+XLSX_MAGIC = b"PK\x03\x04"
+#: Every OOXML workbook carries this part; a zip without it is not a workbook.
+XLSX_CONTENT_TYPES = "[Content_Types].xml"
+
+#: Upload kinds, in the suffix each is staged under.
+KIND_SUFFIX = {"pdf": ".pdf", "xlsx": ".xlsx", "csv": ".csv"}
+SUFFIX_KIND = {suffix: kind for kind, suffix in KIND_SUFFIX.items()}
+#: Legacy Excel containers are refused outright: the BIFF/OLE formats are a
+#: different parser with its own failure modes, and .xlsm carries macros that
+#: must never be opened. Fail closed rather than guess.
+UNSUPPORTED_SUFFIXES = {".xls", ".xlsm", ".xlt", ".xltm", ".xlsb"}
 
 #: Written into every directory that holds staged bytes. It records, per staged
 #: file, the document that owns it and the hash of its contents. ``discard``
@@ -43,7 +56,76 @@ SWEEP_MAX_AGE_HOURS = 24
 
 
 class IngestError(ValueError):
-    """The upload is not a PDF this app can work with."""
+    """The upload is not a document this app can work with."""
+
+
+def sniff_kind(data: bytes) -> str:
+    """Name the upload kind from its bytes: ``pdf``, ``xlsx`` or ``csv``.
+
+    The magic decides, never the filename. A zip counts as a workbook only
+    when it carries the OOXML content-types part; anything else -- a legacy
+    .xls container, a macro workbook saved as zip, arbitrary binary -- is
+    refused rather than parsed as text. Delimited text must decode as UTF-8
+    and carry no NUL byte, which binary formats always do.
+    """
+    if data.startswith(PDF_MAGIC):
+        return "pdf"
+    if data.startswith(XLSX_MAGIC):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = archive.namelist()
+        except (zipfile.BadZipFile, OSError) as error:
+            raise IngestError(
+                "The upload looks like a zip archive but is not a readable "
+                "Excel workbook. Save it as .xlsx (or export a CSV) and "
+                "upload it again."
+            ) from error
+        if XLSX_CONTENT_TYPES in names:
+            return "xlsx"
+        raise IngestError(
+            "The upload is a zip archive but not an Excel workbook. "
+            "Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    if b"\x00" in data:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        ) from error
+    return "csv"
+
+
+def _kind_for(filename: str, sniffed: str) -> str:
+    """Check the filename does not contradict the bytes; stage under a kind.
+
+    The bytes decide what a file is. A *recognised* extension that contradicts
+    the magic means the file was renamed or saved wrong, and neither reading
+    is safe, so the upload is refused. An unrecognised or missing extension
+    contradicts nothing: the magic carries the kind and the file is staged as
+    what it is. Legacy Excel formats are refused before anything else about
+    them is asked.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in UNSUPPORTED_SUFFIXES:
+        raise IngestError(
+            f"{Path(filename).name} is a legacy Excel format, which is not "
+            "supported. Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    declared = SUFFIX_KIND.get(suffix)
+    if declared is None:
+        return sniffed
+    if declared != sniffed:
+        raise IngestError(
+            f"{Path(filename).name} is named {suffix} but its contents are "
+            "not that kind of file. Upload the file under its true format."
+        )
+    return declared
 
 
 class PreflightReason(str, Enum):
@@ -154,6 +236,9 @@ class IngestedFile:
     sha256: str
     path: Path
     size_bytes: int
+    #: What kind of document the bytes are: "pdf", "xlsx" or "csv". Decided
+    #: from the bytes at ingest, never from the filename.
+    kind: str = "pdf"
     owns_directory: bool = False
     source_path: Path | None = None
     source_identity: FileIdentity | None = None
@@ -195,6 +280,23 @@ def _check_size(size: int, max_bytes: int) -> None:
 def _check_magic(head: bytes) -> None:
     if not head.startswith(PDF_MAGIC):
         raise PdfPreflightError(PreflightReason.NOT_PDF)
+
+
+def _held_to_pdf_preflight(head: bytes, filename: str) -> bool:
+    """Whether an upload is checked as a PDF: its bytes say so, or its name
+    does. A file named .pdf that is not one is refused as not a PDF, with the
+    preflight's fixed reason, rather than sniffed as something else."""
+    return head.startswith(PDF_MAGIC) or Path(filename).suffix.lower() == ".pdf"
+
+
+def _check_sheet_size(filename: str, size: int, max_bytes: int) -> None:
+    if size == 0:
+        raise IngestError(f"{Path(filename).name} is empty. Upload the document again.")
+    if size > max_bytes:
+        raise IngestError(
+            f"{Path(filename).name} is {size / 1e6:.0f} MB. The limit is "
+            f"{max_bytes / 1e6:.0f} MB — split the document and retry."
+        )
 
 
 def _check_structure(source: bytes | Path, max_pages: int) -> int:
@@ -543,12 +645,20 @@ def ingest(
     max_bytes: int = MAX_UPLOAD_BYTES,
     max_pages: int = MAX_PDF_PAGES,
 ) -> IngestedFile:
-    """Validate, hash and stage an uploaded PDF.
+    """Validate, hash and stage an uploaded PDF, XLSX or CSV loss run.
 
-    The bytes pass :func:`preflight_pdf` before anything is written, so a
-    refused file never touches the disk.
+    The bytes are checked before anything is written, so a refused file never
+    touches the disk. Anything that is, or is named, a PDF passes
+    :func:`preflight_pdf` in full; a spreadsheet is sized and sniffed.
     """
-    checked = preflight_pdf(data, max_bytes=max_bytes, max_pages=max_pages)
+    if _held_to_pdf_preflight(data[: len(PDF_MAGIC)], filename):
+        checked = preflight_pdf(data, max_bytes=max_bytes, max_pages=max_pages)
+        kind = _kind_for(filename, "pdf")
+        page_count: int | None = checked.page_count
+    else:
+        _check_sheet_size(filename, len(data), max_bytes)
+        kind = _kind_for(filename, sniff_kind(data))
+        page_count = None
 
     owns_directory = not bool(workdir)
     directory = (
@@ -560,7 +670,7 @@ def ingest(
 
     digest = sha256_bytes(data)
     safe_name = Path(filename).name or "upload.pdf"
-    target = directory / f".upload-{uuid4().hex}.pdf"
+    target = directory / f".upload-{uuid4().hex}{KIND_SUFFIX[kind]}"
     document_id = str(uuid4())
     try:
         # The marker is written before the bytes: a process killed between the
@@ -582,8 +692,9 @@ def ingest(
         sha256=digest,
         path=target,
         size_bytes=len(data),
+        kind=kind,
         owns_directory=owns_directory,
-        page_count=checked.page_count,
+        page_count=page_count,
     )
 
 
@@ -594,9 +705,9 @@ def ingest_path(
     max_bytes: int = MAX_UPLOAD_BYTES,
     max_pages: int = MAX_PDF_PAGES,
 ) -> IngestedFile:
-    """Snapshot an existing PDF without trusting a changing pathname.
+    """Snapshot an existing PDF, XLSX or CSV without trusting a changing pathname.
 
-    Size and signature are checked on the open handle before copying. The
+    Size and kind are checked on the open handle before copying. The
     structural checks run on the verified snapshot, never on the caller's
     path, so what was checked is exactly what will be read.
     """
@@ -608,8 +719,17 @@ def ingest_path(
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
-            _check_size(identity.size, max_bytes)
-            _check_magic(source_handle.read(len(PDF_MAGIC)))
+            head = source_handle.read(len(PDF_MAGIC))
+            source_handle.seek(0)
+            pdf = _held_to_pdf_preflight(head, source.name)
+            if pdf:
+                _check_size(identity.size, max_bytes)
+                _check_magic(head)
+                kind = _kind_for(source.name, "pdf")
+            else:
+                _check_sheet_size(source.name, identity.size, max_bytes)
+                kind = _kind_for(source.name, sniff_kind(source_handle.read(max_bytes + 1)))
+                source_handle.seek(0)
 
             owns_directory = not bool(workdir)
             directory = (
@@ -618,7 +738,7 @@ def ingest_path(
                 else Path(workdir)
             )
             directory.mkdir(parents=True, exist_ok=True)
-            temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
+            temporary_target = directory / f".snapshot-{uuid4().hex}{KIND_SUFFIX[kind]}"
             document_id = str(uuid4())
             # Provisional marker before the bytes, so a kill during the copy
             # leaves a marker-bearing directory the startup sweep can find
@@ -644,8 +764,11 @@ def ingest_path(
 
         # The snapshot is verified; check it, not the path it came from. A
         # refusal here is cleaned up by the handler below like any failure.
-        checked = preflight_pdf_path(
-            temporary_target, max_bytes=max_bytes, max_pages=max_pages)
+        checked = (
+            preflight_pdf_path(temporary_target, max_bytes=max_bytes, max_pages=max_pages)
+            if pdf
+            else None
+        )
         _write_owner_marker(directory, temporary_target, document_id, digest)
         target = temporary_target
         temporary_target = None
@@ -655,10 +778,11 @@ def ingest_path(
             sha256=digest,
             path=target,
             size_bytes=identity.size,
+            kind=kind,
             owns_directory=owns_directory,
             source_path=source,
             source_identity=identity,
-            page_count=checked.page_count,
+            page_count=checked.page_count if checked is not None else None,
         )
     except BaseException:
         if temporary_target is not None and temporary_target_created:

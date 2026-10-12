@@ -113,6 +113,153 @@ def test_a_run_that_prints_no_carrier_is_not_given_another_runs(tmp_path):
     assert _claim_rows(result)["CR-50001"]["Carrier"] != LARGE_CARRIER
 
 
+# --- per-run Source Info and Loss Summary ----------------------------------
+
+def _workbook(result):
+    return load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))
+
+
+def _per_run_source_rows(result) -> list[dict]:
+    """The rows of Source Info's per-run facts block, one dict per run."""
+    sheet = _workbook(result)["Source Info"]
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    start = next(
+        index for index, row in enumerate(rows)
+        if row[0] == "Per-run facts"
+    )
+    header = rows[start + 1]
+    out = []
+    for row in rows[start + 2:]:
+        if row[0] is None:
+            break
+        out.append(dict(zip(header, row)))
+    return out
+
+
+def _per_run_summary_blocks(result) -> dict[str, dict]:
+    """Loss Summary's per-run blocks, keyed by run id."""
+    sheet = _workbook(result)["Loss Summary"]
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    starts = [
+        index for index, row in enumerate(rows)
+        if isinstance(row[0], str) and row[0].startswith("Run run-")
+    ]
+    blocks = {}
+    for index in starts:
+        run_id = rows[index][0].split(" ")[1]
+        header = rows[index + 1]
+        period_rows = []
+        for row in rows[index + 2:]:
+            if row[0] is None:
+                break
+            period_rows.append(dict(zip(header, row)))
+        blocks[run_id] = {"header": rows[index][0], "rows": period_rows}
+    return blocks
+
+
+def _packet_with_counts(tmp_path):
+    """The same packet, each report also printing its own claim count."""
+    return _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", *GL_TERM,
+                 "Valuation Date: 12/31/2022"),
+         "rows": RUN_ONE, "total": _total(RUN_ONE), "after": ("Total Claims: 2",)},
+        {"top": ("Page 1 of 1", SMALL_CARRIER, "LOSS RUN REPORT", *AUTO_TERM,
+                 "Valuation Date: 06/30/2021"),
+         "headers": SMALL_HEADERS, "rows": RUN_TWO, "total": _total(RUN_TWO),
+         "after": ("Total Claims: 3",)},
+    ], name="packet-counts.pdf")
+
+
+def test_source_info_names_each_runs_own_facts(tmp_path):
+    result = _packet_with_counts(tmp_path)
+    rows = {row["Run"]: row for row in _per_run_source_rows(result)}
+    assert set(rows) == {"run-1", "run-2"}
+    one, two = rows["run-1"], rows["run-2"]
+    assert (one["Carrier"], one["Policy number"]) == (LARGE_CARRIER, "GL-100")
+    assert (two["Carrier"], two["Policy number"]) == (SMALL_CARRIER, "AU-200")
+    assert one["Valuation date"].date() == date(2022, 12, 31)
+    assert two["Valuation date"].date() == date(2021, 6, 30)
+    assert one["Claims extracted"] == 2
+    assert one["Printed claim count"] == 2
+    assert two["Printed claim count"] == 3
+    assert two["Printed incurred total"] == 1700.0
+
+
+def test_source_info_per_run_facts_never_borrow(tmp_path):
+    """A run that prints no carrier and no valuation says so in Source Info;
+    it is never given run 1's."""
+    result = _packet(tmp_path, second_carrier=False, second_valuation=False)
+    two = {row["Run"]: row for row in _per_run_source_rows(result)}["run-2"]
+    assert two["Carrier"] != LARGE_CARRIER
+    assert two["Valuation date"] == "not printed"
+
+
+def test_loss_summary_carries_each_runs_own_block(tmp_path):
+    result = _packet_with_counts(tmp_path)
+    blocks = _per_run_summary_blocks(result)
+    assert set(blocks) == {"run-1", "run-2"}
+    one, two = blocks["run-1"], blocks["run-2"]
+    assert LARGE_CARRIER in one["header"] and "GL-100" in one["header"]
+    assert SMALL_CARRIER in two["header"] and "AU-200" in two["header"]
+    one_rows = {row["Policy term"]: row for row in one["rows"]}
+    two_rows = {row["Policy term"]: row for row in two["rows"]}
+    assert list(one_rows) == ["2022-01-01 to 2023-01-01"]
+    assert list(two_rows) == ["2020-01-01 to 2021-01-01", "Outside any stated term"]
+    assert one_rows["2022-01-01 to 2023-01-01"]["Claims"] == 2
+    # Run 2's term holds its two 2020 claims; its 2021-05-05 claim is outside
+    # its own term and is shown there -- not folded into run 1's book.
+    assert two_rows["2020-01-01 to 2021-01-01"]["Claims"] == 2
+    assert two_rows["Outside any stated term"]["Claims"] == 1
+    assert one_rows["2022-01-01 to 2023-01-01"]["Carrier printed"] == 3500.0
+    assert one_rows["2022-01-01 to 2023-01-01"]["Ties to carrier"] == "yes"
+    assert two_rows["2020-01-01 to 2021-01-01"]["Carrier printed"] == 1700.0
+    # The printed 3 counts the outside-term claim too, so the term row does
+    # not pretend to tie; the block says so rather than borrowing.
+    assert two_rows["2020-01-01 to 2021-01-01"]["Ties to carrier"] == "no"
+
+
+def test_per_run_blocks_write_through_the_workbook_text_policy(tmp_path):
+    """A run's printed facts are document text: the per-run blocks write them
+    through the same formula-injection policy as every other cell."""
+    result = _packet_with_counts(tmp_path)
+    payload = '=HYPERLINK("http://example.invalid","x")'
+    result.document.runs[1].carrier = payload
+    book = load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))
+    hits = [
+        cell
+        for name in ("Source Info", "Loss Summary")
+        for row in book[name].iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and payload in cell.value
+    ]
+    assert {cell.parent.title for cell in hits} == {"Source Info", "Loss Summary"}
+    for cell in hits:
+        assert cell.data_type == "s", (cell.parent.title, cell.coordinate)
+        if cell.value.startswith("="):
+            assert cell.quotePrefix is True, (cell.parent.title, cell.coordinate)
+
+
+def test_single_run_document_has_no_per_run_blocks(tmp_path):
+    """A single loss run is the whole document: no per-run facts in Source
+    Info, no per-run block in Loss Summary, roll-up as before."""
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", *GL_TERM,
+                 "Valuation Date: 12/31/2022"),
+         "rows": RUN_ONE, "total": _total(RUN_ONE)},
+    ], name="single.pdf")
+    source = [row[0] for row in _workbook(result)["Source Info"].iter_rows(values_only=True)]
+    assert not any(
+        isinstance(value, str) and value.startswith("Per-run facts")
+        for value in source
+    )
+    summary = [row[0] for row in _workbook(result)["Loss Summary"].iter_rows(values_only=True)]
+    assert not any(
+        isinstance(value, str) and value.startswith("Run run-")
+        for value in summary
+    )
+    assert summary[0] == "Policy term"
+
+
 # --- conventions a run does not prove for itself ---------------------------
 
 US_RUN = [

@@ -48,6 +48,9 @@ class SourceMethod(str, Enum):
     DIGITAL = "digital"
     VISION = "vision"
     MANUAL = "manual"
+    #: Read from a spreadsheet source (an uploaded XLSX or CSV), where the
+    #: cell grid is the source and there is no page geometry at all.
+    SHEET = "sheet"
 
 
 class ClaimStatus(str, Enum):
@@ -516,6 +519,10 @@ class RunConfidence(str, Enum):
     INFERRED = "inferred"
     #: Nothing on the pages says where a report begins or ends.
     NONE = "none"
+    #: The boundary is a structural fact of the source, not something a page
+    #: printed: a spreadsheet's worksheets are separate sources by
+    #: construction. A run bounded this way is as settled as a printed one.
+    STRUCTURAL = "structural"
 
 
 class RunBoundary(BaseModel):
@@ -615,10 +622,13 @@ def split_is_settled(runs: Sequence[LogicalRun]) -> bool:
     Only then is it known which run a printed count or total belongs to. A
     boundary resting on a reading (OCR, the vision model) or on nothing, or
     one the planner could not settle, leaves the carrier's printed figures
-    with the whole document they were read from.
+    with the whole document they were read from. A structural boundary --
+    separate worksheets of one spreadsheet -- is settled by construction.
     """
     return bool(runs) and all(
-        run.confidence is RunConfidence.PRINTED and not run.ambiguous for run in runs
+        run.confidence in (RunConfidence.PRINTED, RunConfidence.STRUCTURAL)
+        and not run.ambiguous
+        for run in runs
     )
 
 
@@ -708,6 +718,12 @@ class LossRunDocument(BaseModel):
     #: Rows that read as claims but whose claim number was refused. Recorded,
     #: never silently absorbed; see :class:`RefusedClaimRow`.
     refused_claim_rows: list[RefusedClaimRow] = Field(default_factory=list)
+    #: Worksheets of a spreadsheet source that produced no source of their
+    #: own, named with why: "hidden" (not visible, so not read) or "empty"
+    #: (visible, read, and holding no cells at all). Recorded, never read as
+    #: "no claims, therefore clean": a worksheet that exists but contributed
+    #: nothing is a fact a reviewer can see.
+    ignored_sheets: dict[str, str] = Field(default_factory=dict)
     #: Claim rows found on each page before stitching, so R-19 can tell whether
     #: dropping repeated headers and subtotals also dropped a claim.
     rows_seen_per_page: dict[int, int] = Field(default_factory=dict)

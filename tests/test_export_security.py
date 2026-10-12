@@ -120,13 +120,19 @@ def test_every_formula_payload_is_stored_as_quoted_text():
     # XML parsers normalise a literal carriage return to a line feed on read,
     # so the "\r=1" cell reads back as "\n=1" and cannot be told apart by
     # value. Prove it was written as literal text instead: the package stores
-    # the carriage-return payload itself, and every cell reading "\n=1" --
-    # the "\r=1" cell and the "\n=1" cell alike -- is a quote-prefixed string.
+    # the carriage-return payload itself -- as the raw CR byte or, with an
+    # lxml-backed serializer that character-escapes it, as the `&#13;` entity
+    # -- and every cell reading "\n=1" -- the "\r=1" cell and the "\n=1" cell
+    # alike -- is a quote-prefixed string. The no-`<f>` rule is asserted in
+    # test_no_formula_element_survives_anywhere_in_the_package and quotePrefix
+    # in test_quote_prefix_is_present_in_the_raw_styles_part.
     stored = b"".join(
         data for name, data in _members(payload).items()
         if name.startswith("xl/worksheets/") or name == "xl/sharedStrings.xml"
     )
-    assert b"\r=1" in stored, "the carriage-return payload was not stored as literal text"
+    assert b"\r=1" in stored or b"&#13;=1" in stored, (
+        "the carriage-return payload was not stored as literal text"
+    )
     assert line_feed_cells >= 2, "the \\r=1 and \\n=1 cells were not both read back"
     missing = set(PAYLOADS) - seen - {"\r=1"}
     assert not missing, f"payloads not exercised: {missing}"

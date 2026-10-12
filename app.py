@@ -319,6 +319,22 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     )
     st.caption(" · ".join(meta))
 
+    if document.is_packet:
+        # The headline above is page 1's letterhead. Each run's own facts are
+        # shown here, from that run's pages -- never borrowed across runs.
+        for run in document.runs:
+            valuation = (
+                run.valuation_date.isoformat()
+                if run.valuation_date
+                else (run.valuation_date_text or "not printed")
+            )
+            facts = [
+                f"Carrier: {run.carrier or 'not printed'}",
+                f"Policy: {run.policy_number or 'not printed'}",
+                f"Valuation: {valuation}",
+            ]
+            st.caption(f"{run.run_id} (pages {run.page_range}) — " + " · ".join(facts))
+
     if passed:
         st.markdown(
             '<div class="ll-status ll-status-pass">✓ <b>Reconciled to carrier</b></div>',
@@ -746,8 +762,9 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs, or a broker's saved email (.eml) with its loss "
-        "runs attached — one or a hundred at once. Each uploaded file is "
+        "Drop in carrier loss runs as PDF, XLSX or CSV, or a broker's saved "
+        "email (.eml) with its loss runs attached — one or a hundred at once. "
+        "Each uploaded file is "
         "staged in a temporary directory for this session. It is deleted after "
         "you export it, when you press Delete, or when you remove it from the "
         "queue. Temporary files left behind by an interrupted session are swept "
@@ -757,8 +774,8 @@ def screen_queue() -> None:
 
     state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
-        "Choose PDF files or saved emails (.eml)",
-        type=["pdf", "eml"],
+        "Choose loss run files or saved emails (.eml)",
+        type=["pdf", "xlsx", "csv", "eml"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"uploader-{state['uploader_generation']}",
