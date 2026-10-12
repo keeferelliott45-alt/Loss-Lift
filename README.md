@@ -67,6 +67,12 @@ exception underneath it, change that row's total incurred from `41400.00` to
 `31400.00`, and watch the badge turn green as the checks re-run. Then export
 and open the Exceptions and Source Info sheets.
 
+**Saved emails.** A broker's email saved as `.eml` can be uploaded too: every
+attachment is listed with what happened to it, the loss-run PDFs are read, and
+the submission is summarised as one account with evidence back to each page.
+`python scripts/demo_submission.py` walks a synthetic one through the whole
+workflow. Details, limits and privacy boundaries: `docs/submission-workspace.md`.
+
 ## How it works
 
 Seven stages, each a separate module, each testable without Streamlit.
