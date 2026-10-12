@@ -138,7 +138,7 @@ def _flag(rule, category, severity, run_id=None, n=0):
 
 KINDS = [("R-15", "extraction", Severity.WARN), ("R-04", "financial", Severity.ERROR),
          ("R-13", "underwriting", Severity.WARN), ("R-14", "underwriting", Severity.INFO),
-         ("R-19", "underwriting", Severity.WARN)]
+         ("R-19", "extraction", Severity.WARN)]
 
 
 @pytest.mark.parametrize("combo, run_status, needs_mapping", [

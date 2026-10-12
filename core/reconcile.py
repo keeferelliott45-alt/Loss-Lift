@@ -818,6 +818,13 @@ def r19_stitching_row_count(
     Multi-page tables are stitched into one before validation, dropping
     repeated headers and per-page subtotals. If that drops more than it should,
     the count is the first place it shows.
+
+    It is a reading gap, not an underwriting observation: a claim row the pages
+    held did not come through, which is the same question R-20 and R-22 answer.
+    It stays the spec's WARN severity -- nothing here is a wrong figure, only a
+    row that needs finding -- and it is categorised ``extraction`` so it blocks
+    trust under the one policy for reading problems rather than through a
+    category carve-out.
     """
     seen = doc.rows_seen_per_page
     if not seen:
@@ -829,7 +836,7 @@ def r19_stitching_row_count(
     return [
         Finding(
             rule_id="R-19",
-            category=FindingCategory.UNDERWRITING,
+            category=FindingCategory.EXTRACTION,
             scope=FindingScope.DOCUMENT,
             subject="document",
             severity=Severity.WARN,
@@ -1491,10 +1498,49 @@ def r29_refused_claims_on_unbounded_scans(
     carrying such an identifier and a loss date or status of its own, refused
     there, may be another report's claim: it is not dropped quietly -- the
     document is reviewed and the rows are named.
+
+    On a single report bounded by its own page numbering the vote pooled
+    nothing, yet a row carrying a well-formed identifier and a loss date or
+    status of its own was still left out of the claims. That is a claim the
+    reading did not take, whatever its numbering looks like, and it is named
+    too. Rows in an unsettled run are named by R-28 and not repeated here.
     """
+    findings: list[Finding] = []
+    unsettled = [run for run in doc.runs if run.ambiguous]
+    lone = [
+        row for row in doc.refused_claim_rows
+        if not row.report and not any(run.holds(row.page) for run in unsettled)
+    ]
+    if lone:
+        listed = "; ".join(
+            f"page {row.page}" + (f" line {row.row + 1}" if row.row is not None else "")
+            + f" ({row.identifier})"
+            for row in lone[:10]
+        )
+        more = f" and {len(lone) - 10} more" if len(lone) > 10 else ""
+        pages = sorted({row.page for row in lone})
+        findings.append(Finding(
+            rule_id="R-29",
+            severity=Severity.ERROR,
+            category=FindingCategory.EXTRACTION,
+            scope=FindingScope.DOCUMENT,
+            subject="document",
+            condition="bounded",
+            page=pages[0],
+            message=(
+                f"{len(lone)} row(s) on page(s) "
+                f"{', '.join(str(page) for page in pages)} read as claims -- a "
+                f"claim number and a loss date or status -- but their claim "
+                f"numbers are shaped unlike the rest of this report's, so they "
+                f"were not read as claims: {listed}{more}. Add them on the review "
+                f"screen or confirm they are not claims before exporting."
+            ),
+            expected="every claim-like row read as a claim",
+            actual=len(lone),
+        ))
     refused = [row for row in doc.refused_claim_rows if row.report]
     if not refused:
-        return []
+        return findings
     listed = "; ".join(
         f"page {row.page}" + (f" line {row.row + 1}" if row.row is not None else "")
         + f" ({row.identifier})"
@@ -1502,7 +1548,7 @@ def r29_refused_claims_on_unbounded_scans(
     )
     more = f" and {len(refused) - 10} more" if len(refused) > 10 else ""
     pages = sorted({row.page for row in refused})
-    return [Finding(
+    return findings + [Finding(
         rule_id="R-29",
         severity=Severity.ERROR,
         category=FindingCategory.EXTRACTION,

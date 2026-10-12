@@ -59,6 +59,33 @@ MIN_IDENTIFIER_LENGTH = 3
 DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
 
 
+#: A worded label that names the claim number itself: "Claim No:",
+#: "Claim Number:", "File No:", "Occurrence:". Some carriers print the label
+#: inside the identifier cell of every claim. Deliberately a closed list: a
+#: label outside it ("Policy Period:", "Claimant:", "Claim Count:") is printed
+#: furniture, and reading furniture as a claim is the worse error.
+IDENTIFIER_LABEL = re.compile(
+    r"(?:claim|clm|file|occurrence|occ|incident|loss\s+ref(?:erence)?)"
+    r"(?:\s*(?:no\.?|nbr\.?|num\.?|number|id|ref\.?|reference|#))?",
+    re.IGNORECASE,
+)
+
+
+def strip_identifier_label(cell: str) -> str:
+    """The cell without a leading label that names the claim number.
+
+    "Claim No: WC-1004" is the claim WC-1004 with its label printed beside it.
+    Only a label from :data:`IDENTIFIER_LABEL` is removed, and only when
+    something follows the colon; any other cell comes back as it was.
+    """
+    text = cell.strip()
+    label, separator, rest = text.partition(":")
+    rest = rest.strip()
+    if separator and rest and IDENTIFIER_LABEL.fullmatch(label.strip()):
+        return rest
+    return text
+
+
 # --------------------------------------------------------------------------
 # What a claim number looks like in this document
 # --------------------------------------------------------------------------
@@ -135,7 +162,7 @@ def leading_identifier(cell: str, shapes: set[str]) -> str | None:
     continuation line: the junk that detail layouts put in this column does
     not begin with an identifier either.
     """
-    cell = cell.strip()
+    cell = strip_identifier_label(cell)
     if not cell or not is_identifier_candidate(cell):
         return None
     if not shapes or identifier_shape(cell) in shapes:

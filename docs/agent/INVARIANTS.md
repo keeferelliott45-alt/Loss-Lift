@@ -86,8 +86,8 @@ Coverage grades and blind spots per invariant: the coverage audit in
 **Enforced.**
 - One policy: `core.review.canonical_status` / `canonical_run_status`.
   NEEDS_REVIEW on any financial or extraction finding at any severity, any
-  ERROR, any `UNACCOUNTED_RULES` finding (R-19 included, though a WARN), any
-  run not clean, a mapping to confirm, or no reconciliation.
+  ERROR, any `UNACCOUNTED_RULES` finding, any run not clean, a mapping to
+  confirm, or no reconciliation.
   App queue/pill/card, workbook Source Info and Runs sheets, runs overview,
   claim accounting, JSON export, telemetry and the gate all use it
   (`test_status_policy.py`).
