@@ -762,8 +762,9 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs, or a broker's saved email (.eml) with its loss "
-        "runs attached — one or a hundred at once. Each uploaded file is "
+        "Drop in carrier loss runs as PDF, XLSX or CSV, or a broker's saved "
+        "email (.eml) with its loss runs attached — one or a hundred at once. "
+        "Each uploaded file is "
         "staged in a temporary directory for this session. It is deleted after "
         "you export it, when you press Delete, or when you remove it from the "
         "queue. Temporary files left behind by an interrupted session are swept "
@@ -773,8 +774,8 @@ def screen_queue() -> None:
 
     state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
-        "Choose PDF files or saved emails (.eml)",
-        type=["pdf", "eml"],
+        "Choose loss run files or saved emails (.eml)",
+        type=["pdf", "xlsx", "csv", "eml"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"uploader-{state['uploader_generation']}",

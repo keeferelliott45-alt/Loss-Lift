@@ -11,11 +11,13 @@ session — persistent storage of claim data is out of scope (spec section 13).
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -25,6 +27,17 @@ from uuid import uuid4
 
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
+XLSX_MAGIC = b"PK\x03\x04"
+#: Every OOXML workbook carries this part; a zip without it is not a workbook.
+XLSX_CONTENT_TYPES = "[Content_Types].xml"
+
+#: Upload kinds, in the suffix each is staged under.
+KIND_SUFFIX = {"pdf": ".pdf", "xlsx": ".xlsx", "csv": ".csv"}
+SUFFIX_KIND = {suffix: kind for kind, suffix in KIND_SUFFIX.items()}
+#: Legacy Excel containers are refused outright: the BIFF/OLE formats are a
+#: different parser with its own failure modes, and .xlsm carries macros that
+#: must never be opened. Fail closed rather than guess.
+UNSUPPORTED_SUFFIXES = {".xls", ".xlsm", ".xlt", ".xltm", ".xlsb"}
 
 #: Written into every directory that holds staged bytes. It records, per staged
 #: file, the document that owns it and the hash of its contents. ``discard``
@@ -41,7 +54,76 @@ SWEEP_MAX_AGE_HOURS = 24
 
 
 class IngestError(ValueError):
-    """The upload is not a PDF this app can work with."""
+    """The upload is not a document this app can work with."""
+
+
+def sniff_kind(data: bytes) -> str:
+    """Name the upload kind from its bytes: ``pdf``, ``xlsx`` or ``csv``.
+
+    The magic decides, never the filename. A zip counts as a workbook only
+    when it carries the OOXML content-types part; anything else -- a legacy
+    .xls container, a macro workbook saved as zip, arbitrary binary -- is
+    refused rather than parsed as text. Delimited text must decode as UTF-8
+    and carry no NUL byte, which binary formats always do.
+    """
+    if data.startswith(PDF_MAGIC):
+        return "pdf"
+    if data.startswith(XLSX_MAGIC):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = archive.namelist()
+        except (zipfile.BadZipFile, OSError) as error:
+            raise IngestError(
+                "The upload looks like a zip archive but is not a readable "
+                "Excel workbook. Save it as .xlsx (or export a CSV) and "
+                "upload it again."
+            ) from error
+        if XLSX_CONTENT_TYPES in names:
+            return "xlsx"
+        raise IngestError(
+            "The upload is a zip archive but not an Excel workbook. "
+            "Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    if b"\x00" in data:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        ) from error
+    return "csv"
+
+
+def _kind_for(filename: str, sniffed: str) -> str:
+    """Check the filename does not contradict the bytes; stage under a kind.
+
+    The bytes decide what a file is. A *recognised* extension that contradicts
+    the magic means the file was renamed or saved wrong, and neither reading
+    is safe, so the upload is refused. An unrecognised or missing extension
+    contradicts nothing: the magic carries the kind and the file is staged as
+    what it is. Legacy Excel formats are refused before anything else about
+    them is asked.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in UNSUPPORTED_SUFFIXES:
+        raise IngestError(
+            f"{Path(filename).name} is a legacy Excel format, which is not "
+            "supported. Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    declared = SUFFIX_KIND.get(suffix)
+    if declared is None:
+        return sniffed
+    if declared != sniffed:
+        raise IngestError(
+            f"{Path(filename).name} is named {suffix} but its contents are "
+            "not that kind of file. Upload the file under its true format."
+        )
+    return declared
 
 
 class DiscardOutcome(str, Enum):
@@ -105,6 +187,9 @@ class IngestedFile:
     sha256: str
     path: Path
     size_bytes: int
+    #: What kind of document the bytes are: "pdf", "xlsx" or "csv". Decided
+    #: from the bytes at ingest, never from the filename.
+    kind: str = "pdf"
     owns_directory: bool = False
     source_path: Path | None = None
     source_identity: FileIdentity | None = None
@@ -394,18 +479,15 @@ def ingest(
     filename: str,
     workdir: str | Path | None = None,
 ) -> IngestedFile:
-    """Validate, hash and stage an uploaded PDF."""
+    """Validate, hash and stage an uploaded PDF, XLSX or CSV loss run."""
     if not data:
-        raise IngestError(f"{filename} is empty. Upload the PDF again.")
+        raise IngestError(f"{filename} is empty. Upload the document again.")
     if len(data) > MAX_UPLOAD_BYTES:
         raise IngestError(
             f"{filename} is {len(data) / 1e6:.0f} MB. The limit is "
             f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
         )
-    if not data.startswith(PDF_MAGIC):
-        raise IngestError(
-            f"{filename} is not a PDF. Loss runs must be uploaded as PDF files."
-        )
+    kind = _kind_for(filename, sniff_kind(data))
 
     owns_directory = not bool(workdir)
     directory = (
@@ -417,7 +499,7 @@ def ingest(
 
     digest = sha256_bytes(data)
     safe_name = Path(filename).name or "upload.pdf"
-    target = directory / f".upload-{uuid4().hex}.pdf"
+    target = directory / f".upload-{uuid4().hex}{KIND_SUFFIX[kind]}"
     document_id = str(uuid4())
     try:
         # The marker is written before the bytes: a process killed between the
@@ -439,12 +521,13 @@ def ingest(
         sha256=digest,
         path=target,
         size_bytes=len(data),
+        kind=kind,
         owns_directory=owns_directory,
     )
 
 
 def ingest_path(path: str | Path, workdir: str | Path | None = None) -> IngestedFile:
-    """Snapshot an existing PDF without trusting a changing pathname."""
+    """Snapshot an existing PDF, XLSX or CSV without trusting a changing pathname."""
     source = Path(path).resolve()
     directory: Path | None = None
     temporary_target: Path | None = None
@@ -454,16 +537,15 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
             if identity.size == 0:
-                raise IngestError(f"{source.name} is empty. Upload the PDF again.")
+                raise IngestError(f"{source.name} is empty. Upload the document again.")
             if identity.size > MAX_UPLOAD_BYTES:
                 raise IngestError(
                     f"{source.name} is {identity.size / 1e6:.0f} MB. The limit is "
                     f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
                 )
-            if source_handle.read(len(PDF_MAGIC)) != PDF_MAGIC:
-                raise IngestError(
-                    f"{source.name} is not a PDF. Loss runs must be uploaded as PDF files."
-                )
+            data = source_handle.read(MAX_UPLOAD_BYTES + 1)
+            kind = _kind_for(source.name, sniff_kind(data))
+            source_handle.seek(0)
 
             owns_directory = not bool(workdir)
             directory = (
@@ -472,7 +554,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                 else Path(workdir)
             )
             directory.mkdir(parents=True, exist_ok=True)
-            temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
+            temporary_target = directory / f".snapshot-{uuid4().hex}{KIND_SUFFIX[kind]}"
             document_id = str(uuid4())
             # Provisional marker before the bytes, so a kill during the copy
             # leaves a marker-bearing directory the startup sweep can find
@@ -505,6 +587,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             sha256=digest,
             path=target,
             size_bytes=identity.size,
+            kind=kind,
             owns_directory=owns_directory,
             source_path=source,
             source_identity=identity,

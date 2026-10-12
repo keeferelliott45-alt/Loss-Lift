@@ -155,9 +155,9 @@ def test_a_direct_pdf_upload_behaves_as_before(tmp_path):
         discard(direct[0])
 
 
-def test_the_uploader_accepts_pdf_and_saved_email():
+def test_the_uploader_accepts_pdf_sheets_and_saved_email():
     source = Path(APP).read_text(encoding="utf-8")
-    assert 'type=["pdf", "eml"]' in source
+    assert 'type=["pdf", "xlsx", "csv", "eml"]' in source
 
 
 def test_evidence_opens_the_claim_on_its_page(emailed):
