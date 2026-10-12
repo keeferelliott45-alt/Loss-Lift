@@ -133,4 +133,3 @@ base.
 Next safe action (owner): decide whether to re-validate this harness against
 `4ca0d41` (a fresh worktree from that SHA), or pin PR #16's base to `230c0fc`.
 Do not rebase PR #9's branch.
-
