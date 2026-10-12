@@ -55,6 +55,25 @@ GAP_COMPARISON_TOLERANCE = 1e-6
 #: A cell shorter than this is a code or a stray digit, never a claim number.
 MIN_IDENTIFIER_LENGTH = 3
 
+#: How many distinct numbering series one vote may admit. A loss run numbers
+#: its claims in one series, sometimes a few (a WC and a GL series, a series
+#: that grew a digit, which is one family). A column whose recurring shapes
+#: fall into more families than this is not holding a claim-number series at
+#: all -- a register, a parts list or any other table that happens to carry a
+#: "claim" heading -- and reading every row of it as a claim is the
+#: over-extraction this ceiling exists to stop. Beyond it the vote is
+#: ``{NO_SERIES}``: no claim is built, every claim-like row is recorded as
+#: refused (R-29), the document reads NEEDS_REVIEW, and nothing is guessed or
+#: dropped.
+MAX_SERIES_FAMILIES = 4
+
+#: The vote when the column holds no claim-number series. Not an empty set:
+#: an empty vote means "no evidence", and ``leading_identifier`` then falls
+#: back to the basic tests and accepts every candidate -- the opposite of
+#: refusing. This is a shape no identifier can have (``identifier_shape``
+#: never writes a lowercase letter), so nothing matches it.
+NO_SERIES = "no claim-number series"
+
 #: A whole cell that is just a date. Claim numbers are not dates.
 DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
 
@@ -169,7 +188,20 @@ def consensus_shapes(candidates: Sequence[str]) -> set[str]:
         shape for shape, count in shapes.items()
         if count >= 2 and any(same_series(shape, known) for known in series)
     }
+    if len(series_families(admitted)) > MAX_SERIES_FAMILIES:
+        return {NO_SERIES}
     return admitted
+
+
+def series_families(shapes: set[str]) -> list[set[str]]:
+    """The admitted shapes grouped into numbering series (``same_series``)."""
+    families: list[set[str]] = []
+    for shape in sorted(shapes):
+        joined = [family for family in families
+                  if any(same_series(shape, member) for member in family)]
+        merged = {shape}.union(*joined) if joined else {shape}
+        families = [family for family in families if family not in joined] + [merged]
+    return families
 
 
 def _runs(shape: str) -> list[tuple[str, int]]:
