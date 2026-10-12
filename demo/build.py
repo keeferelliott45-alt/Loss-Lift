@@ -42,6 +42,8 @@ from tests.test_packet_claim_series import (  # noqa: E402
     _large_run,
 )
 from tests.test_run_metadata import AUTO_TERM, GL_TERM, RUN_ONE, RUN_TWO  # noqa: E402
+from tests.fuzz.generator import render as render_fuzz  # noqa: E402
+from tests.fuzz.run import build_case  # noqa: E402
 
 DEFAULT_OUT = Path(__file__).resolve().parent / "out"
 
@@ -56,6 +58,9 @@ class DemoDocument:
     #: Rule ids that must be among the findings (the demo's talking point).
     rules: tuple[str, ...]
     beat: str
+    #: Read scanned pages from the recorded answers in ``recordings/`` (never a
+    #: live model). Only the scanned-replay item sets this.
+    replay: bool = False
 
 
 def _save(document: pymupdf.Document, path: Path) -> Path:
@@ -102,6 +107,45 @@ def _foreign_page_packet(path: Path) -> Path:
     ])
 
 
+#: A seeded hostile case from the fuzz harness: a third carrier's unnumbered
+#: page slipped into a two-carrier packet. Same seed and operators, same
+#: bytes (``python -m tests.fuzz.run --case 5:add_unnumbered_run``).
+HOSTILE_SEED, HOSTILE_OPERATORS = 5, ("add_unnumbered_run",)
+
+
+def _hostile_packet(path: Path) -> Path:
+    rendered = render_fuzz(build_case(HOSTILE_SEED, HOSTILE_OPERATORS), path)
+    document = pymupdf.open(rendered)
+    data = document.tobytes()
+    document.close()
+    return _save(pymupdf.open("pdf", data), path)
+
+
+#: Where the scanned-replay item's recorded vision answers are written.
+RECORDINGS = "recordings"
+
+
+def _scanned_replay(path: Path) -> Path:
+    """The golden scanned page, plus a recorded vision answer for it.
+
+    The answer is what a stand-in model transcribes off the synthetic page
+    (``tests/test_extract_vision.py``), recorded under the key the app's own
+    vision reader uses. Replaying it reads the page exactly as a live model
+    that transcribed it correctly would, with no key and no network.
+    """
+    from core.extract_vision import recording_extractor
+    from tests.golden import fixtures as fx
+    from tests.test_extract_vision import StandInModel, transcription
+
+    built = _golden("scanned")(path)
+    model = StandInModel(transcription(fx.SCANNED))
+    with tempfile.TemporaryDirectory() as scratch:
+        run_pipeline(built, use_vision=True, profiles_dir=Path(scratch),
+                     vision_extractor=recording_extractor(path.parent / RECORDINGS,
+                                                          client=model))
+    return built
+
+
 def _golden(name: str) -> Callable[[Path], Path]:
     def build(path: Path) -> Path:
         rendered = render_golden(BY_NAME[name], path)
@@ -126,11 +170,20 @@ DEMO: tuple[DemoDocument, ...] = (
                  DocumentStatus.NEEDS_REVIEW, 1, ("R-01",),
                  "The carrier's own arithmetic does not add up: flagged, not hidden."),
     DemoDocument("05-foreign-page-packet.pdf", _foreign_page_packet,
-                 DocumentStatus.NEEDS_REVIEW, 2, ("R-28",),
-                 "Another carrier's page bound inside a report: named, never folded in."),
+                 DocumentStatus.CLEAN, 2, (),
+                 "Another carrier's page bound inside a report: read as its own run, "
+                 "never folded in."),
     DemoDocument("06-scanned.pdf", _golden("scanned"),
                  DocumentStatus.NEEDS_REVIEW, 1, ("R-22",),
                  "A scanned page with vision off: the page is named as unread."),
+    DemoDocument("08-hostile-packet.pdf", _hostile_packet,
+                 DocumentStatus.NEEDS_REVIEW, 3, ("R-23", "R-28"),
+                 "A third carrier's unnumbered page slipped in: its money is named "
+                 "and the boundary flagged, not guessed."),
+    DemoDocument("09-scanned-replay.pdf", _scanned_replay,
+                 DocumentStatus.NEEDS_REVIEW, 1, ("R-27",),
+                 "A scanned page read by vision (recorded answer): values marked "
+                 "vision, the count left to a person.", replay=True),
 )
 
 
@@ -163,13 +216,29 @@ def build(out: Path) -> dict[str, str]:
         digests[item.filename] = hashlib.sha256(path.read_bytes()).hexdigest()
     email = _email(out / EMAIL_FILENAME)
     digests[EMAIL_FILENAME] = hashlib.sha256(email.read_bytes()).hexdigest()
+    for recording in sorted((out / RECORDINGS).glob("*.json")):
+        digests[f"{RECORDINGS}/{recording.name}"] = hashlib.sha256(
+            recording.read_bytes()).hexdigest()
     return digests
 
 
-def observe(path: Path) -> tuple[DocumentStatus, int, set[str]]:
-    """Read one PDF the way the app does with the LLM and vision off."""
+def read(path: Path, *, replay: bool = False):
+    """Read one PDF the way the app does with the LLM off.
+
+    Vision is off too, except for the scanned-replay item, which replays its
+    recorded answer and never reaches a model."""
+    vision: dict = {"use_vision": False}
+    if replay:
+        from core.extract_vision import replay_extractor
+
+        vision = {"use_vision": True,
+                  "vision_extractor": replay_extractor(path.parent / RECORDINGS)}
     with tempfile.TemporaryDirectory() as scratch:
-        result = run_pipeline(path, use_vision=False, profiles_dir=Path(scratch))
+        return run_pipeline(path, profiles_dir=Path(scratch), **vision)
+
+
+def observe(path: Path, *, replay: bool = False) -> tuple[DocumentStatus, int, set[str]]:
+    result = read(path, replay=replay)
     findings = result.reconciliation.findings if result.reconciliation else []
     return (canonical_status(result.reconciliation), len(result.document.runs) or 1,
             {finding.rule_id for finding in findings})
@@ -179,7 +248,7 @@ def check(out: Path) -> list[str]:
     """Every way the built pack differs from what the runbook promises."""
     problems = []
     for item in DEMO:
-        status, runs, rules = observe(out / item.filename)
+        status, runs, rules = observe(out / item.filename, replay=item.replay)
         if status is not item.status:
             problems.append(f"{item.filename}: status {status.value}, expected {item.status.value}")
         if runs != item.runs:
@@ -194,8 +263,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--scan-workbook", action="store_true",
+        help="also write the scanned-replay item's workbook (vision cells marked)")
     args = parser.parse_args(argv)
     digests = build(args.out)
+    if args.scan_workbook:
+        from core.export import write_xlsx
+
+        item = next(entry for entry in DEMO if entry.replay)
+        result = read(args.out / item.filename, replay=True)
+        target = write_xlsx(result.document, args.out / item.filename.replace(".pdf", ".xlsx"),
+                            result.reconciliation)
+        print(f"wrote {target.name}")
     for item in DEMO:
         print(f"{item.filename:32} {digests[item.filename][:12]}  {item.beat}")
     print(f"{EMAIL_FILENAME:32} {digests[EMAIL_FILENAME][:12]}  "
