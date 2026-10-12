@@ -430,27 +430,45 @@ def _finish(flags: list[TriageFlag]) -> list[TriageFlag]:
 
     Two histories can share a claim number -- two carriers printing the same
     one. Rather than drop the second flag's provenance, duplicates are merged:
-    claim numbers and sources unite, the first reason stands.
+    claim numbers and sources unite. A cannot-evaluate reason is never
+    swallowed: if any constituent flag was unevaluated, the merged flag is
+    unevaluated and carries every distinct reason, in first-seen order,
+    joined deterministically; its ``reason`` repeats that merged text, as the
+    module does for every unevaluated flag.
     """
     ordered = sorted(flags, key=_flag_sort_key)
     merged: dict[tuple[str, str], TriageFlag] = {}
+    reasons: dict[tuple[str, str], list[str]] = {}
     for flag in ordered:
         first_claim = flag.claim_numbers[0] if flag.claim_numbers else ""
         key = (flag.rule, first_claim)
+        collected = reasons.setdefault(key, [])
+        if not flag.evaluated and flag.not_evaluated_reason:
+            if flag.not_evaluated_reason not in collected:
+                collected.append(flag.not_evaluated_reason)
         existing = merged.get(key)
         if existing is None:
             merged[key] = flag
             continue
         numbers = tuple(sorted(set(existing.claim_numbers) | set(flag.claim_numbers)))
         sources = _sort_sources(existing.sources + flag.sources)
+        if collected:
+            merged_reason = "; ".join(collected)
+            reason = merged_reason
+            evaluated = False
+            not_evaluated_reason = merged_reason
+        else:
+            reason = existing.reason
+            evaluated = True
+            not_evaluated_reason = None
         merged[key] = TriageFlag(
             rule=existing.rule,
             severity=existing.severity,
             claim_numbers=numbers,
-            reason=existing.reason,
+            reason=reason,
             sources=sources,
-            evaluated=existing.evaluated,
-            not_evaluated_reason=existing.not_evaluated_reason,
+            evaluated=evaluated,
+            not_evaluated_reason=not_evaluated_reason,
         )
     return list(merged.values())
 

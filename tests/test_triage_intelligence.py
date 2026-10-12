@@ -761,6 +761,63 @@ def test_per_term_table_rows_match_account_periods():
     assert row_2023[9] == 4500.0
 
 
+def test_duplicate_same_numbered_flags_never_swallow_a_reason():
+    """Two histories can print the same claim number under different carriers.
+
+    When their T-01 flags merge, a cannot-evaluate reason from either history
+    must survive: the merged flag is unevaluated and carries every distinct
+    reason. (Fuzz finding: ``_finish`` kept only the first reason.)
+    """
+    # History A: attributed GL -- the override supplies a ceiling -- but the
+    # claim carries no incurred total, so it cannot evaluate against it.
+    attributed = _run(
+        "attributed.pdf", date(2024, 12, 31),
+        [Claim(claim_number="X-1", date_of_loss=date(2023, 5, 1),
+               claim_status=ClaimStatus.OPEN, incurred_total=None)],
+        carrier="Carrier GL", policy="POL-GL", lob=LineOfBusiness.GL,
+    )
+    # History B: same claim number, a different carrier, no line of business
+    # stated, no account-level ceiling -> a different cannot-evaluate reason.
+    unattributed = _run(
+        "unattributed.pdf", date(2024, 12, 31),
+        [_claim("X-1", date(2023, 5, 1), "5000.00")],
+        carrier="Carrier NO-LOB", policy="POL-NO-LOB", lob=None,
+    )
+    account = build_account("Acme Haulage", [attributed, unattributed])
+    # the two histories really are distinct -- the whole point of the merge
+    assert len([h for h in account.histories if h.claim_number == "X-1"]) == 2
+
+    rules = AppetiteRules(lob_overrides={
+        "GL": LobOverride(open_incurred_ceiling=Decimal("40000.00")),
+    })
+    t01 = [f for f in evaluate_appetite(account, rules) if f.rule == T01_OPEN_INCURRED]
+    assert len(t01) == 1
+    flag = t01[0]
+    assert flag.claim_numbers == ("X-1",)
+    assert flag.evaluated is False
+    reason_a = (
+        "open claim X-1 carries no incurred total - cannot evaluate against ceiling"
+    )
+    reason_b = (
+        "open claim X-1 has no configured open-incurred ceiling - "
+        "cannot evaluate against ceiling"
+    )
+    # BOTH distinct reasons survive -- exactly these two, nothing swallowed
+    # and nothing invented. (Their join order is not pinned: the merge
+    # tiebreak is document_id, a random uuid4, so the order is not stable
+    # across processes; the SET of reasons is what must be deterministic.)
+    assert flag.not_evaluated_reason is not None
+    assert sorted(flag.not_evaluated_reason.split("; ")) == sorted(
+        [reason_a, reason_b]
+    )
+    # the module convention: reason carries the same text on an unevaluated flag
+    assert flag.reason == flag.not_evaluated_reason
+    # no appearance is dropped: both carriers' provenance is united
+    assert {s.source_filename for s in flag.sources} == {
+        "attributed.pdf", "unattributed.pdf"
+    }
+
+
 def test_period_gaps_appear_only_when_present():
     gapped_one = _run("a.pdf", date(2023, 12, 31),
                       [_claim("C-1", date(2023, 5, 1), "1000.00")], periods=[TERM_2023])
