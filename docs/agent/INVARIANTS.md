@@ -20,6 +20,12 @@ Coverage grades and blind spots per invariant: the coverage audit in
 - Unread source pages (failed / unresolved / partly recognised pictures) raise
   R-22; no claims at all raises R-20 (ERROR).
 - A null is never a zero (`NullReason`, R-15).
+- The silent-CLEAN fuzz harness checks this end to end: seeded synthetic
+  reports and packets with a known truth (every claim's money as `Decimal`,
+  its run and its page), classified only through `canonical_status`. A
+  missing, duplicated, invented, wrongly-run or wrongly-valued claim while the
+  document reads CLEAN is a SILENT failure (`tests/fuzz/`,
+  `tests/test_fuzz_smoke.py`; clean LOUD baseline 0, hostile SILENT 0).
 
 **Desired / not yet.**
 - Refused rows on a single report whose claim-number vote was bounded are

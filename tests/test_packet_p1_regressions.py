@@ -330,12 +330,10 @@ def test_p1_3_unlabelled_scans_fail_closed(tmp_path, amounts):
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "not one of the three P1s: a single report read partly off a text layer "
-    "and partly off a scan keeps main's vote per reader, so the scanned page's "
-    "dated cause code is still voted on by that page's rows"))
 def test_p1_3_a_scanned_continuation_of_a_digital_report_shares_its_vote(tmp_path):
-    """A report read partly off a text layer and partly off a scan."""
+    """A report read partly off a text layer and partly off a scan: every page
+    numbered, so it is one established report and both readers vote together
+    (tests/test_mixed_reader_vote.py)."""
     large = _large_run(8)
     pages = [
         (LARGE_CARRIER, LARGE_HEADERS, large, {"marker": "Page 1 of 2"}),

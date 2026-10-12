@@ -291,6 +291,37 @@ def test_a_report_that_stops_short_then_an_unnumbered_page_fails_closed(tmp_path
     assert result.reconciliation.status is DocumentStatus.NEEDS_REVIEW
 
 
+def test_a_foreign_page_bridged_inside_a_report_is_read_as_its_own_run(tmp_path):
+    """A "Page 1 of 2", another carrier's unnumbered page, a "Page 2 of 2": the
+    report's own count resumes right after the foreign page, so its pagination
+    itself leaves that page out -- it is not the report's page with its footer
+    missing -- and the page names another carrier. It is a report of its own:
+    its claim is read into that run, and the packet, whose two runs each tie
+    what they printed, is CLEAN -- not a review that only names the claim."""
+    large = _large_run(6)
+    foreign = SMALL_RUN[:1]
+    result = _read(tmp_path, [
+        (LARGE_CARRIER, LARGE_HEADERS, large[:3], {"number": 1, "of": 2}),
+        (SMALL_CARRIER, SMALL_HEADERS, foreign),
+        (LARGE_CARRIER, LARGE_HEADERS, (*large[3:], _total(large)), {"number": 2, "of": 2}),
+    ])
+    document = result.document
+    runs = document.runs
+    assert [(run.pages, run.ambiguous) for run in runs] == [([1, 3], False), ([2], False)]
+    foreign_run = runs[1]
+    foreign_claims = document.run_claims(foreign_run)
+    assert [claim.claim_number for claim in foreign_claims] == [SMALL_RUN[0][0]]
+    assert foreign_claims[0].source_page == 2
+    assert [claim.claim_number for claim in document.run_claims(runs[0])] == [
+        row[0] for row in large]
+    assert document.refused_claim_rows == []
+    assert document.unplaced_rows == []
+    rules = sorted({finding.rule_id for finding in result.reconciliation.findings})
+    assert "R-23" not in rules and "R-28" not in rules
+    assert result.reconciliation.run_status["run-2"] is DocumentStatus.CLEAN
+    assert canonical_status(result.reconciliation) is DocumentStatus.CLEAN
+
+
 def test_two_numbers_in_one_count_on_one_page_keep_the_continuing_one():
     evidence = {
         1: PageEvidence(1, paginations=tuple(paginations_in("Page 1 of 2", "header"))),
@@ -881,6 +912,30 @@ def test_a_claim_added_by_hand_joins_the_run_of_its_page(tmp_path):
     moved = to_records(document, columns)
     moved[0]["_page"] = 2
     assert apply_edits(document, moved).claims[0].source_page == 1
+
+
+def test_a_claim_added_with_no_page_belongs_to_no_run_and_is_named(tmp_path):
+    """A row a reviewer adds to a packet without saying which run it belongs to
+    must not default into run-1. It belongs to no run, R-11 names it, and the
+    packet needs review even though every run's own arithmetic still ties."""
+    from core.pipeline import edit_claims, to_records
+
+    result, _large, _small = _two_carrier_packet(tmp_path)
+    document = result.document
+    columns = ["claim_number", "date_of_loss", "claim_status", "paid_total",
+               "reserve_total", "incurred_total"]
+    records = to_records(document, columns)
+    records.append({"claim_number": "CR-40999", "date_of_loss": "2022-05-05",
+                    "claim_status": "OPEN", "paid_total": "", "reserve_total": "",
+                    "incurred_total": ""})
+    edited = edit_claims(result, records)
+    added = next(c for c in edited.document.claims if c.claim_number == "CR-40999")
+    assert added.source_page is None
+    for run in edited.document.runs:
+        assert added not in edited.document.run_claims(run)
+    assert edited.reconciliation.status is DocumentStatus.NEEDS_REVIEW
+    assert any(f.rule_id == "R-11" and "CR-40999" in f.message
+               for f in edited.reconciliation.findings)
 
 
 def test_each_row_carries_its_runs_valuation_date(tmp_path):

@@ -58,6 +58,40 @@ MIN_IDENTIFIER_LENGTH = 3
 #: A whole cell that is just a date. Claim numbers are not dates.
 DATE_SHAPED = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
 
+#: A whole cell that is an amount: a currency mark, or digits grouped in
+#: thousands. Claim numbers carry neither, and a column whose gutters collapse
+#: can put an amount where the claim number should be.
+MONEY_SHAPED = re.compile(
+    r"\(?-?\s*(?:[$€£]\s*-?\s*\d[\d,.]*|\d{1,3}(?:[,.]\d{3})+(?:[.,]\d+)?)\)?-?"
+)
+
+
+#: A worded label that names the claim number itself: "Claim No:",
+#: "Claim Number:", "File No:", "Occurrence:". Some carriers print the label
+#: inside the identifier cell of every claim. Deliberately a closed list: a
+#: label outside it ("Policy Period:", "Claimant:", "Claim Count:") is printed
+#: furniture, and reading furniture as a claim is the worse error.
+IDENTIFIER_LABEL = re.compile(
+    r"(?:claim|clm|file|occurrence|occ|incident|loss\s+ref(?:erence)?)"
+    r"(?:\s*(?:no\.?|nbr\.?|num\.?|number|id|ref\.?|reference|#))?",
+    re.IGNORECASE,
+)
+
+
+def strip_identifier_label(cell: str) -> str:
+    """The cell without a leading label that names the claim number.
+
+    "Claim No: WC-1004" is the claim WC-1004 with its label printed beside it.
+    Only a label from :data:`IDENTIFIER_LABEL` is removed, and only when
+    something follows the colon; any other cell comes back as it was.
+    """
+    text = cell.strip()
+    label, separator, rest = text.partition(":")
+    rest = rest.strip()
+    if separator and rest and IDENTIFIER_LABEL.fullmatch(label.strip()):
+        return rest
+    return text
+
 
 # --------------------------------------------------------------------------
 # What a claim number looks like in this document
@@ -91,6 +125,8 @@ def is_identifier_candidate(text: str) -> bool:
     # not resolve without document evidence and so parses to None, which would
     # otherwise read as "not a date" and let a date column bleed in as an
     # identifier.
+    if MONEY_SHAPED.fullmatch(text.strip()):
+        return False
     return not DATE_SHAPED.fullmatch(text)
 
 
@@ -122,7 +158,42 @@ def consensus_shapes(candidates: Sequence[str]) -> set[str]:
     # claim on it is ordinary. Requiring two would extract nothing from it.
     most_common = shapes.most_common(1)[0][1]
     floor = min(most_common, max(2, int(most_common * 0.25)))
-    return {shape for shape, count in shapes.items() if count >= floor}
+    admitted = {shape for shape, count in shapes.items() if count >= floor}
+    # A series whose numbers grew or lost a digit -- "AL201406511-1" in one
+    # year, "AL20158493-2" the next -- is still the series. Its shape differs
+    # from an admitted one only in how long its runs are, and where it
+    # recurs it is admitted beside it, however small its share. A one-off
+    # stays a one-off, and a shape of another pattern earns nothing here.
+    series = set(admitted)
+    admitted |= {
+        shape for shape, count in shapes.items()
+        if count >= 2 and any(same_series(shape, known) for known in series)
+    }
+    return admitted
+
+
+def _runs(shape: str) -> list[tuple[str, int]]:
+    return [(match.group(0)[0], len(match.group(0))) for match in re.finditer(r"(.)\1*", shape)]
+
+
+def same_series(shape: str, other: str) -> bool:
+    """One series whose numbers grew or lost a digit: AA99999999-9 / AA999999999-9.
+
+    The runs must line up one for one: letters and punctuation exactly, each
+    run of digits within one digit of its counterpart. A three-digit office
+    code is not a twelve-digit claim number's series.
+    """
+    mine, theirs = _runs(shape), _runs(other)
+    if len(mine) != len(theirs):
+        return False
+    for (kind, length), (other_kind, other_length) in zip(mine, theirs):
+        if kind != other_kind:
+            return False
+        if kind == "9" and abs(length - other_length) > 1:
+            return False
+        if kind != "9" and length != other_length:
+            return False
+    return True
 
 
 def leading_identifier(cell: str, shapes: set[str]) -> str | None:
@@ -135,7 +206,7 @@ def leading_identifier(cell: str, shapes: set[str]) -> str | None:
     continuation line: the junk that detail layouts put in this column does
     not begin with an identifier either.
     """
-    cell = cell.strip()
+    cell = strip_identifier_label(cell)
     if not cell or not is_identifier_candidate(cell):
         return None
     if not shapes or identifier_shape(cell) in shapes:
