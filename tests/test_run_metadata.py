@@ -218,6 +218,27 @@ def test_loss_summary_carries_each_runs_own_block(tmp_path):
     assert two_rows["2020-01-01 to 2021-01-01"]["Ties to carrier"] == "no"
 
 
+def test_per_run_blocks_write_through_the_workbook_text_policy(tmp_path):
+    """A run's printed facts are document text: the per-run blocks write them
+    through the same formula-injection policy as every other cell."""
+    result = _packet_with_counts(tmp_path)
+    payload = '=HYPERLINK("http://example.invalid","x")'
+    result.document.runs[1].carrier = payload
+    book = load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))
+    hits = [
+        cell
+        for name in ("Source Info", "Loss Summary")
+        for row in book[name].iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and payload in cell.value
+    ]
+    assert {cell.parent.title for cell in hits} == {"Source Info", "Loss Summary"}
+    for cell in hits:
+        assert cell.data_type == "s", (cell.parent.title, cell.coordinate)
+        if cell.value.startswith("="):
+            assert cell.quotePrefix is True, (cell.parent.title, cell.coordinate)
+
+
 def test_single_run_document_has_no_per_run_blocks(tmp_path):
     """A single loss run is the whole document: no per-run facts in Source
     Info, no per-run block in Loss Summary, roll-up as before."""
