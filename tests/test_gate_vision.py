@@ -187,3 +187,14 @@ def test_vision_paths_are_published_by_schema_name():
     for name in seal.VISION_KEYS:
         assert seal.schema_path(f"vision.{name}") == f"vision.{name}"
     assert seal.schema_path("vision.claims.vision") == "vision.claims.*"
+
+
+def test_the_published_leak_bound_counts_every_known_schema_field():
+    """docs/cloud-corpus-gate.md states how many schema fields a run can flag."""
+    import re
+
+    text = (Path(__file__).resolve().parents[1] / "docs" / "cloud-corpus-gate.md").read_text()
+    stated = re.search(r"which of the (\d+) known schema fields\s+changed \((\d+) bits\)", text)
+    assert stated and int(stated.group(1)) == int(stated.group(2)) == len(seal.KNOWN_PATHS)
+    total = re.search(r"at most (\d+) bits", text)
+    assert total and int(total.group(1)) == 2 + len(seal.KNOWN_PATHS) + 40 + 8 + 14
