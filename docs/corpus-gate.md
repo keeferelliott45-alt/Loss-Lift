@@ -132,6 +132,7 @@ For every document, both commits' results are compared field by field:
 | `review_status` | `CLEAN` / `NEEDS_REVIEW` (**critical**) -- the canonical trust status every layer shows (`core.review.canonical_status`); a revision that predates the function is measured under the same policy |
 | `runs` | number of logical runs, whether the document is a packet, unsettled and incomplete runs; for a packet, per run (keyed by position): run id, pages, boundary confidence, whether settled and complete, claims held and a digest of them, refused and unplaced rows on its pages, printed claim count, which printed totals it has, engine and canonical status, R-04 and R-05 counts, digests of its boundary evidence and of its own carrier/policy/term/valuation facts |
 | `refused` | claim-like rows the claim-number vote refused: count, how many a rule reports, per page, and a digest |
+| `vision` | whether recorded vision answers were replayed; the pages asked of the vision reader, split into answered, recording missing, and recording present but unusable; claims counted by the method they were read with (`digital`, `vision`, `sheet`, ...); vision-read claims above the 0.85 confidence cap (an invariant: anything but 0 is a fault) |
 | `pages` | processed, failed, skipped, unresolved and scanned page lists; page count; column-split pages; rows seen per page; a digest of each unresolved page's reason |
 | `unplaced` | count of rows whose money could not be placed, per page and in total; digest of their content |
 | `printed` | printed claim count; a digest per printed total column; unreadable totals, count evidence and printed sections, as counts and digests |
@@ -175,7 +176,12 @@ model, the prompt and the response schema (`core.extract_vision.recording_key`).
 Replay never renders, needs no key and reaches no network. A page with no
 recording for the current prompt and model is a failed page, named in the
 warnings, so a prompt change shows up as a change until it is recorded again --
-never as a page silently read empty. A recording holds what the model
+never as a page silently read empty. The `vision` group says which: a page
+whose recording is missing moves from `vision.answered` to `vision.missing`,
+which reads differently from a page the engine now reads differently
+(`claims.*`, `findings.*`). A change touching `vision.missing` means the
+candidate needs recording again before its scans can be compared at all;
+do not allowlist it. A recording holds what the model
 transcribed off a real document: it lives outside the repository beside the
 corpus (the gate refuses one inside the working tree) under the same
 protections. A revision that cannot replay fails to start rather than being
