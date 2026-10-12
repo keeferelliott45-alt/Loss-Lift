@@ -11,9 +11,8 @@ from the reconciliation rule ids (R-01 ...): a triage flag is an appetite
 observation for a person deciding whether to write the account, not a
 statement that a document was read wrongly.
 
-Workbook round-trip tests for the triage export land with the export hook in
-a later commit in this same lane -- ``account_triage_to_bytes`` does not
-exist yet, so no export tests live here.
+Workbook round-trip tests for the triage export live at the end of this file,
+beside ``account_triage_to_bytes``, which they exercise.
 """
 
 from __future__ import annotations
@@ -21,10 +20,13 @@ from __future__ import annotations
 import json
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 
 import pytest
+from openpyxl import load_workbook
 
 from core.account import build_account
+from core.export import account_triage_to_bytes
 from core.intelligence import (
     AppetiteConfigError,
     AppetiteRules,
@@ -660,3 +662,123 @@ def test_load_appetite_rules_empty_object_is_safe_defaults(tmp_path):
     assert rules.development_alert_pct is None
     assert rules.lob_overrides == {}
     assert rules.open_statuses == frozenset({ClaimStatus.OPEN, ClaimStatus.REOPENED})
+
+
+# --------------------------------------------------------------------------
+# Workbook export (account_triage_to_bytes)
+# --------------------------------------------------------------------------
+
+def test_triage_workbook_round_trips_with_three_sheets():
+    account = _rich_account()
+    book = load_workbook(BytesIO(account_triage_to_bytes(account, RICH_RULES)))
+    assert book.sheetnames == ["Triage Summary", "Triage Flags", "Not Evaluated"]
+
+
+def test_triage_flags_row_carries_appearance_provenance():
+    packet = _packet()
+    account = build_account("Acme Haulage", [packet])
+    rules = AppetiteRules(open_incurred_ceiling=Decimal("2000.00"))
+    book = load_workbook(BytesIO(account_triage_to_bytes(account, rules)))
+    rows = [row for row in book["Triage Flags"].iter_rows(min_row=2, values_only=True)]
+    (t01,) = [f for f in evaluate_appetite(account, rules) if f.rule == T01_OPEN_INCURRED]
+    # both runs of the packet recorded the claim, so the merged flag carries
+    # both appearances and the sheet writes one row per source
+    assert len(t01.sources) == 2
+    t01_rows = [row for row in rows if row[0] == T01_OPEN_INCURRED]
+    assert len(t01_rows) == len(t01.sources)
+    by_run = {row[7]: row for row in t01_rows}
+    assert set(by_run) == {source.run_id for source in t01.sources}
+    for source in t01.sources:
+        rule, severity, claims, evaluated, reason, not_evaluated, \
+            source_file, run_id, page, row_id, claim_number = by_run[source.run_id]
+        assert rule == "T-01 open-incurred-ceiling"
+        assert severity == "WARN"
+        # the workbook stores booleans as "Yes"/"No" via TextPolicy
+        assert evaluated == "Yes"
+        assert claims == "100"
+        assert not_evaluated is None
+        # provenance is the appearance the flag was computed from, verbatim
+        assert source_file == source.source_filename == "packet.pdf"
+        assert page == source.page
+        assert row_id == source.row_id
+        assert claim_number == source.claim_number == "100"
+    current = t01.sources[-1]
+    assert current.run_id == "run-2" and current.page == 2 and current.row_id == "p2r2"
+
+
+def test_flag_with_two_sources_writes_two_rows():
+    account = _rich_account()
+    book = load_workbook(BytesIO(account_triage_to_bytes(account, RICH_RULES)))
+    (t02,) = [f for f in evaluate_appetite(account, RICH_RULES) if f.rule == T02_TERM_COUNT]
+    assert len(t02.sources) == 2
+    rows = [row for row in book["Triage Flags"].iter_rows(min_row=2, values_only=True)]
+    t02_rows = [row for row in rows if row[0] == T02_TERM_COUNT]
+    assert len(t02_rows) == 2
+    assert {(row[6], row[9]) for row in t02_rows} == {
+        (source.source_filename, source.row_id) for source in t02.sources
+    }
+    assert all(row[3] == "Yes" for row in t02_rows)
+
+
+def test_bare_rules_show_not_evaluated_loudly():
+    account = _rich_account()
+    book = load_workbook(BytesIO(account_triage_to_bytes(account, AppetiteRules())))
+    notes = [
+        row[0] for row in book["Not Evaluated"].iter_rows(min_row=2, values_only=True)
+        if row[0]
+    ]
+    assert len([note for note in notes if "not configured" in note]) == 3
+    rows = [row for row in book["Triage Flags"].iter_rows(min_row=2, values_only=True)]
+    unevaluated = [row for row in rows if row[3] == "No"]
+    assert len(unevaluated) == 3
+    for row in unevaluated:
+        assert row[5] and "not configured" in row[5]
+        # no provenance can exist for a rule that never evaluated
+        assert row[6] is None and row[7] is None and row[8] is None \
+            and row[9] is None and row[10] is None
+
+
+def test_per_term_table_rows_match_account_periods():
+    account = _rich_account()
+    book = load_workbook(BytesIO(account_triage_to_bytes(account, RICH_RULES)))
+    rows = [row for row in book["Triage Summary"].iter_rows(values_only=True)]
+    header_index = next(i for i, row in enumerate(rows) if row[0] == "Term")
+    term_rows = []
+    for row in rows[header_index + 1:]:
+        if row[0] is None or row[0] == "Coverage period gaps":
+            break
+        term_rows.append(row)
+    assert {row[0] for row in term_rows} == {p.label for p in account.periods}
+    for row in term_rows:
+        period = next(p for p in account.periods if p.label == row[0])
+        assert row[3] == period.claims
+        assert row[4] == period.open_claims
+        assert row[5] == period.closed_claims
+        assert row[9] == float(period.totals["incurred_total"])
+    # the 2023 term's counts and incurred total appear verbatim
+    row_2023 = next(row for row in term_rows if row[0] == "2023-01-01 to 2023-12-31")
+    assert row_2023[3] == 2
+    assert row_2023[9] == 4500.0
+
+
+def test_period_gaps_appear_only_when_present():
+    gapped_one = _run("a.pdf", date(2023, 12, 31),
+                      [_claim("C-1", date(2023, 5, 1), "1000.00")], periods=[TERM_2023])
+    gapped_two = _run("b.pdf", date(2025, 12, 31),
+                      [_claim("C-2", date(2025, 3, 1), "2000.00")], periods=[TERM_2025])
+    gapped = build_account("Acme Haulage", [gapped_one, gapped_two])
+    (gap,) = triage_summary(gapped, AppetiteRules()).period_gaps
+    book = load_workbook(BytesIO(account_triage_to_bytes(gapped, AppetiteRules())))
+    cells = [cell for row in book["Triage Summary"].iter_rows(values_only=True) for cell in row]
+    assert gap in cells
+
+    short = _run("short.pdf", date(2023, 12, 31),
+                 [_claim("C-1", date(2023, 5, 1), "1000.00")], periods=[TERM_2023])
+    long_ = _run("long.pdf", date(2025, 12, 31),
+                 [_claim("C-2", date(2024, 6, 1), "2000.00")],
+                 periods=[(date(2023, 6, 1), date(2025, 6, 30))])
+    contiguous = build_account("Acme Haulage", [short, long_])
+    assert triage_summary(contiguous, AppetiteRules()).period_gaps == ()
+    book = load_workbook(BytesIO(account_triage_to_bytes(contiguous, AppetiteRules())))
+    cells = [cell for row in book["Triage Summary"].iter_rows(values_only=True) for cell in row]
+    assert not any(isinstance(cell, str) and "coverage gap" in cell for cell in cells)
