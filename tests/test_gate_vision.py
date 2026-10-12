@@ -169,6 +169,7 @@ def test_the_seal_accepts_a_consistent_vision_group():
     {"answered": [1, 4]},                       # answered but never requested
     {"missing": [9]},                           # missing but never requested
     {"unusable": [1]},                          # unusable and answered at once
+    {"missing": [1, 2]},                        # missing and answered at once
     {"requested": [1, 1, 2, 3]},                # requested twice
     {"replay": False},                          # pages requested without a replay
     {"requested": [3, 2, 1]},                   # out of order

@@ -376,7 +376,8 @@ class Sealer:
         if len(asked) != len(requested) or not replay and requested:
             raise Rejected("vision pages requested twice, or without a replay")
         parts = (set(answered), set(missing), set(unusable))
-        if any(not part <= asked for part in parts) or set(unusable) & (parts[0] | parts[1]):
+        if any(not part <= asked for part in parts) or parts[0] & parts[1] \
+                or parts[2] & (parts[0] | parts[1]):
             raise Rejected("vision pages outside what was requested")
         return {
             "replay": replay,
