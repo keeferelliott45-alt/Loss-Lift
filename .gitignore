@@ -9,3 +9,6 @@ uploads/
 
 # Local operational telemetry (counts only, never document content)
 data/telemetry/
+
+# Built demo pack (python -m demo.build)
+demo/out/
