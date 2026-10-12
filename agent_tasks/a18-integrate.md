@@ -55,8 +55,8 @@ state whether each is pre-existing on main (Windows/env) or caused by the merge.
   manifest/allowlist/labels/golden edits; do not touch other worktrees.
 
 ## Environment
-- Python: `C:\Users\keefe\AppData\Local\Python\pythoncore-3.14-64\python.exe`
-- pytest basetemp: `--basetemp=C:\Users\keefe\AppData\Local\Temp\kilo\pytest-a18`
+- Python: the local Python 3.14 interpreter with every dependency installed (`py -3`)
+- pytest basetemp: `--basetemp=%TEMP%\kilo\pytest-a18` (fresh per run)
 - PR #18 head sha: `597ff9dd12c1c5cdda32b4dbe7f5fbfed3993241`
 
 ## Handoff

@@ -43,7 +43,7 @@ Gate approvals for other commits do not transfer to this batch.
 
 ## Windows execution
 
-Python: `C:/Users/keefe/AppData/Local/Python/pythoncore-3.14-64/python.exe`.
+Python: the local Python 3.14 interpreter with every dependency installed (`py -3`).
 Use task-owned TEMP/TMP and explicit pytest basetemp paths. Git Bash needs
 its usr/bin and mingw64/bin on PATH; use explicit safe.directory entries for
 the task worktree, not changes to global Git trust. Environment failures
