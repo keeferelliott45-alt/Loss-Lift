@@ -26,6 +26,8 @@ from typing import Any
 from uuid import uuid4
 
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+#: The most pages one PDF may have, on every intake path.
+MAX_PDF_PAGES = 1000
 PDF_MAGIC = b"%PDF-"
 XLSX_MAGIC = b"PK\x03\x04"
 #: Every OOXML workbook carries this part; a zip without it is not a workbook.
@@ -126,6 +128,53 @@ def _kind_for(filename: str, sniffed: str) -> str:
     return declared
 
 
+class PreflightReason(str, Enum):
+    """Why a PDF was refused before it was staged. Fixed codes, stable to log."""
+
+    EMPTY = "empty"
+    TOO_LARGE = "too_large"
+    NOT_PDF = "not_pdf"
+    DAMAGED = "damaged"
+    NO_PAGES = "no_pages"
+    PASSWORD = "password"
+    TOO_MANY_PAGES = "too_many_pages"
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return self.value
+
+
+#: The sentence shown for each refusal. Nothing the file or its sender chose --
+#: a name, a path, parser output -- is ever part of one; the only values filled
+#: in are limits LossLift itself set.
+PREFLIGHT_MESSAGES = {
+    PreflightReason.EMPTY: "It is empty. Upload the PDF again.",
+    PreflightReason.TOO_LARGE: ("It is larger than the {limit} MB limit for one PDF. "
+                                "Split the document and retry."),
+    PreflightReason.NOT_PDF: "It is not a PDF. Loss runs must be uploaded as PDF files.",
+    PreflightReason.DAMAGED: "It could not be opened as a PDF; the file may be damaged.",
+    PreflightReason.NO_PAGES: "It has no pages to read.",
+    PreflightReason.PASSWORD: "It is password-protected. Upload an unprotected copy.",
+    PreflightReason.TOO_MANY_PAGES: "It has more than the {limit}-page limit for one PDF.",
+}
+
+
+class PdfPreflightError(IngestError):
+    """A PDF refused by :func:`preflight_pdf`. An ``IngestError``, so every
+    existing handler still catches it; ``reason`` says which check refused it."""
+
+    def __init__(self, reason: PreflightReason, *, limit: int | None = None) -> None:
+        self.reason = reason
+        super().__init__(PREFLIGHT_MESSAGES[reason].format(limit=limit))
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """What the checks established about a PDF they accepted."""
+
+    size_bytes: int
+    page_count: int
+
+
 class DiscardOutcome(str, Enum):
     """What happened when a staged file was discarded."""
 
@@ -196,6 +245,8 @@ class IngestedFile:
     ingested_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    #: Pages counted by the preflight when the file was staged.
+    page_count: int | None = None
 
     @property
     def exists(self) -> bool:
@@ -212,6 +263,115 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Preflight: the one set of checks every intake path applies
+# --------------------------------------------------------------------------
+
+
+def _check_size(size: int, max_bytes: int) -> None:
+    if size == 0:
+        raise PdfPreflightError(PreflightReason.EMPTY)
+    if size > max_bytes:
+        raise PdfPreflightError(PreflightReason.TOO_LARGE, limit=max_bytes // (1024 * 1024))
+
+
+def _check_magic(head: bytes) -> None:
+    if not head.startswith(PDF_MAGIC):
+        raise PdfPreflightError(PreflightReason.NOT_PDF)
+
+
+def _held_to_pdf_preflight(head: bytes, filename: str) -> bool:
+    """Whether an upload is checked as a PDF: its bytes say so, or its name
+    does. A file named .pdf that is not one is refused as not a PDF, with the
+    preflight's fixed reason, rather than sniffed as something else."""
+    return head.startswith(PDF_MAGIC) or Path(filename).suffix.lower() == ".pdf"
+
+
+def _check_sheet_size(filename: str, size: int, max_bytes: int) -> None:
+    if size == 0:
+        raise IngestError(f"{Path(filename).name} is empty. Upload the document again.")
+    if size > max_bytes:
+        raise IngestError(
+            f"{Path(filename).name} is {size / 1e6:.0f} MB. The limit is "
+            f"{max_bytes / 1e6:.0f} MB — split the document and retry."
+        )
+
+
+def _check_structure(source: bytes | Path, max_pages: int) -> int:
+    """Open the PDF and count its pages; refuse what cannot be read.
+
+    Only a password needed to *open* the file refuses it. An owner password
+    (print or copy restrictions) is common on carrier PDFs and does not stop
+    reading. Parser detail is never surfaced: every failure is one fixed
+    reason.
+    """
+    import pymupdf
+
+    try:
+        if isinstance(source, Path):
+            document = pymupdf.open(source, filetype="pdf")
+        else:
+            document = pymupdf.open(stream=source, filetype="pdf")
+    except Exception:  # noqa: BLE001 - parser detail is never shown
+        raise PdfPreflightError(PreflightReason.DAMAGED) from None
+    with document:
+        try:
+            if document.needs_pass:
+                raise PdfPreflightError(PreflightReason.PASSWORD)
+            pages = document.page_count
+            repaired = bool(getattr(document, "is_repaired", False))
+        except PdfPreflightError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise PdfPreflightError(PreflightReason.DAMAGED) from None
+    if pages == 0:
+        # A file MuPDF had to rebuild into nothing is damaged; one that says
+        # plainly it has no pages is empty of pages.
+        raise PdfPreflightError(
+            PreflightReason.DAMAGED if repaired else PreflightReason.NO_PAGES)
+    if pages > max_pages:
+        raise PdfPreflightError(PreflightReason.TOO_MANY_PAGES, limit=max_pages)
+    return pages
+
+
+def preflight_pdf(
+    data: bytes,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> PreflightResult:
+    """Every check a PDF must pass before it is staged, on the bytes themselves.
+
+    Raises :class:`PdfPreflightError` (an ``IngestError``) with a fixed reason.
+    The cheap checks run first: size and the ``%PDF-`` signature before the
+    file is opened at all.
+    """
+    _check_size(len(data), max_bytes)
+    _check_magic(data[: len(PDF_MAGIC)])
+    pages = _check_structure(data, max_pages)
+    return PreflightResult(size_bytes=len(data), page_count=pages)
+
+
+def preflight_pdf_path(
+    path: str | Path,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> PreflightResult:
+    """The same checks as :func:`preflight_pdf`, on a file LossLift staged.
+
+    Meant for a verified snapshot, never for a caller's path that could still
+    change: :func:`ingest_path` runs it on its own copy.
+    """
+    target = Path(path)
+    size = target.stat().st_size
+    _check_size(size, max_bytes)
+    with target.open("rb") as handle:
+        _check_magic(handle.read(len(PDF_MAGIC)))
+    pages = _check_structure(target, max_pages)
+    return PreflightResult(size_bytes=size, page_count=pages)
 
 
 def _read_owner_marker(directory: Path) -> dict[str, dict[str, str]]:
@@ -401,6 +561,9 @@ def stage_and_run(
     filename: str,
     run: Any,
     workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
 ) -> tuple[IngestedFile, Any]:
     """Stage an upload, run the pipeline, and never orphan the file on failure.
 
@@ -409,7 +572,7 @@ def stage_and_run(
     file behind. On success ownership passes to the caller, which discards it
     after export, on delete, or when the document leaves the queue.
     """
-    staged = ingest(data, filename, workdir)
+    staged = ingest(data, filename, workdir, max_bytes=max_bytes, max_pages=max_pages)
     try:
         result = run(staged)
     except BaseException:
@@ -478,16 +641,24 @@ def ingest(
     data: bytes,
     filename: str,
     workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
 ) -> IngestedFile:
-    """Validate, hash and stage an uploaded PDF, XLSX or CSV loss run."""
-    if not data:
-        raise IngestError(f"{filename} is empty. Upload the document again.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise IngestError(
-            f"{filename} is {len(data) / 1e6:.0f} MB. The limit is "
-            f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
-        )
-    kind = _kind_for(filename, sniff_kind(data))
+    """Validate, hash and stage an uploaded PDF, XLSX or CSV loss run.
+
+    The bytes are checked before anything is written, so a refused file never
+    touches the disk. Anything that is, or is named, a PDF passes
+    :func:`preflight_pdf` in full; a spreadsheet is sized and sniffed.
+    """
+    if _held_to_pdf_preflight(data[: len(PDF_MAGIC)], filename):
+        checked = preflight_pdf(data, max_bytes=max_bytes, max_pages=max_pages)
+        kind = _kind_for(filename, "pdf")
+        page_count: int | None = checked.page_count
+    else:
+        _check_sheet_size(filename, len(data), max_bytes)
+        kind = _kind_for(filename, sniff_kind(data))
+        page_count = None
 
     owns_directory = not bool(workdir)
     directory = (
@@ -523,11 +694,23 @@ def ingest(
         size_bytes=len(data),
         kind=kind,
         owns_directory=owns_directory,
+        page_count=page_count,
     )
 
 
-def ingest_path(path: str | Path, workdir: str | Path | None = None) -> IngestedFile:
-    """Snapshot an existing PDF, XLSX or CSV without trusting a changing pathname."""
+def ingest_path(
+    path: str | Path,
+    workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> IngestedFile:
+    """Snapshot an existing PDF, XLSX or CSV without trusting a changing pathname.
+
+    Size and kind are checked on the open handle before copying. The
+    structural checks run on the verified snapshot, never on the caller's
+    path, so what was checked is exactly what will be read.
+    """
     source = Path(path).resolve()
     directory: Path | None = None
     temporary_target: Path | None = None
@@ -536,16 +719,17 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
-            if identity.size == 0:
-                raise IngestError(f"{source.name} is empty. Upload the document again.")
-            if identity.size > MAX_UPLOAD_BYTES:
-                raise IngestError(
-                    f"{source.name} is {identity.size / 1e6:.0f} MB. The limit is "
-                    f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
-                )
-            data = source_handle.read(MAX_UPLOAD_BYTES + 1)
-            kind = _kind_for(source.name, sniff_kind(data))
+            head = source_handle.read(len(PDF_MAGIC))
             source_handle.seek(0)
+            pdf = _held_to_pdf_preflight(head, source.name)
+            if pdf:
+                _check_size(identity.size, max_bytes)
+                _check_magic(head)
+                kind = _kind_for(source.name, "pdf")
+            else:
+                _check_sheet_size(source.name, identity.size, max_bytes)
+                kind = _kind_for(source.name, sniff_kind(source_handle.read(max_bytes + 1)))
+                source_handle.seek(0)
 
             owns_directory = not bool(workdir)
             directory = (
@@ -578,6 +762,13 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                     "Run the extraction again."
                 )
 
+        # The snapshot is verified; check it, not the path it came from. A
+        # refusal here is cleaned up by the handler below like any failure.
+        checked = (
+            preflight_pdf_path(temporary_target, max_bytes=max_bytes, max_pages=max_pages)
+            if pdf
+            else None
+        )
         _write_owner_marker(directory, temporary_target, document_id, digest)
         target = temporary_target
         temporary_target = None
@@ -591,6 +782,7 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
             owns_directory=owns_directory,
             source_path=source,
             source_identity=identity,
+            page_count=checked.page_count if checked is not None else None,
         )
     except BaseException:
         if temporary_target is not None and temporary_target_created:
