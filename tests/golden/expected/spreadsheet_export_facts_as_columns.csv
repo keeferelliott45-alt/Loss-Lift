@@ -1,0 +1,6 @@
+claim_number,date_of_loss,claim_status,claimant_name,paid_total,reserve_total,recovery_total,incurred_total
+GP-24-0101,2024-02-06,OPEN,"Vance, Rita",7150.00,14000.00,,21150.00
+GP-24-0102,2024-04-18,CLOSED,"Okafor, Ben",1325.00,,,1325.00
+GP-24-0103,2024-06-02,OPEN,"Silva, Marco",26100.00,36500.00,,62600.00
+GP-24-0104,2024-09-15,CLOSED,"Tran, Linh",875.00,,300.00,575.00
+GP-24-0105,2024-11-28,REOPENED,"Wu, Danielle",5070.00,10500.00,,15570.00

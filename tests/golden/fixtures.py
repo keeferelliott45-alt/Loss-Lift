@@ -22,12 +22,38 @@ D = Decimal
 
 @dataclass(frozen=True)
 class Column:
-    """One printed column and the canonical field it carries."""
+    """One printed column and the canonical field it carries.
+
+    ``fact`` is for a spreadsheet-style export: a column that repeats one
+    document-level fact (the company, the insured, the policy, its term) on
+    every claim instead of stating it in a letterhead. It carries no claim
+    field and holds the same literal text on every row.
+    """
 
     label: str
     field: str | None
     align: str = "left"
     width: float = 58.0
+    fact: str | None = None
+
+
+@dataclass(frozen=True)
+class RunSection:
+    """One logical run of a board packet.
+
+    A board packet binds several carriers' loss runs into one document. Each
+    run prints its own letterhead facts, its own rows, and its own footer,
+    which must tie to that run's rows and to nothing else.
+    """
+
+    carrier: str
+    named_insured: str
+    policy_number: str
+    policy_period: tuple[date, date]
+    valuation_date: date
+    line_of_business: str
+    claims: tuple[dict[str, Any], ...]
+    report_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +103,13 @@ class Fixture:
     print_claim_count: bool = True
     total_label: str = "TOTALS"
     landscape: bool = True
+    #: Spreadsheet-style export: a title band instead of a letterhead, with
+    #: the document's facts repeated as columns on every claim.
+    spreadsheet: bool = False
+    #: When set, the document is a board packet: one page per section, each
+    #: with its own letterhead facts, rows and footer. ``claims`` holds every
+    #: section's rows concatenated.
+    sections: tuple[RunSection, ...] = ()
 
     @property
     def money_fields(self) -> tuple[str, ...]:
@@ -572,8 +605,155 @@ UNKNOWN_FORMAT = Fixture(
 
 
 # --------------------------------------------------------------------------
-# Carrier layouts that broke the pipeline in QA (bug report, fixtures 1-4)
-#
+# Real-world export shapes from the go-to-market risk list
+# --------------------------------------------------------------------------
+
+_SPREADSHEET_COLUMNS = (
+    Column("Company", None, fact="Granite Peak Specialty"),
+    Column("Insured", None, fact="Boulder Outfitters LLC"),
+    Column("Policy Number", None, fact="GP-441027-24"),
+    Column("Effective Date", None, fact="01/01/2024"),
+    Column("Expiry Date", None, fact="12/31/2024"),
+    Column("Currency", None, fact="USD"),
+    Column("Claim Number", "claim_number", width=76),
+    Column("Loss Date", "date_of_loss", width=62),
+    Column("Status", "claim_status", width=44),
+    Column("Claimant", "claimant_name", width=88),
+    Column("Paid", "paid_total", align="right", width=66),
+    Column("Reserve", "reserve_total", align="right", width=66),
+    Column("Recovery", "recovery_total", align="right", width=62),
+    Column("Total Incurred", "incurred_total", align="right", width=72),
+)
+
+
+SPREADSHEET_EXPORT = Fixture(
+    name="spreadsheet_export_facts_as_columns",
+    description=(
+        "Spreadsheet-style export: no letterhead, the company, insured, "
+        "policy, term and currency repeat as columns on every claim"
+    ),
+    carrier="Granite Peak Specialty",
+    named_insured="Boulder Outfitters LLC",
+    policy_number="GP-441027-24",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    columns=_SPREADSHEET_COLUMNS,
+    spreadsheet=True,
+    report_title="CLAIM LISTING",
+    claims=(
+        _totalled("GP-24-0101", date(2024, 2, 6), date(2024, 2, 9), "Open",
+                  indemnity=D("6300.00"), expense=D("850.00"),
+                  res_indemnity=D("12000.00"), res_expense=D("2000.00"),
+                  claimant="Vance, Rita", description="Deck collapse injury"),
+        _totalled("GP-24-0102", date(2024, 4, 18), date(2024, 4, 18), "Closed",
+                  indemnity=D("1150.00"), expense=D("175.00"),
+                  claimant="Okafor, Ben", description="Rented gear damage"),
+        _totalled("GP-24-0103", date(2024, 6, 2), date(2024, 6, 11), "Open",
+                  indemnity=D("22000.00"), expense=D("4100.00"),
+                  res_indemnity=D("30000.00"), res_expense=D("6500.00"),
+                  claimant="Silva, Marco", description="Guided party fall"),
+        _totalled("GP-24-0104", date(2024, 9, 15), date(2024, 9, 16), "Closed",
+                  indemnity=D("780.00"), expense=D("95.00"),
+                  recovery=D("300.00"),
+                  claimant="Tran, Linh", description="Vehicle door contact"),
+        _totalled("GP-24-0105", date(2024, 11, 28), date(2024, 12, 2), "Reopened",
+                  indemnity=D("4450.00"), expense=D("620.00"),
+                  res_indemnity=D("9000.00"), res_expense=D("1500.00"),
+                  claimant="Wu, Danielle", description="Trail sign dispute"),
+    ),
+)
+
+
+def _packet_section(
+    carrier: str,
+    policy_number: str,
+    claims: tuple[dict[str, Any], ...],
+    line_of_business: str,
+    *,
+    valuation: date = date(2024, 12, 31),
+    period: tuple[date, date] = (date(2024, 1, 1), date(2024, 12, 31)),
+    report_title: str | None = None,
+) -> RunSection:
+    return RunSection(
+        carrier=carrier,
+        named_insured="Harborline Charters Inc",
+        policy_number=policy_number,
+        policy_period=period,
+        valuation_date=valuation,
+        line_of_business=line_of_business,
+        claims=claims,
+        report_title=report_title,
+    )
+
+
+_PACKET_RUN_ONE = (
+    _totalled("CM-24-0301", date(2024, 2, 11), date(2024, 2, 14), "Open",
+              indemnity=D("8200.00"), expense=D("1100.00"),
+              res_indemnity=D("15000.00"), res_expense=D("2500.00"),
+              claimant="Dockside Marina", description="Fender system failure"),
+    _totalled("CM-24-0302", date(2024, 5, 20), date(2024, 5, 22), "Closed",
+              indemnity=D("2380.00"), expense=D("420.00"),
+              recovery=D("600.00"),
+              claimant="Reyes, Tomas", description="Fuel dock spill"),
+    _totalled("CM-24-0303", date(2024, 8, 9), date(2024, 8, 12), "Open",
+              indemnity=D("15600.00"), expense=D("2900.00"),
+              res_indemnity=D("22000.00"), res_expense=D("4800.00"),
+              claimant="Pelham, George", description="Grounding at inlet"),
+)
+
+_PACKET_RUN_TWO = (
+    _totalled("MOC-9021", date(2024, 3, 4), date(2024, 3, 7), "Open",
+              indemnity=D("4200.00"), expense=D("680.00"),
+              res_indemnity=D("11000.00"), claimant="Ito, Kenji",
+              description="Crew injury during haul"),
+    _totalled("MOC-9022", date(2024, 7, 19), date(2024, 7, 21), "Closed",
+              indemnity=D("940.00"), expense=D("130.00"),
+              claimant="Byrne, Aoife", description="Slime line slip"),
+)
+
+_PACKET_RUN_THREE = (
+    _totalled("TBU-5501", date(2024, 4, 2), date(2024, 4, 5), "Open",
+              indemnity=D("10800.00"), expense=D("1900.00"),
+              res_indemnity=D("17000.00"), res_expense=D("3100.00"),
+              claimant="Voss, Hilda", description="Storm mooring damage"),
+    _totalled("TBU-5502", date(2024, 10, 6), date(2024, 10, 8), "Closed",
+              indemnity=D("1620.00"), expense=D("240.00"),
+              claimant="Nakamura, Ryu", description="Chart table claim"),
+    _totalled("TBU-5503", date(2024, 11, 25), date(2024, 11, 27), "Open",
+              indemnity=D("0.00"), expense=D("310.00"),
+              res_indemnity=D("6500.00"), claimant="Adler, Jon",
+              description="Salvage lien dispute"),
+)
+
+
+BOARD_PACKET = Fixture(
+    name="board_packet_per_run_totals",
+    description=(
+        "Board packet: three carriers' loss runs bound into one document, "
+        "one page each, every run's own footer tying to its own rows"
+    ),
+    carrier="Cascadia Marine Insurance",
+    named_insured="Harborline Charters Inc",
+    policy_number="CM-712304-24",
+    policy_period=(date(2024, 1, 1), date(2024, 12, 31)),
+    valuation_date=date(2024, 12, 31),
+    line_of_business="GL",
+    columns=_GL_COLUMNS,
+    claims=(
+        *_PACKET_RUN_ONE,
+        *_PACKET_RUN_TWO,
+        *_PACKET_RUN_THREE,
+    ),
+    sections=(
+        _packet_section("Cascadia Marine Insurance", "CM-712304-24", _PACKET_RUN_ONE, "GL"),
+        _packet_section("Meridian Ocean Casualty", "MOC-88512-24", _PACKET_RUN_TWO, "AUTO"),
+        _packet_section("Tidewater Bloom Underwriters", "TBU-4471", _PACKET_RUN_THREE, "PROP"),
+    ),
+)
+
+
+
 # Each of these reproduces a document that produced a false finding or lost
 # every row, so the defect stays fixed.
 # --------------------------------------------------------------------------
@@ -1057,6 +1237,8 @@ ALL_FIXTURES: tuple[Fixture, ...] = (
     DIRTY_AVALANCHE,
     STRESS_OBSCURE_EU_CREDIT,
     UNKNOWN_FORMAT,
+    SPREADSHEET_EXPORT,
+    BOARD_PACKET,
     SCANNED,
 )
 

@@ -22,7 +22,7 @@ from typing import Any, Sequence
 
 import pymupdf
 
-from tests.golden.fixtures import ALL_FIXTURES, Column, Fixture
+from tests.golden.fixtures import ALL_FIXTURES, Column, Fixture, RunSection
 
 EXPECTED_DIR = Path(__file__).parent / "expected"
 
@@ -104,7 +104,7 @@ def money_cell(value: Decimal, fixture: Fixture, field_name: str = "") -> str:
 def cell_text(fixture: Fixture, claim: dict[str, Any], column: Column) -> str:
     """What this cell prints, honouring any per-row display override."""
     if column.field is None:
-        return ""
+        return column.fact or ""
     override = claim.get(f"{column.field}_display")
     if override is not None:
         return str(override)
@@ -260,14 +260,37 @@ def _draw_row(
         _draw(page, text, x, y, fixture.font, size, bold, embedded)
 
 
-def _draw_document_header(page, fixture: Fixture, size: float, page_no: int, pages: int) -> float:
+def _draw_document_header(
+    page, fixture: Fixture, size: float, page_no: int, pages: int,
+    *, section: RunSection | None = None,
+) -> float:
     """Carrier block at the top of every page; returns the first table y."""
     font = fixture.font
     embedded = font_files(fixture)
+    if fixture.spreadsheet:
+        y = MARGIN + 10
+        title = fixture.report_title or "CLAIM LISTING"
+        _draw(page, title, MARGIN, y, font, size + 1, bold=True, embedded=embedded)
+        right = (PORTRAIT_SIZE if not fixture.landscape else PAGE_SIZE)[0] - MARGIN
+        label = f"Page {page_no} of {pages}"
+        _draw(page, label, right - _width(label, font, size, embedded[0]), y, font, size, embedded=embedded)
+        y += LINE_HEIGHT
+        valuation = format_date(fixture.valuation_date, fixture.date_format)
+        _draw(page, f"Valuation Date: {valuation}", MARGIN, y, font, size, embedded=embedded)
+        return MARGIN + 48.0
+
+    carrier = section.carrier if section else fixture.carrier
+    named_insured = section.named_insured if section else fixture.named_insured
+    policy_number = section.policy_number if section else fixture.policy_number
+    policy_period = section.policy_period if section else fixture.policy_period
+    valuation_date = section.valuation_date if section else fixture.valuation_date
+    line_of_business = section.line_of_business if section else fixture.line_of_business
+
     y = MARGIN + 10
-    letterhead = fixture.carrier
-    if fixture.report_title:
-        letterhead = f"{fixture.carrier} - {fixture.report_title}"
+    letterhead = carrier
+    title = section.report_title if section else fixture.report_title
+    if title:
+        letterhead = f"{carrier} - {title}"
     _draw(page, letterhead, MARGIN, y, font, size + 3.5, bold=True, embedded=embedded)
     right = (PORTRAIT_SIZE if not fixture.landscape else PAGE_SIZE)[0] - MARGIN
     label = f"Page {page_no} of {pages}"
@@ -277,13 +300,13 @@ def _draw_document_header(page, fixture: Fixture, size: float, page_no: int, pag
     _draw(page, "LOSS RUN REPORT", MARGIN, y, font, size + 1, bold=True, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Named Insured: {fixture.named_insured}", MARGIN, y, font, size, embedded=embedded)
-    valuation = format_date(fixture.valuation_date, fixture.date_format)
+    _draw(page, f"Named Insured: {named_insured}", MARGIN, y, font, size, embedded=embedded)
+    valuation = format_date(valuation_date, fixture.date_format)
     _draw(page, f"Valuation Date: {valuation}", MARGIN + 340, y, font, size, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Policy Number: {fixture.policy_number}", MARGIN, y, font, size, embedded=embedded)
-    start, end = fixture.policy_period
+    _draw(page, f"Policy Number: {policy_number}", MARGIN, y, font, size, embedded=embedded)
+    start, end = policy_period
     period = (
         f"Policy Period: {format_date(start, fixture.date_format)} to "
         f"{format_date(end, fixture.date_format)}"
@@ -291,8 +314,13 @@ def _draw_document_header(page, fixture: Fixture, size: float, page_no: int, pag
     _draw(page, period, MARGIN + 340, y, font, size, embedded=embedded)
 
     y += LINE_HEIGHT
-    _draw(page, f"Line of Business: {fixture.line_of_business}", MARGIN, y, font, size, embedded=embedded)
-    _draw(page, f"Currency: {fixture.currency}", MARGIN + 340, y, font, size, embedded=embedded)
+    _draw(page, f"Line of Business: {line_of_business}", MARGIN, y, font, size, embedded=embedded)
+    if section is None:
+        # A packet's sections name their carrier, policy, term and line of
+        # business; a currency line printed on every page would be one more
+        # band word every run shares, which is how a packet's separate
+        # reports stop naming themselves apart.
+        _draw(page, f"Currency: {fixture.currency}", MARGIN + 340, y, font, size, embedded=embedded)
 
     return MARGIN + HEADER_BLOCK_HEIGHT
 
@@ -308,74 +336,120 @@ def _draw_rules(page, starts, widths, top: float, bottom: float, rows: int) -> N
         page.draw_line(pymupdf.Point(x, top), pymupdf.Point(x, bottom), width=0.4)
 
 
+def _totals_for(fixture: Fixture, claims: Sequence[dict[str, Any]]) -> dict[str, Decimal]:
+    """Footer totals summed from the canonical values being printed."""
+    totals: dict[str, Decimal] = {}
+    for field_name in fixture.money_fields:
+        values = [
+            claim[field_name] for claim in claims if claim.get(field_name) is not None
+        ]
+        if values:
+            totals[field_name] = sum(values, Decimal("0"))
+    return totals
+
+
+def _draw_table_page(
+    page,
+    fixture: Fixture,
+    size: float,
+    widths: Sequence[float],
+    starts: Sequence[float],
+    chunk: Sequence[dict[str, Any]],
+    *,
+    page_no: int,
+    pages: int,
+    section: RunSection | None = None,
+    last: bool = True,
+    count: int | None = None,
+) -> None:
+    y = _draw_document_header(page, fixture, size, page_no, pages, section=section)
+
+    header_y = y
+    _draw_row(
+        page, fixture, [column.label for column in fixture.columns],
+        starts, widths, y, size, bold=True,
+    )
+    # Underline the header the way carrier reports do.
+    page.draw_line(
+        pymupdf.Point(starts[0] - CELL_PAD, y + 3),
+        pymupdf.Point(starts[-1] + widths[-1] + CELL_PAD, y + 3),
+        width=0.6,
+    )
+    y += LINE_HEIGHT + 3
+
+    for claim in chunk:
+        _draw_row(
+            page, fixture,
+            [cell_text(fixture, claim, column) for column in fixture.columns],
+            starts, widths, y, size,
+        )
+        y += LINE_HEIGHT
+
+    if fixture.style == "ruled":
+        _draw_rules(page, starts, widths, header_y - LINE_HEIGHT + 4,
+                    y - LINE_HEIGHT + 4, len(chunk) + 1)
+
+    if not last:
+        return
+    y += 4
+    page.draw_line(
+        pymupdf.Point(starts[0] - CELL_PAD, y - LINE_HEIGHT + 4),
+        pymupdf.Point(starts[-1] + widths[-1] + CELL_PAD, y - LINE_HEIGHT + 4),
+        width=0.6,
+    )
+    if fixture.print_totals:
+        totals = _totals_for(fixture, chunk if section else fixture.claims)
+        row = []
+        for index, column in enumerate(fixture.columns):
+            if index == 0:
+                row.append(fixture.total_label)
+            elif column.field in totals:
+                row.append(money_cell(totals[column.field], fixture, column.field))
+            elif index == 1 and fixture.claim_count_in_totals_row:
+                row.append(f"{fixture.claim_count_label} {count if count is not None else len(chunk)}")
+            else:
+                row.append("")
+        _draw_row(page, fixture, row, starts, widths, y, size, bold=True)
+        y += LINE_HEIGHT
+    if fixture.print_claim_count and not fixture.claim_count_in_totals_row:
+        y += 4
+        _draw(
+            page,
+            f"{fixture.claim_count_label} {count if count is not None else len(chunk)}",
+            starts[0] + CELL_PAD, y, fixture.font, size, bold=True,
+            embedded=font_files(fixture),
+        )
+
+
 def render(fixture: Fixture, path: Path) -> Path:
     """Write one fixture to ``path`` and return it."""
     size, widths, starts = plan_layout(fixture)
     page_size = PAGE_SIZE if fixture.landscape else PORTRAIT_SIZE
-    chunks = [
-        fixture.claims[index : index + fixture.rows_per_page]
-        for index in range(0, len(fixture.claims), fixture.rows_per_page)
-    ] or [()]
-
     document = pymupdf.open()
-    for page_index, chunk in enumerate(chunks, start=1):
-        page = document.new_page(width=page_size[0], height=page_size[1])
-        y = _draw_document_header(page, fixture, size, page_index, len(chunks))
 
-        header_y = y
-        _draw_row(
-            page, fixture, [column.label for column in fixture.columns],
-            starts, widths, y, size, bold=True,
-        )
-        # Underline the header the way carrier reports do.
-        page.draw_line(
-            pymupdf.Point(starts[0] - CELL_PAD, y + 3),
-            pymupdf.Point(starts[-1] + widths[-1] + CELL_PAD, y + 3),
-            width=0.6,
-        )
-        y += LINE_HEIGHT + 3
-
-        for claim in chunk:
-            _draw_row(
-                page, fixture,
-                [cell_text(fixture, claim, column) for column in fixture.columns],
-                starts, widths, y, size,
+    if fixture.sections:
+        # A board packet: one page per run, each with its own letterhead
+        # facts, rows and footer, which must tie to that run's rows alone.
+        for section in fixture.sections:
+            page = document.new_page(width=page_size[0], height=page_size[1])
+            _draw_table_page(
+                page, fixture, size, widths, starts, section.claims,
+                page_no=1, pages=1, section=section, last=True,
+                count=len(section.claims),
             )
-            y += LINE_HEIGHT
-
-        if fixture.style == "ruled":
-            _draw_rules(page, starts, widths, header_y - LINE_HEIGHT + 4,
-                        y - LINE_HEIGHT + 4, len(chunk) + 1)
-
-        if page_index == len(chunks):
-            y += 4
-            page.draw_line(
-                pymupdf.Point(starts[0] - CELL_PAD, y - LINE_HEIGHT + 4),
-                pymupdf.Point(starts[-1] + widths[-1] + CELL_PAD, y - LINE_HEIGHT + 4),
-                width=0.6,
+    else:
+        chunks = [
+            fixture.claims[index : index + fixture.rows_per_page]
+            for index in range(0, len(fixture.claims), fixture.rows_per_page)
+        ] or [()]
+        for page_index, chunk in enumerate(chunks, start=1):
+            page = document.new_page(width=page_size[0], height=page_size[1])
+            _draw_table_page(
+                page, fixture, size, widths, starts, chunk,
+                page_no=page_index, pages=len(chunks),
+                section=None, last=page_index == len(chunks),
+                count=len(fixture.claims),
             )
-            if fixture.print_totals:
-                totals = fixture.printed_totals()
-                row = []
-                for index, column in enumerate(fixture.columns):
-                    if index == 0:
-                        row.append(fixture.total_label)
-                    elif column.field in totals:
-                        row.append(money_cell(totals[column.field], fixture, column.field))
-                    elif index == 1 and fixture.claim_count_in_totals_row:
-                        row.append(f"{fixture.claim_count_label} {len(fixture.claims)}")
-                    else:
-                        row.append("")
-                _draw_row(page, fixture, row, starts, widths, y, size, bold=True)
-                y += LINE_HEIGHT
-            if fixture.print_claim_count and not fixture.claim_count_in_totals_row:
-                y += 4
-                _draw(
-                    page,
-                    f"{fixture.claim_count_label} {len(fixture.claims)}",
-                    starts[0] + CELL_PAD, y, fixture.font, size, bold=True,
-                    embedded=font_files(fixture),
-                )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if fixture.scanned:
@@ -444,9 +518,31 @@ def expected_rows(fixture: Fixture) -> list[dict[str, str]]:
     return rows
 
 
+def _section_meta(fixture: Fixture) -> list[dict[str, Any]]:
+    """What each run of a board packet printed about itself and its footer."""
+    runs = []
+    for section in fixture.sections:
+        start, end = section.policy_period
+        runs.append({
+            "carrier": section.carrier,
+            "named_insured": section.named_insured,
+            "policy_number": section.policy_number,
+            "policy_period_start": start.isoformat(),
+            "policy_period_end": end.isoformat(),
+            "valuation_date": section.valuation_date.isoformat(),
+            "line_of_business": section.line_of_business,
+            "claim_count": len(section.claims),
+            "printed_totals": {
+                field: f"{value:.2f}"
+                for field, value in _totals_for(fixture, section.claims).items()
+            },
+        })
+    return runs
+
+
 def expected_meta(fixture: Fixture) -> dict[str, Any]:
     start, end = fixture.policy_period
-    return {
+    meta = {
         "name": fixture.name,
         "description": fixture.description,
         "carrier": fixture.carrier,
@@ -461,13 +557,16 @@ def expected_meta(fixture: Fixture) -> dict[str, Any]:
         "claim_count": len(fixture.claims),
         "printed_claim_count": len(fixture.claims) if fixture.print_claim_count else None,
         "printed_totals": (
-            {k: f"{v:.2f}" for k, v in fixture.printed_totals().items()}
-            if fixture.print_totals
+            {k: f"{v:.2f}" for k, v in _totals_for(fixture, fixture.claims).items()}
+            if fixture.print_totals and not fixture.sections
             else {}
         ),
         "scanned": fixture.scanned,
         "fields": expected_fields(fixture),
     }
+    if fixture.sections:
+        meta["runs"] = _section_meta(fixture)
+    return meta
 
 
 def write_expected(directory: Path = EXPECTED_DIR) -> list[Path]:

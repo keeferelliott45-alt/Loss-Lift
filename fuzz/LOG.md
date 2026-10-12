@@ -133,3 +133,47 @@ base.
 Next safe action (owner): decide whether to re-validate this harness against
 `4ca0d41` (a fresh worktree from that SHA), or pin PR #16's base to `230c0fc`.
 Do not rebase PR #9's branch.
+
+## Campaign 2 entry — 2026-10-12: account/triage hazard pack (K4)
+
+New post-extraction families in `tests/fuzz/account_triage.py`, served by the
+same campaign entry point:
+
+- `python -m tests.fuzz.run --family account --seed-start S --count N`
+- `python -m tests.fuzz.run --family triage --seed-start S --count N [--budget 10m]`
+- (equivalently `python -m tests.fuzz.account_triage_run --family both ...`)
+
+No PDF is rendered: account cases are truth-shaped logical runs fed to
+`core.account`, triage cases add an `AppetiteRules` configuration and check
+`core.intelligence`'s summary. The oracle reuses SAFE/SILENT/LOUD/UNNAMED;
+for triage, a check that cannot evaluate is SAFE only when
+`TriageSummary.not_evaluated` surfaces it, and SILENT when the summary
+presents it as passing. 0 SILENT is the pass bar. 600 seeded cases
+(300 per family) run in about 3 seconds.
+
+| Batch | Command | Cases | SAFE | SILENT | LOUD | UNNAMED | ERROR |
+|---|---|---|---|---|---|---|---|
+| both families | `--seed-start 0 --count 300` (per family) | 600 | 600 | 0 | 0 | 0 | 0 |
+| account via run.py | `--family account --seed-start 50000 --count 50` | 50 | 50 | 0 | 0 | 0 | 0 |
+| triage via run.py | `--family triage --seed-start 50000 --count 50` | 50 | 50 | 0 | 0 | 0 | 0 |
+
+Determinism: two identical runs of the same command produce identical
+tallies. Oracle soundness is pinned by hand-checked sabotage cases in
+`tests/test_fuzz_account_triage_smoke.py`.
+
+The `triage` family needs `core.intelligence` (branch `agent/kilo/triage-intel`);
+on branches without it the family reports a clear error and the account family
+still runs. The marathon lane should run this pack against the triage head.
+
+Deferred product observations (not fixed here; test/fixture-only lane):
+
+- `core.account._later_run_omits` probes identity, not presence: when a later
+  run *prints* the same claim number but leaves carrier or policy unstated,
+  the earlier history is reported dropped ("absent from a later run") even
+  though the number is present. The scenarios were shaped so this does not
+  masquerade as truth; worth a look on its own.
+- `core.intelligence._finish` merges duplicate flags by (rule, first claim):
+  when two histories share a claim number and one view cannot evaluate while
+  the other fires, the merged flag keeps `evaluated=True` and the
+  not-evaluated reason is lost from `not_evaluated`. Observed on the triage
+  head with a LOB-unattributable twin of a flagged claim.

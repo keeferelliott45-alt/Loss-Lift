@@ -4,9 +4,14 @@
     python -m tests.fuzz.run --family clean --seed-start 0 --count 60
     python -m tests.fuzz.run --family hostile --budget 20m --seed-start 60
     python -m tests.fuzz.run --case 12:wrong_total,duplicate_page
+    python -m tests.fuzz.run --family account --seed-start 0 --count 200
+    python -m tests.fuzz.run --family triage --seed-start 0 --count 200
 
 Every case is reproducible from ``(seed, operator list)``: the generator, the
-operator draw and the operator order are all derived from the seed.
+operator draw and the operator order are all derived from the seed. The
+``account`` and ``triage`` families run the post-extraction hazard pack
+(``tests.fuzz.account_triage``) instead of rendering PDFs; they accept the
+same seed, count, budget and reporting options and ignore the PDF-only ones.
 """
 
 from __future__ import annotations
@@ -29,7 +34,10 @@ from tests.fuzz import mutations
 from tests.fuzz.generator import Case, clean_case, render, scanned_payloads
 from tests.fuzz.oracle import LOUD, SAFE, SILENT, UNNAMED, classify
 
-FAMILIES = ("clean", "hostile")
+FAMILIES = ("clean", "hostile", "account", "triage")
+
+#: Families the account/triage pack serves; they need no PDF.
+NON_PDF_FAMILIES = ("account", "triage")
 
 
 def choose_operators(seed: int, max_ops: int = 3) -> tuple[str, ...]:
@@ -116,6 +124,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", type=str, default="")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.family in NON_PDF_FAMILIES:
+        # The account/triage pack takes seeds, counts and a budget; the
+        # PDF-only options mean nothing there and are not forwarded.
+        from tests.fuzz import account_triage_run
+
+        forward = ["--family", args.family, "--seed-start", str(args.seed_start)]
+        if args.count:
+            forward += ["--count", str(args.count)]
+        if args.budget:
+            forward += ["--budget", args.budget]
+        if args.verbose:
+            forward += ["--verbose"]
+        return account_triage_run.main(forward)
 
     if args.case:
         seed_text, _, ops_text = args.case.partition(":")
