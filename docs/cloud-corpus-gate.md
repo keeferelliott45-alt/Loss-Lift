@@ -110,11 +110,11 @@ it fails with exit 4. Land the requirement on `main` first.
 
 **What is left.** A candidate that sets out to leak can still choose what the
 published result says, within its schema. Per document that is: its state
-(unchanged, changed or failed: 2 bits), which of the 117 known schema fields
-changed (117 bits), the claim count before and after (each at most 1,000,000:
+(unchanged, changed or failed: 2 bits), which of the 126 known schema fields
+changed (126 bits), the claim count before and after (each at most 1,000,000:
 40 bits), the status and the review status before and after (`CLEAN`,
 `NEEDS_REVIEW` or `unlisted`: 8 bits), and which builtin exception each
-revision raised (about 14 bits). That is at most 181 bits, under 23 bytes, per
+revision raised (about 14 bits). That is at most 190 bits, under 24 bytes, per
 document per run, and only a run that
 fails the gate publishes anything beyond the state. The test suite measures
 this: candidates that encode document bytes and the salt as huge integers,

@@ -541,7 +541,90 @@ def _runs(
     }
 
 
-def measure(result: Any, digest: Digest) -> dict[str, Any]:
+#: The confidence a vision-read field may carry at most (spec stage 2b).
+VISION_CONFIDENCE_CAP = 0.85
+
+
+class VisionLedger:
+    """What a document's vision reader was asked for, and what it had to give.
+
+    Wraps the revision's replay extractor. Three facts about a requested page
+    are kept apart because they mean different things: a page *answered*
+    (the recording replayed into a table), a page whose recording is
+    *missing* (no answer was ever recorded for this document, page, model,
+    prompt and schema), and a page whose recording exists but could not be
+    *used*. A revision that changed the vision prompt or schema finds none of
+    the old recordings; that has to read as missing evidence, never as the
+    engine reading the scan differently.
+
+    Only page numbers and counts are kept. The recordings themselves are not
+    opened here.
+    """
+
+    def __init__(self, extractor: Callable[..., Any], directory: Path,
+                 key: Callable[..., str]) -> None:
+        self._extractor = extractor
+        self._directory = Path(directory)
+        self._key = key
+        self.reset()
+
+    def reset(self) -> None:
+        self.requested: set[int] = set()
+        self.answered: set[int] = set()
+        self.missing: set[int] = set()
+
+    def __call__(self, path: Any, pages: Any, *args: Any, **kwargs: Any) -> Any:
+        asked = {int(page) for page in pages}
+        self.requested |= asked
+        document = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for page in asked:
+            if not (self._directory / f"{self._key(document, page)}.json").is_file():
+                self.missing.add(page)
+        output = self._extractor(path, pages, *args, **kwargs)
+        self.answered |= {int(getattr(table, "page", 0) or 0)
+                          for table in (getattr(output, "tables", None) or output or [])}
+        return output
+
+
+def _vision(claims: list[Any], ledger: VisionLedger | None, digest: Digest) -> dict[str, Any]:
+    """How the scanned path was exercised, and whether its evidence was there.
+
+    ``replay`` says whether recorded answers were replayed at all; without
+    them a scanned page is skipped and every list here is empty. A claim's
+    method is the one it was read with (``read_method``, kept when a person
+    has since edited it), else ``source_method``. ``over_cap`` counts claims
+    read by vision whose confidence exceeds the cap -- an invariant, so
+    anything but zero is a change worth failing on.
+    """
+    methods: Counter[str] = Counter()
+    over_cap = 0
+    for claim in claims:
+        method = getattr(claim, "read_method", None) or getattr(claim, "source_method", None)
+        name = plain(method) if method is not None else "absent"
+        key = name if isinstance(name, str) and LOWER_TOKEN.fullmatch(name) else digest(name)
+        methods[key] += 1
+        if name == "vision":
+            confidence = getattr(claim, "confidence", None)
+            if isinstance(confidence, (int, float)) and confidence > VISION_CONFIDENCE_CAP:
+                over_cap += 1
+    requested = sorted(ledger.requested) if ledger is not None else []
+    missing = sorted(ledger.missing) if ledger is not None else []
+    answered = sorted(ledger.answered & ledger.requested) if ledger is not None else []
+    unusable = sorted(set(requested) - set(answered) - set(missing))
+    return {
+        "replay": ledger is not None,
+        "requested": requested,
+        "answered": answered,
+        "missing": missing,
+        "unusable": unusable,
+        "claims": dict(sorted(methods.items())),
+        "over_cap": over_cap,
+    }
+
+
+def measure(
+    result: Any, digest: Digest, *, vision: VisionLedger | None = None
+) -> dict[str, Any]:
     """Every privacy-safe measurement the gate compares, for one document.
 
     Every group is measured, or the document is not: a group that raises stops
@@ -574,6 +657,7 @@ def measure(result: Any, digest: Digest) -> dict[str, Any]:
         "runs": lambda: _runs(document, reconciliation, digest,
                               needs_mapping=bool(getattr(result, "needs_mapping", False))),
         "refused": lambda: _refused(document, digest),
+        "vision": lambda: _vision(claims, vision, digest),
     }
     try:
         claims.extend(getattr(document, "claims", None) or [])
@@ -631,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             from core.pipeline import run_pipeline
 
             vision: dict[str, Any] = {"use_vision": False}
+            ledger: VisionLedger | None = None
             if args.vision_replay is not None:
                 try:
                     from core.extract_vision import replay_extractor
@@ -638,8 +723,11 @@ def main(argv: list[str] | None = None) -> int:
                     # A revision that cannot replay would be measured without
                     # its scanned pages while the other is measured with them.
                     raise NotImplementedError("vision replay") from None
-                vision = {"use_vision": True,
-                          "vision_extractor": replay_extractor(args.vision_replay)}
+                from core.extract_vision import recording_key
+
+                ledger = VisionLedger(replay_extractor(args.vision_replay),
+                                      args.vision_replay, recording_key)
+                vision = {"use_vision": True, "vision_extractor": ledger}
         except Exception as error:  # noqa: BLE001 - the revision cannot start
             _write(handle, {"kind": "fatal", "error_type": error_name(error)})
             return 3
@@ -656,13 +744,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         for entry in documents:
             record: dict[str, Any] = {"kind": "document", "id": entry["id"]}
+            if ledger is not None:
+                ledger.reset()
             try:
                 result = run_pipeline(Path(entry["path"]), **vision)
             except Exception as error:  # noqa: BLE001 - recorded as a failure
                 record.update(ok=False, error_type=error_name(error))
             else:
                 try:
-                    record.update(ok=True, metrics=measure(result, digest))
+                    record.update(ok=True, metrics=measure(result, digest, vision=ledger))
                 except Unmeasured as failure:
                     record.update(
                         ok=False, error_type=failure.error_type, unmeasured=failure.group

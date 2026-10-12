@@ -59,8 +59,9 @@ PAGE_KEY = re.compile(r"0|[1-9][0-9]{0,4}")
 GROUPS = (
     "claim_count", "status", "extraction_method", "pages", "unplaced", "printed",
     "findings", "summary", "claims", "metadata", "warnings", "review_status", "runs",
-    "refused",
+    "refused", "vision",
 )
+VISION_KEYS = ("replay", "requested", "answered", "missing", "unusable", "claims", "over_cap")
 MAX_RUNS = 1_000
 BUILTIN_ERRORS = frozenset(
     name for name in dir(builtins)
@@ -74,6 +75,7 @@ MAP_PATHS = (
     "printed.totals", "findings.by_rule", "findings.by_rule_severity",
     "findings.by_rule_category", "findings.by_rule_scope", "findings.identity",
     "findings.detail", "claims.fields", "claims.null_counts", "refused.by_page",
+    "vision.claims",
 )
 #: Maps whose values are objects: the key (a run's position) collapses to
 #: ``*`` and the field beneath it is kept, so a change reads
@@ -363,6 +365,30 @@ class Sealer:
             "digest": self.digest(value["digest"]),
         }
 
+    def vision(self, value: Any) -> dict[str, Any]:
+        value = self.exact(value, VISION_KEYS)
+        replay = self.boolean(value["replay"])
+        requested = self.pages_list(value["requested"])
+        answered = self.pages_list(value["answered"])
+        missing = self.pages_list(value["missing"])
+        unusable = self.pages_list(value["unusable"])
+        asked = set(requested)
+        if len(asked) != len(requested) or not replay and requested:
+            raise Rejected("vision pages requested twice, or without a replay")
+        parts = (set(answered), set(missing), set(unusable))
+        if any(not part <= asked for part in parts) or parts[0] & parts[1] \
+                or parts[2] & (parts[0] | parts[1]):
+            raise Rejected("vision pages outside what was requested")
+        return {
+            "replay": replay,
+            "requested": requested,
+            "answered": answered,
+            "missing": missing,
+            "unusable": unusable,
+            "claims": self.mapped(value["claims"], MAX_NAMED_KEYS, self.name_key, self.integer),
+            "over_cap": self.integer(value["over_cap"]),
+        }
+
     def run_item(self, value: Any) -> dict[str, Any]:
         value = self.exact(value, RUN_ITEM_KEYS)
         return {
@@ -418,6 +444,7 @@ class Sealer:
             "review_status": self.token(value["review_status"], collect.UPPER_TOKEN),
             "runs": self.runs(value["runs"]),
             "refused": self.refused(value["refused"]),
+            "vision": self.vision(value["vision"]),
         }
 
     def document(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -535,7 +562,8 @@ def _read(path: Path, run: comparison.RevisionRun, manifest: Manifest) -> None:
 def _paths() -> tuple[str, ...]:
     paths = ["claim_count", "status", "extraction_method", "pages", "unplaced", "printed",
              "findings", "summary", "claims", "metadata", "warnings", "review_status", "runs",
-             "refused"]
+             "refused", "vision"]
+    paths += [f"vision.{name}" for name in VISION_KEYS]
     paths += [f"runs.{name}" for name in ("count", "packet", "unsettled", "incomplete", "items")]
     paths += [f"runs.items.*.{name}" for name in RUN_ITEM_KEYS]
     paths += [f"refused.{name}" for name in ("count", "reported", "by_page", "digest")]
