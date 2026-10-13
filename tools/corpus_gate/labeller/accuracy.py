@@ -94,8 +94,9 @@ def _add_value_row(bucket: dict[str, int], kind: str, extracted: str, truth: str
                 except (InvalidOperation, ValueError):
                     pass
         return
-    # An expected value. AGREE on an empty extraction is a stop, not a pass:
-    # "should be null" has its own word, and a blank is never agreement.
+    # An expected value. AGREE on an empty extraction is never a pass:
+    # "should be null" has its own word, and a blank is no agreement -- it is
+    # counted missing, so it lands in `wrong`, fail-closed.
     bucket["expected"] += 1
     if not extracted:
         bucket["missing"] += 1

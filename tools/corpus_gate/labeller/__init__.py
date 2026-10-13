@@ -26,11 +26,12 @@ Commands
 
         Read the adjudicated worksheets back, hash-verify the staged corpus
         copies again (refusing a document whose bytes no longer match the
-        manifest), validate the label schema (money as plain Decimal
+        manifest), validate the label schema (money as plain, finite Decimal
         strings, ISO dates, status/bool enums, AGREE/EMPTY tokens), refuse
-        enum-invalid truth and duplicate or unknown rows, and merge the
-        result into the truth file OUTSIDE the repository. Blank truth is
-        written as an explicit null: never agreement, never imputed.
+        non-finite money, enum-invalid truth, and duplicate or unknown rows,
+        and merge the result into the truth file OUTSIDE the repository.
+        Blank truth is written as an explicit null: never agreement, never
+        imputed.
 
     py -m tools.corpus_gate.labeller measure \
         --truth FILE --manifest FILE [--labels FILE] --out DIR [--repo DIR]
@@ -51,10 +52,11 @@ Privacy rules
 
 No corpus content, document text, or path to the owner's staging area may
 appear in this package or anything it writes inside the repository. The
-manifest, worksheets and truth file all live outside the repo, exactly like
-the corpus gate's manifest and labels; ``init`` and ``import`` refuse to
-write inside the working tree. The labeller never contacts the network and
-never runs a model.
+manifest, worksheets, truth file and labels all live outside the repo,
+exactly like the corpus gate's manifest and labels; ``init``, ``import`` and
+``measure`` refuse any named corpus, manifest, worksheet, truth, labels or
+report path inside the working tree. The labeller never contacts the network
+and never runs a model.
 
 Fail-closed rules
 -----------------
