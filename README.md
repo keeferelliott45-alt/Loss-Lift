@@ -195,8 +195,11 @@ The spec's own section 15 is the binding constraint, and it is not met yet:
    "walk me through how you handle loss runs today". If fewer than four
    describe it as a real recurring pain, the build does not start.
 
-Kill criteria: no pilot commitments by week 6, or fewer than three paying
-customers by week 10.
+Kill criteria (restated 2026-10, owner to confirm): three design partners
+sending real loss runs under NDA within 10–12 weeks of consistent outreach,
+and a first paid pilot, with a pre-agreed success metric and a budget line,
+within about six months. Pilots without a budget line do not count. See
+`CLAUDE.md` §15.
 
 ## Stack
 

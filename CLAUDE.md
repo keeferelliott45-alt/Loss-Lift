@@ -516,4 +516,10 @@ The spec is worthless if the premise is wrong. Two things first:
 1. **Get 10 real loss runs.** Ask your Marsh / Zurich / Munich Re contacts for anonymised or expired samples. Without real documents you'll build for imaginary formats and every assumption in §5 will be wrong.
 2. **Run the discovery calls.** Eight to twelve conversations asking only "walk me through how you handle loss runs today". If fewer than four describe it as a real recurring pain, the build doesn't start.
 
-Kill criteria: no pilot commitments by Week 6, or fewer than three paying customers by Week 10 — stop.
+**Kill criteria** (restated 2026-10, owner to confirm). Stop, or change the market, if any of these is missed:
+
+1. **10–12 weeks of consistent outreach → 3 design partners.** A design partner is a broker, wholesaler or MGA that has sent **real loss runs under NDA** and reviewed LossLift's output on them with us. Meetings, interest and deck requests do not count.
+2. **About 6 months → the first paid pilot.** One program or book, a flat monthly fee, and a success metric agreed in writing before it starts (for example: share of documents reconciled without re-keying, time per document, errors caught).
+3. **No pilot without a budget line.** A "pilot" with no named budget owner and no decision date does not count toward criterion 2. It is a design partnership with a 60-day limit. Pilots without a budget line are known to sit in limbo for 6–12 months.
+
+Engineering serves these criteria; it does not replace them. Building past the next design partner's documents is not progress on criterion 1.
