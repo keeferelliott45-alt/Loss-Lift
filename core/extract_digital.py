@@ -1790,7 +1790,9 @@ def counted_claim_evidence(page_texts: Mapping[int, str]) -> list[dict[str, int]
 
 
 def document_claim_count(
-    page_texts: Mapping[int, str], extra_counts: Sequence[int] = ()
+    page_texts: Mapping[int, str],
+    extra_counts: Sequence[int] = (),
+    claim_count: int | None = None,
 ) -> int | None:
     """How many claims the document says it holds -- or None if it never says.
 
@@ -1813,6 +1815,20 @@ def document_claim_count(
     no scope of their own, but they can deny one: a document is only
     unambiguous when nothing else on it states a different figure.
 
+    ``claim_count`` is the number of claims extracted for the scope this call
+    is about -- one logical run of a packet. Where it is given, a grand-wording
+    count that names a different number is refused rather than adopted: it is
+    the count path's counterpart of the totals path's ``_covers`` guard. A
+    board packet's pooled ``GRAND TOTAL`` row sits at the foot of the last
+    run's table and states the packet's count, not that run's; without the guard
+    the last run was checked against the packet's figure and R-05 fired on a
+    discrepancy nobody made. A refused grand count is dropped from consideration
+    entirely -- it neither supplies the answer nor competes with the counts that
+    might. Where that leaves the scope with no count of its own the answer is
+    None and nothing is checked against it, the same fail-closed posture as a
+    scope that prints no count at all. Left unset, the document-level behaviour
+    is unchanged: the first grand count found is the document's own.
+
     Nothing is inferred from the counts' arithmetic. A document whose sections
     hold one, two and three claims prints a 3 that is also 1+2, and adopting it
     reports six correctly extracted claims as a discrepancy; the coincidence
@@ -1821,16 +1837,24 @@ def document_claim_count(
     :func:`counted_claim_evidence` keeps what was printed so a rule can say the
     document's count is unresolved rather than absent.
     """
+    grand_rejected: set[int] = set()
     for _page, text in sorted(page_texts.items(), reverse=True):
         match = GRAND_COUNT_PATTERN.search(text)
         if match:
-            return parse_int(match.group(1))
+            value = parse_int(match.group(1))
+            if claim_count is None or value is None or value == claim_count:
+                return value
+            grand_rejected.add(value)
 
     stated = [
         entry
         for _page, text in sorted(page_texts.items())
         for entry in stated_claim_counts(text)
     ]
+    if grand_rejected:
+        # A grand-wording count refused above is not this scope's, so it neither
+        # supplies the answer nor competes with whatever else the scope states.
+        stated = [entry for entry in stated if entry[0] not in grand_rejected]
     # Counts read off scanned pages carry no wording, so they can never be the
     # document's own -- but they are still counts the document states, and the
     # "nothing else to be confused with" rule below is exactly the rule they
