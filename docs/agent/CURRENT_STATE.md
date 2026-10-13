@@ -1,94 +1,129 @@
-# CURRENT_STATE — LossLift as of 2026-10-12
+# CURRENT_STATE — LossLift as of 2026-10-13
 
 Rewrite this file when a milestone changes; do not append history (that goes
 in `Remember.md`).
 
 ## Where the code is
 
-- `main` is `15cf2b4`. Merged since 2026-09-27: #9 and #12 (packet series,
-  signed totals, bridged page; #19 merged into #9's branch first), #37
-  (packet export privacy: #18's content including #20's submission
-  workspace), #38 (D1 per-run facts) and #39 (F: CSV/XLSX intake).
-- Tests on `main` (Linux): 3070 passed, 21 skipped, 6 xfailed, 0 failed.
-  The golden ratchet is 108/108 rows, with money and text at 100%. On
-  Windows, 27 `tests/test_cloud_gate*` tests fail for environment reasons
-  (docker, symlink, mkfifo). They fail identically on a clean base and are
-  not a regression signal.
-- **Reliability lineage, not on `main`.** Branch
-  `agent/kilo/b1-foreign-page-bridged` carries all of
-  `agent/lead/reliability-phase-1`: #13, #16, #17, then E1–E14 and R1
-  (#22–#36). On top of that it adds B1, which reads a bridged foreign page
-  as its own run and refuses rows on a blind page that names another
-  report. The branch has `main` merged in (head `5303b4e`). Its draft
-  carrier PR, #40, is **blocked on the owner-run corpus gate**: E8 fixes a false CLEAN, B1
-  reclassifies bridged pages, and E10a changed the no-losses document. On
-  that head, qualification is 23 of 24 met, and fuzz smoke and golden pass.
+`main` is `1077728`. Merged since the last rewrite, in merge order, each
+through its PR under the watchers protocol:
+
+| PR | Merge | What |
+|---|---|---|
+| #40 | `ffc01c5` | Reliability lineage carrier (E1–E14, R1, B1). Merged under a **written owner exception** to gate run 38308067802 (exit 1: 6 changed, 0 failed, no critical measure moved; recorded on #40). |
+| #53 | `5db9c9b` | Underwriter triage layer `core/intelligence.py` (T-01…T-06, triage-local), fail-closed duplicate-flag merge `c5a20d7`. |
+| #50 | `db1f178` | R1 labelling helper (`tools/corpus_gate/labeller/`): owner-side real-document truth. |
+| #54 | `8a3e443` | Golden + fuzz expansion: ratchet 108 → **121** rows (16 formats); account/triage hazard pack. |
+| #55 | `db9132b` | Per-run R-05 / `run_view` pinning (test-only). |
+| #57 | `84e9605` | Fix-forward: triage smoke fixture (test-only). |
+| #58 | `98ed282` | Account `dropped`: a later run printing the same claim number counts as present. |
+| #59 | `1077728` | Labeller hardening (non-finite money, unknown fields, `ensure_outside`). |
+
+### Verification on `1077728`
+
+- **Linux** (Python 3.11): full suite **3446 passed, 0 failed**, 21 skipped,
+  6 xfailed; golden **121/121** (money and text 100%), exit 0; `compileall` 0.
+- **Windows**: 31 failures, all in the known set below; golden 121/121;
+  `compileall` 0.
+- **Fuzz** (Linux, `main`): see the 2026-10-13 cross-check PR. 0 SILENT in the PDF,
+  account and triage families. The account pack on #51 shows two SILENT
+  classes in `dropped` reporting (gaps below).
+
+### Known failure set (name-stable)
+
+A run is clean when its failures are exactly these and nothing else. Any
+extra failure must **reproduce at the base commit** before it may be called
+environmental. A delta of zero is the criterion, not a count.
+
+| Platform | Tests | Why |
+|---|---|---|
+| Windows | `tests/test_cloud_gate*.py`: 27 | POSIX symlink privilege, `os.mkfifo`, container tooling |
+| Windows | `tests/test_pdf_preflight.py` `[damaged]`: 3 | file lock on the malformed fixture |
+| Windows (flaky) | `tests/test_attack_lifecycle.py::test_discard_refuses_path_outside_tempdir` | cwd-dependent: passes only when the cwd is outside the temp directory |
+| Linux | none | — |
+
+Linux note: pytest's `--basetemp` must sit inside `tempfile.gettempdir()`.
+A basetemp elsewhere makes the staged-file tests fail by design, because
+`discard` refuses paths outside the temp directory.
 
 ## What `main` does now
 
-Logical runs (`core/runs.py`) are first-class. Reconciliation runs per run,
-under one canonical status policy (`core/review.py`). A refused row is
-recorded and never folded into another claim. R-19 blocks trust. R-28 names
-an incomplete report's missing pages, and a bridged unnumbered page is named
-(#12). Exports go through one text policy (`core/xlsx_safety.py`), which
-stores formula payloads as quoted text, with whole-package redaction.
-Staged uploads are owner-marked and verifiably deleted (#37). Saved `.eml`
-submissions are read with PDF attachments only, through the submission
-workspace. Packets show each run's own facts in Source Info and Loss
-Summary (#38). XLSX and CSV uploads are read sheet by sheet: each visible
-worksheet is its own `STRUCTURAL` run, and formulas are never evaluated
-(#39).
+Logical runs are first-class (`core/runs.py`), reconciled per run under one
+canonical status policy (`core/review.py`). Refused rows are recorded, never
+folded. R-19 blocks trust, and R-28 names incomplete reports and bridged pages.
+A bridged foreign page is read as its own run (B1). Exports go through one
+text policy. Uploads are owner-marked and verifiably deleted. `.eml`
+submissions take PDF attachments only. Packets show each run's own facts.
+XLSX/CSV are read sheet by sheet as `STRUCTURAL` runs. The account rollup
+feeds an optional, deterministic triage view that flags against user-set
+thresholds and names what it could not evaluate. The R1 labeller can produce
+the first adjudicated real-document accuracy number. Qualification: 23 of 24
+cases met.
 
-## Known gaps (re-audited 2026-10-12)
+## Parked, gate-required (do not merge without the gate)
 
-Closed since the last audit:
-- XLSX/CSV ingest: #39 (on `main`).
-- Column labels taken as the carrier, and `Claim No:`-labelled rows dropped
-  as furniture: E2 (on the carrier).
-- A foreign page bridged into a report: named by #12 (on `main`), read as
-  its own run by B1 (on the carrier).
-- A refused row on a bounded single report named by no rule: #17 (on the
-  carrier).
-- An incomplete single report reading CLEAN: R-28 (#9, on `main`).
+| PR | Expected corpus change | Prerequisite |
+|---|---|---|
+| #49 R-27 scanned count adoption | clean scanned pages NEEDS_REVIEW → CLEAN, plus an R-27 INFO record | **re-record vision answers** (the prompt hash is in `recording_key`); #46 (gate `vision` group) merged first |
+| #56 pooled grand-wording count guard | pooled grand-wording rows lose a false R-05 LOUD; vision unaffected | none |
+| #52 records shape ceiling | documents whose claim-number vote spans more than 4 series families → 0 claims, rows refused (R-29) | none |
 
-Still open:
-- Per-run R-05 (printed count per run) works but is not pinned by a test.
-  One changed line in `run_view` would disable it silently.
-- Scanned path: a clean scan always reads NEEDS_REVIEW, because the model's
-  claim count is not adopted (R-27). Nothing protects the vision path on the
-  real corpus.
-- Recovery sign, number format, date order and profile are per document.
-  Per run they are only checked (borrowed-convention R-15).
-- The packet's document-level header rows still show page 1's facts. The
-  per-run blocks from #38 sit beside them.
-- R-19 is categorised underwriting but blocks trust (#15 proposes
-  `extraction`).
-- Digital pages that are laid out as tables but yield no table are not
-  accounted for. That fix is open as #4 (conflicting, needs a gate run).
-- Qualification `mixed-series-packet`: a vision-read second run keeps its
-  printed totals at document level. It fails safe (over-flagged).
+Owner brief: `docs/agent/GATE_QUEUE.md`. Allowlist entries are owner-only.
+Exit 0 is the only pass.
 
-## Intentional limitations
+## Known gaps (2026-10-13)
 
-- Reconcile's cross-run R-11 flags repeats even across carriers, while the
-  account rollup keeps them apart. These are different questions, and each
-  fails closed.
-- A restart under a heading that names nothing is ambiguous (NEEDS_REVIEW).
-- Email attachments are accepted only as PDFs. An emailed XLSX is rejected
-  and named.
+Open, with pins:
+- **Figureless claim row across a page break** (`pipeline.page_furniture`):
+  a claim row with a number and status but no date or amount, printed last
+  on one page and repeated first on the next, is dropped as furniture. With
+  no printed total or count, the document reads CLEAN with the claim missing.
+  Strict xfails and a verified sketch are on #51.
+- **Account `dropped` misses true omissions** (`account._later_run_omits`).
+  There are two classes:
+  - a later run of the same policy that prints no term;
+  - since #58, another carrier's claim with the same number counts as
+    presence.
+
+  Both read CLEAN, and triage T-05 stays silent. They are pinned on #51. A
+  sketch is on #58 (shared class 132 → 0 SILENT, over-flags 2 → 14).
+- **mixed-series-packet** (qualification 23/24): one model-read boundary
+  unsettles the whole packet (`split_is_settled` is all-or-nothing), giving a
+  false R-04 delta. It fails closed. Pinned on #47 with a sketch that moves
+  nothing else.
+- **Pooled grand-wording count** adopted as a run's count (false R-05),
+  pinned as a strict xfail in `test_run_view_pinning.py`; the fix is #56.
+- **Scanned path**: a clean scan reads NEEDS_REVIEW until #49. The cloud gate
+  still carries no recordings.
+
+Consistency notes, no risk:
+- `core/export.py::_section_header` writes static literal headers outside
+  the TextPolicy. They are literals, never document text; this is a
+  consistency gap, not an injection path.
+- The labeller's `_KNOWN_FIELDS` is derived from `worksheet.CLAIM_FIELDS`,
+  so the two move in lockstep by construction. Keep it derived.
+- The account presence scan is O(runs × claims), which is fine at loss-run scale.
+- Triage `_finish` joins not-evaluated reasons in first-seen order over a
+  sorted input. The output is deterministic, but it is not a stable set
+  ordering across code changes.
+- Per-run number format, date order, recovery sign and profile are only
+  checked (borrowed-convention R-15), not applied per run.
+- `tests/fuzz/run.py` keeps every rendered PDF of a run in one temp
+  directory, so long `--vision` runs need chunking.
 
 ## Highest-value next tasks
 
-1. Owner: run the cloud corpus gate on #40's head, explain every changed
-   document, and then merge the carrier.
-2. Pin per-run R-05 and per-run printed facts with tests; mutation-check
-   `run_view`.
-3. Adjudicated real truth via the R1 labelling helper (needs the owner's
-   corpus). Without it, no real-corpus accuracy figure exists.
-4. Scanned path: adopt the model's claim count safely (R-27), and carry
-   vision recordings into the cloud gate.
-5. After the carrier lands: rebase #4 (unread table pages) and decide what
-   remains of #15.
+1. Owner: dispatch the gate for #56 and #52. Re-record vision answers, then
+   gate #49 after #46 merges.
+2. Owner: run the R1 labeller over the corpus to get the first real accuracy
+   number.
+3. Fix the two SILENT classes pinned on #51 (furniture and account
+   `dropped`), using the sketches posted there and on #58. Both are
+   gate-required.
+4. Apply the #47 sketch (per-run settledness) → qualification 24/24.
+5. Merge the Claude-lane drafts whose Linux matrix is green once Kilo has
+   reviewed them: #43 privacy scrub, #46 gate vision group, #48 compliance
+   pack, #44 demo pack.
 
 ## Explicitly deferred
 
