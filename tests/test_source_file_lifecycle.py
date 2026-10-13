@@ -18,6 +18,7 @@ from core.ingest import (
     verify_source_unchanged,
 )
 from core.pipeline import run_pipeline
+from tests.pdf_fixtures import synthetic_pdf
 
 
 def _digital_pdf(path: Path) -> Path:
@@ -184,7 +185,7 @@ def test_failed_upload_does_not_delete_an_earlier_staged_upload(
     monkeypatch,
 ) -> None:
     workdir = tmp_path / "shared-stage"
-    data = b"%PDF-1.7 first upload remains owned"
+    data = synthetic_pdf("first upload remains owned")
     first = ingest(data, "claims.pdf", workdir)
     original = first.path.read_bytes()
     real_open = Path.open
@@ -207,8 +208,8 @@ def test_discard_does_not_remove_a_caller_owned_workdir(
     tmp_path: Path,
 ) -> None:
     workdir = tmp_path / "losslift-caller-owned"
-    first = ingest(b"%PDF-1.7 first", "first.pdf", workdir)
-    second = ingest(b"%PDF-1.7 second", "second.pdf", workdir)
+    first = ingest(synthetic_pdf("first"), "first.pdf", workdir)
+    second = ingest(synthetic_pdf("second"), "second.pdf", workdir)
 
     discard(first)
 
@@ -261,7 +262,7 @@ def test_empty_workdir_uses_and_owns_a_private_directory(
         source = _digital_pdf(tmp_path / "caller-owned.pdf")
         staged = ingest_path(source, "")
     else:
-        staged = ingest(b"%PDF-1.7 upload", "upload.pdf", "")
+        staged = ingest(synthetic_pdf("upload"), "upload.pdf", "")
 
     assert staged.owns_directory
     discard(staged)
@@ -300,7 +301,7 @@ def test_empty_workdir_failure_removes_its_private_directory(
             return real_open(path, mode, *args, **kwargs)
 
         monkeypatch.setattr(Path, "open", fail_upload_write)
-        operation = lambda: ingest(b"%PDF-1.7 upload", "upload.pdf", "")
+        operation = lambda: ingest(synthetic_pdf("upload"), "upload.pdf", "")
 
     with pytest.raises(OSError, match="synthetic"):
         operation()

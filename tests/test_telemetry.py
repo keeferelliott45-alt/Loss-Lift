@@ -34,10 +34,13 @@ def _clean_single(tmp_path):
 
 
 def _packet(tmp_path):
+    """A packet whose one boundary stays unsettled: an unnumbered page under
+    A's heading, numbering its claims another way, inside A's count, so its
+    claim is refused and the packet is UNRESOLVED."""
     large = _large_run(12)
     return _read(tmp_path, [
         {"top": ("Page 1 of 3", LARGE_CARRIER, *LETTER), "rows": large[:4]},
-        {"top": ("HARBOR CREST SPECIALTY INSURANCE COMPANY", *LETTER),
+        {"top": (LARGE_CARRIER, *LETTER),
          "headers": SMALL_HEADERS, "rows": list(SMALL_RUN[:1])},
         {"top": ("Page 2 of 3", LARGE_CARRIER, *LETTER), "rows": large[4:8]},
         {"top": ("Page 3 of 3", LARGE_CARRIER, *LETTER), "rows": large[8:],

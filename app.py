@@ -14,6 +14,7 @@ person running this will have dozens of reports in flight at once.
 from __future__ import annotations
 
 import html
+import tempfile
 import time
 from pathlib import Path
 from decimal import Decimal
@@ -71,7 +72,13 @@ from core.submission import (
     summarise_submission,
 )
 from core.submission_export import submission_filename, submission_to_bytes
-from core.account import UNNAMED_ACCOUNT, build_accounts
+from core.account import UNNAMED_ACCOUNT, AccountRollup, build_accounts
+from core.intelligence import (
+    AppetiteConfigError,
+    AppetiteRules,
+    load_appetite_rules,
+    triage_summary,
+)
 from core.accounting import claim_accounting
 from core.runs import unsettled_runs
 from core.summary import summarise_by_period
@@ -1937,6 +1944,149 @@ def _accounts_panel() -> None:
         "Loss runs filed under the same insured, merged. Where a claim appears "
         "in more than one run, the newest valuation is the one carried forward."
     )
+
+    upload = st.file_uploader(
+        "Appetite rules (JSON, optional)", type=["json"], key="triage-rules-json"
+    )
+    if upload is not None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / Path(upload.name).name
+            path.write_bytes(upload.getvalue())
+            try:
+                rules = load_appetite_rules(path)
+            except AppetiteConfigError as exc:
+                st.error(f"Appetite rules file rejected: {exc}")
+                rules = AppetiteRules()
+    else:
+        rules = AppetiteRules()
+        st.caption(
+            "No appetite rules loaded - thresholds are not configured; "
+            "nothing will be reported as passing silently."
+        )
+
+    def _triage_section(account: AccountRollup, rules: AppetiteRules) -> None:
+        """The account as the underwriter's triage reads it, with provenance.
+
+        Read-only over what reconciliation already marked. A non-CLEAN account
+        is not ready to price, and its appetite flags are provisional on that.
+        """
+        triage = triage_summary(account, rules)
+        st.markdown("#### Underwriting triage")
+        if triage.status is DocumentStatus.CLEAN:
+            st.markdown(
+                "**Account status: CLEAN** - account trusted by reconciliation, "
+                "appetite flags below."
+            )
+        else:
+            st.markdown(
+                f"**Account status: {triage.status.value}** - account needs "
+                "review, not ready to price; appetite flags are provisional."
+            )
+        if triage.flags:
+            st.dataframe(
+                [
+                    {
+                        "Rule": flag.rule,
+                        "Severity": flag.severity.value,
+                        "Claims": ", ".join(flag.claim_numbers),
+                        "Evaluated": flag.evaluated,
+                        "Cannot evaluate": not flag.evaluated,
+                        "Reason": (
+                            flag.reason
+                            if flag.evaluated
+                            else flag.not_evaluated_reason or flag.reason
+                        ),
+                    }
+                    for flag in triage.flags
+                ],
+                hide_index=True, width="stretch",
+            )
+        else:
+            st.caption("No appetite flags for this account under the loaded rules.")
+        if triage.not_evaluated:
+            st.markdown("**Could not be evaluated**")
+            for item in triage.not_evaluated:
+                st.markdown(f"- {item}")
+        if triage.period_gaps:
+            st.markdown("**Coverage-period gaps**")
+            for gap in triage.period_gaps:
+                st.markdown(f"- {gap}")
+
+        flagged = [flag for flag in triage.flags if flag.sources]
+        if flagged:
+            flag_labels = [
+                f"{flag.rule} - {', '.join(flag.claim_numbers) or 'account-level'}"
+                for flag in flagged
+            ]
+            picked_flag = st.selectbox(
+                "Show me where this came from",
+                flag_labels,
+                key=f"triage-flag-{account.name}",
+            )
+            flag = flagged[flag_labels.index(picked_flag)]
+            source_labels = [
+                f"{s.source_filename} · run {s.run_id or '-'} · page {s.page}"
+                for s in flag.sources
+            ]
+            picked_source = st.selectbox(
+                "Source", source_labels, key=f"triage-source-{account.name}"
+            )
+            source = flag.sources[source_labels.index(picked_source)]
+            result = state["documents"].get(source.document_id)
+            claim = None
+            if result is not None:
+                candidates = [
+                    appearance.claim
+                    for history in account.histories
+                    for appearance in history.appearances
+                    if appearance.document_id == source.document_id
+                    and appearance.claim.claim_number == source.claim_number
+                ]
+                if candidates:
+                    exact = [
+                        c for c in candidates if c.row_id == source.row_id
+                    ]
+                    claim = (exact or candidates)[0]
+            if result is not None and claim is not None:
+                evidence = claim_evidence(claim)
+                if result.source_path:
+                    evidence = confirm_region(result.source_path, evidence, claim.claim_number)
+                left, right = st.columns([2, 3])
+                with left:
+                    st.markdown(f"**Source** — {evidence.describe()}")
+                    st.caption(evidence.note)
+                    st.markdown(f"Extraction: `{evidence.method.value}`")
+                    if evidence.text:
+                        st.markdown("Text on the page:")
+                        st.code(evidence.text, language=None)
+                with right:
+                    if not result.source_path or not Path(result.source_path).exists():
+                        st.info(
+                            "The uploaded file has been deleted, so the page cannot be shown. "
+                            "The page number, line and cell text above are kept."
+                        )
+                    else:
+                        image = render_evidence(result.source_path, evidence)
+                        if image is None:
+                            st.info("There is no page to show for this one.")
+                        else:
+                            st.image(image, width="stretch")
+            else:
+                st.caption(
+                    "Source document is not in this session - provenance on "
+                    f"record: file {source.source_filename}, "
+                    f"run {source.run_id or '-'}, page {source.page}."
+                )
+
+        triage_bytes = export_module.account_triage_to_bytes(account, rules)
+        st.download_button(
+            "Download triage workbook (xlsx)",
+            data=triage_bytes,
+            file_name=f"{account.name.replace(' ', '_')}_triage.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"triage-dl-{account.name}",
+        )
+
     for account in accounts:
         clean = account.status is DocumentStatus.CLEAN
         with st.expander(
@@ -2010,6 +2160,8 @@ def _accounts_panel() -> None:
                      "single-document export: the claimant column is dropped "
                      "and the sensitive values are scrubbed from the rest.",
             )
+            _triage_section(account, rules)
+
             st.download_button(
                 "Download account workbook",
                 data=export_module.account_to_bytes(account, redact=account_redact),
