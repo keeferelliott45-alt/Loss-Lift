@@ -22,11 +22,11 @@ These tests pin, end to end and by exact rule id and ``run_id``:
 * ``run_view`` carries a run's pages and printed facts, so a claim whose
   source page moves between runs moves with it.
 
-The last test is a strict xfail documenting a known gap left to K2: a pooled
-GRAND TOTAL row whose count is printed in grand-total wording ("GRAND TOTAL
-Claims: 5") is adopted as the last run's printed count and R-05 fires
-falsely, although the totals path refuses the very same row. Everything is
-synthetic (spec section 9).
+A pooled GRAND TOTAL row whose count is printed in grand-total wording
+("GRAND TOTAL Claims: 5") is refused by the count path, exactly as the totals
+path refuses the same row: the count path now applies the totals path's covers
+guard, so a grand-wording count that is not a count of the run can never become
+that run's printed count. Everything is synthetic (spec section 9).
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from decimal import Decimal
 
 import pytest
 
+from core.extract_digital import document_claim_count
 from core.reconcile import run_view
 from core.schema import DocumentStatus
 from tests.test_packet_adversarial import LETTER, _read, _total
@@ -169,18 +170,63 @@ def test_a_run_wrong_count_still_fires_when_a_pooled_count_ties(tmp_path):
     assert sorted(entry["count"] for entry in two.printed_count_evidence) == [2, 3]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "known gap, K2's lane: a pooled GRAND TOTAL row whose count is printed in "
-    "grand-total wording (\"GRAND TOTAL Claims: 5\") is adopted as the last "
-    "run's printed claim count and R-05 fires falsely (5 against 2), although "
-    "the totals path refuses that same row because its count is not the run's. "
-    "The count path lacks the covers guard the totals path has"))
 def test_a_pooled_grand_count_is_never_the_runs_own_count(tmp_path):
-    """The same pooled row, its count printed the way grand totals word it."""
+    """The same pooled row, its count printed the way grand totals word it.
+
+    The count path applies the totals path's covers guard: the pooled
+    grand-wording count ("GRAND TOTAL Claims: 5") names a number that is not
+    run 2's extracted count (2), so it is refused rather than adopted. Run 2's
+    own printed count (2) still stands, so R-05 fires on nothing."""
     result = _packet(tmp_path, pooled=[_pooled_row("GRAND TOTAL Claims: 5")])
-    two = result.document.runs[1]
+    one, two = result.document.runs
     assert two.printed_totals["incurred_total"] == Decimal("2800.00")
+    assert two.printed_claim_count == 2
+    assert one.printed_claim_count == 3
     assert not _findings(result, "R-05"), _shaped(_findings(result, "R-05"))
+    assert result.reconciliation.run_status == {
+        "run-1": DocumentStatus.CLEAN, "run-2": DocumentStatus.CLEAN}
+
+
+def test_a_runs_own_wrong_count_still_fires_beside_a_pooled_grand_row(tmp_path):
+    """Run 2's own count ("Number of claims: 1") is wrong for its two claims,
+    and a pooled grand-wording row (5) sits on the same page. The guard refuses
+    the pooled figure; the run is still checked against the count it printed
+    itself, so R-05 fires for run 2 alone."""
+    result = _packet(
+        tmp_path, second_after=("Number of claims: 1",),
+        pooled=[_pooled_row("GRAND TOTAL Claims: 5")])
+    two = result.document.runs[1]
+    assert two.printed_claim_count == 1
+    assert _shaped(_findings(result, "R-05")) == [("run-2", "claim_count", "1", "2")]
+    assert result.reconciliation.run_status == {
+        "run-1": DocumentStatus.CLEAN, "run-2": DocumentStatus.NEEDS_REVIEW}
+
+
+def test_a_pooled_grand_count_that_matches_no_run_is_not_adopted(tmp_path):
+    """The pooled row's grand-wording count (7) matches neither run's extracted
+    count (3, 2). It is refused outright and, run 2 printing no count of its
+    own, the run is checked against nothing: no fabricated R-05 (which adopting
+    the 7 would have raised against two claims), and the unadopted count is
+    kept as unresolved evidence for R-27."""
+    result = _packet(tmp_path, second_after=(), pooled=[_pooled_row("GRAND TOTAL Claims: 7")])
+    one, two = result.document.runs
+    assert one.printed_claim_count == 3
+    assert two.printed_claim_count is None
+    assert [entry["count"] for entry in two.printed_count_evidence] == [7]
+    assert not _findings(result, "R-05"), _shaped(_findings(result, "R-05"))
+    assert [(f.run_id, f.field) for f in _findings(result, "R-27")] == [
+        ("run-2", "claim_count")]
+
+
+def test_document_level_pooled_count_semantics_are_unchanged():
+    """The guard is opt-in and per run. Called the way the document level always
+    called it, a grand-wording count is still the document's own -- the packet
+    path is the only caller that scopes it, and it does so by passing the count
+    it extracted for that run."""
+    totals = {2: "GRAND TOTAL Claims: 5"}
+    assert document_claim_count(totals) == 5
+    assert document_claim_count(totals, claim_count=2) is None
+    assert document_claim_count(totals, claim_count=5) == 5
 
 
 # ==========================================================================

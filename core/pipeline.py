@@ -2749,7 +2749,11 @@ def _run_pipeline(
             run.unreadable_totals_page = total_row[0] if total_row else None
             run.unreadable_totals_row = total_row[1] if total_row else None
             run.printed_claim_count = document_claim_count(
-                texts, [entry["count"] for entry in counted]
+                texts,
+                [entry["count"] for entry in counted],
+                claim_count=sum(
+                    1 for claim in claims if run.holds(claim.source_page)
+                ),
             )
             run.printed_count_evidence = counted_claim_evidence(texts) + counted
         # What the run's own pages say about it -- its first claims page's
