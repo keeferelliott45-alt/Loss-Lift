@@ -400,11 +400,21 @@ def build_account(
     # raising when that later run covers the claim's term -- a 2019 claim
     # missing from the 2024 run is simply not that run's business, and a
     # claim missing from another carrier's run is not missing at all.
+    #
+    # Omission is about presence, not identity: the number appearing in *any*
+    # later run that covers the period means the claim is still on the books
+    # and is not dropped, whatever that run does or does not say about its
+    # carrier or policy. Identity decides only whether a number that is absent
+    # from every later covering run is a genuine omission -- an unstated
+    # carrier there is "cannot tell", never "gone".
     def _later_run_omits(history: ClaimHistory) -> bool:
         latest = history.appearances[-1]
-        for source in sources[last_index[id(history)] + 1:]:
-            if not _covers(source, history.current):
-                continue
+        later = [source for source in sources[last_index[id(history)] + 1:]
+                 if _covers(source, history.current)]
+        if any(claim.claim_number == history.claim_number
+               for source in later for claim in source.claims):
+            return False
+        for source in later:
             probe = Appearance(source.document_id, source.source_filename, source.carrier,
                                source.valuation_date, history.current, source.run_id,
                                source.policy_number, source.term_of(history.current))

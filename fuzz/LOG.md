@@ -161,9 +161,10 @@ Determinism: two identical runs of the same command produce identical
 tallies. Oracle soundness is pinned by hand-checked sabotage cases in
 `tests/test_fuzz_account_triage_smoke.py`.
 
-The `triage` family needs `core.intelligence` (branch `agent/kilo/triage-intel`);
-on branches without it the family reports a clear error and the account family
-still runs. The marathon lane should run this pack against the triage head.
+The `triage` family needs `core.intelligence`. On a branch without it every
+triage seed is tallied as ERROR and the run exits nonzero (2, never a silent
+pass), while the account family still runs. The marathon lane should run this
+pack against the triage head.
 
 Deferred product observations (not fixed here; test/fixture-only lane):
 

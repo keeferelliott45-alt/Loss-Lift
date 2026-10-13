@@ -133,7 +133,10 @@ def _measure(args: argparse.Namespace) -> int:
     try:
         root = runner.repo_root(args.repo)
         manifests.ensure_outside(args.manifest, root, "manifest")
+        manifests.ensure_outside(args.truth, root, "truth file")
         manifests.ensure_outside(args.out, root, "report directory")
+        if args.labels is not None:
+            manifests.ensure_outside(args.labels, root, "labels file")
         manifest = manifests.load(args.manifest)
         truth = adjudicated.load_truth(args.truth, manifest)
         labels = (

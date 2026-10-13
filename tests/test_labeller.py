@@ -280,6 +280,43 @@ def test_import_rejects_schema_invalid_truth(tmp_path, session, field, truth):
     assert not (tmp_path / "truth.json").exists()
 
 
+@pytest.mark.parametrize("truth", ["NaN", "Infinity", "-inf"])
+def test_import_rejects_non_finite_money_truth(tmp_path, session, truth):
+    out, manifest_path, manifest = _init(session, tmp_path)
+    worksheet = _worksheet_of(out, manifest)
+    rows = sheets.read_worksheet(worksheet)
+    victim = next(row for row in rows if row["field"] == "paid_total")
+    victim["TRUTH"] = truth
+    with worksheet.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=sheets.WORKSHEET_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    assert _run(["import", "--corpus", str(session[1]), "--manifest", str(manifest_path),
+                 "--worksheets", str(out), "--truth", str(tmp_path / "truth.json"),
+                 "--repo", str(REPO)]) == 3
+    assert not (tmp_path / "truth.json").exists()
+
+
+def test_import_refuses_an_unknown_field_row(tmp_path, session):
+    out, manifest_path, manifest = _init(session, tmp_path)
+    worksheet = _worksheet_of(out, manifest)
+    rows = sheets.read_worksheet(worksheet)
+    bogus = dict(rows[0])
+    bogus["field"] = "not_a_real_field"
+    bogus["TRUTH"] = "AGREE"
+    rows.append(bogus)
+    with worksheet.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=sheets.WORKSHEET_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    assert _run(["import", "--corpus", str(session[1]), "--manifest", str(manifest_path),
+                 "--worksheets", str(out), "--truth", str(tmp_path / "truth.json"),
+                 "--repo", str(REPO)]) == 3
+    assert not (tmp_path / "truth.json").exists()
+
+
 def test_import_refuses_a_document_the_manifest_no_longer_matches(tmp_path, session):
     out, manifest_path, manifest = _init(session, tmp_path)
     _adjudicate(_worksheet_of(out, manifest), _confirm_extraction)
@@ -334,6 +371,25 @@ def test_measure_refuses_truth_from_another_manifest(tmp_path, session, golden_p
 
     assert _run(["measure", "--truth", str(truth), "--manifest", str(other_manifest),
                  "--out", str(tmp_path / "report"), "--repo", str(REPO)]) == 3
+
+
+def test_measure_refuses_truth_and_labels_inside_the_repository(tmp_path, session):
+    out, manifest_path, manifest = _init(session, tmp_path)
+    _adjudicate(_worksheet_of(out, manifest), _confirm_extraction)
+    truth = tmp_path / "truth.json"
+    assert _run(["import", "--corpus", str(session[1]), "--manifest", str(manifest_path),
+                 "--worksheets", str(out), "--truth", str(truth), "--repo", str(REPO)]) == 0
+
+    inside_truth = REPO / "labeller-truth-must-not-live-here.json"
+    assert _run(["measure", "--truth", str(inside_truth), "--manifest", str(manifest_path),
+                 "--out", str(tmp_path / "report-a"), "--repo", str(REPO)]) == 3
+    assert not (tmp_path / "report-a").exists()
+
+    inside_labels = REPO / "labeller-labels-must-not-live-here.json"
+    assert _run(["measure", "--truth", str(truth), "--manifest", str(manifest_path),
+                 "--labels", str(inside_labels), "--out", str(tmp_path / "report-b"),
+                 "--repo", str(REPO)]) == 3
+    assert not (tmp_path / "report-b").exists()
 
 
 # --------------------------------------------------------------------------
@@ -451,6 +507,14 @@ def test_measure_matches_hand_computed_expectations(tmp_path):
 
     markdown = accuracy.render_markdown(report)
     assert "50.00%" in markdown
+
+
+def test_accuracy_counts_agree_on_empty_extraction_as_missing_not_correct():
+    bucket = accuracy._value_bucket()
+    accuracy._add_value_row(bucket, accuracy.TEXT, "", "AGREE")
+    assert bucket["expected"] == 1
+    assert bucket["missing"] == 1
+    assert bucket["correct"] == 0
 
 
 def test_measure_reports_no_adjudicated_group_as_null_not_perfect(tmp_path):
