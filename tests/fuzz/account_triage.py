@@ -1007,7 +1007,5 @@ def triage_outcome(seed: int):
     from core import intelligence as _ti
 
     case = triage_case(seed)
-    if _ti is None:
-        raise ImportError("core.intelligence is not present on this branch")
     summary = _ti.triage_summary(case.account.build(), case.rules)
     return classify_triage(case, summary)
