@@ -274,10 +274,39 @@ def campaign(start: int, count: int) -> tuple[Counter, list]:
 # --- the suite's slice ---------------------------------------------------------
 
 
-def test_a_fixed_slice_has_no_silent_account():
+def _pinned(hazards: tuple[str, ...], defects: list[str]) -> bool:
+    """The two known classes, each pinned below by a strict xfail."""
+    unreported = defects == ["dropped: purge not reported"] and "purged_later" in hazards
+    return unreported and ("term_unprinted" in hazards
+                           or "shared_number_two_carriers" in hazards)
+
+
+def test_a_fixed_slice_has_no_silent_account_beyond_the_pinned_classes():
     tally, silent = campaign(0, 400)
-    assert not silent, silent[:5]
-    assert tally["SAFE"] + tally["LOUD"] == 400
+    unknown = [case for case in silent if not _pinned(case[1], case[2])]
+    assert not unknown, unknown[:5]
+    assert tally["SAFE"] + tally["LOUD"] + len(silent) == 400
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "account finding (since main 98ed282, #58): _later_run_omits now treats the "
+    "claim number appearing in ANY later covering run as presence, so another "
+    "carrier's distinct claim with the same number hides a genuine purge"))
+def test_a_purge_is_not_hidden_by_another_carriers_claim_with_the_same_number():
+    s = scenario(2143)
+    assert s.hazards == ("purged_later", "shared_number_two_carriers")
+    verdict, defects = judge(s)
+    assert verdict != "SILENT", defects
+
+
+def test_the_same_purge_without_a_shared_number_is_reported():
+    """The boundary: with the other carrier numbering differently, it is reported."""
+    s = scenario(2143)
+    for run in s.runs:
+        if run.carrier != CARRIERS[0]:
+            run.claims = {Truth(t.carrier, t.policy, "9" + t.number, t.loss): v
+                          for t, v in run.claims.items()}
+    assert judge(s)[0] == "SAFE"
 
 
 @pytest.mark.xfail(strict=True, reason=(
