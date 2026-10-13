@@ -2,6 +2,8 @@
 
 Drop this in the repo root as `CLAUDE.md`. Claude Code reads it automatically on every session.
 
+> **Coding agents:** start with `AGENTS.md` (rules, reading order, checks). This file is the product spec.
+
 ---
 
 **Companion repo:** the marketing/front-end site is separate from this repo, at `keeferelliott45-alt/LostLift-Front-page` (private GitHub repo — note the name is spelled "LostLift", not "LossLift"). React + Vite + TypeScript + Tailwind, built with Bolt.new; includes a Supabase migration for pilot-signup inquiries. Different stack, not part of the Streamlit app below — access it with `add_repo` when needed.
@@ -428,7 +430,10 @@ allowlist entry that names the document's manifest id and hash, the field and
 both values. Both commits read a private copy of each document, verified by
 hash as it is copied. The corpus and its manifest live outside the repository.
 The gate's output carries ids, counts and keyed digests, never document text.
-See `docs/corpus-gate.md`.
+See `docs/corpus-gate.md`. Without a local terminal, dispatch the *Corpus
+gate* workflow from `main` instead (exact SHAs, corpus release tag, optional PR
+number); the corpus grows only through the *Corpus update* workflow's
+propose → approve → publish steps. See `docs/cloud-corpus-gate.md`.
 
 **Thresholds before charging anyone:**
 - Money fields: ≥ 99.5% on digital PDFs

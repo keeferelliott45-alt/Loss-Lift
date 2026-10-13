@@ -5,6 +5,7 @@ These are the numbers that decide whether the product may be charged for.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -211,6 +212,54 @@ def test_accuracy_report_is_printable(reports, capsys):
     print("\n" + "\n".join(r.summary() for r in reports.values()))
     print(total.summary())
     assert "money" in total.summary()
+
+
+def test_a_spreadsheet_export_reads_document_facts_from_its_columns(golden_dir):
+    """No letterhead: the facts repeat as columns, and the document keeps them."""
+    _, result = score_fixture(
+        "spreadsheet_export_facts_as_columns",
+        golden_dir / "spreadsheet_export_facts_as_columns.pdf",
+    )
+    document = result.document
+    assert document.carrier == "Granite Peak Specialty"
+    assert document.named_insured == "Boulder Outfitters LLC"
+    assert document.policy_number == "GP-441027-24"
+    assert (document.policy_period_start, document.policy_period_end) == (
+        date(2024, 1, 1), date(2024, 12, 31)
+    )
+    assert document.valuation_date == date(2024, 12, 31)
+    assert document.currency == "USD"
+
+
+def test_board_packet_keeps_every_run_and_its_own_footer(golden_dir):
+    """Each run's facts and footer belong to that run, and tie to its rows."""
+    name = "board_packet_per_run_totals"
+    _, result = score_fixture(name, golden_dir / f"{name}.pdf")
+    document = result.document
+    meta = load_meta(name)
+    assert len(meta["runs"]) == 3
+    assert len(document.runs) == 3
+    for run, expected in zip(document.runs, meta["runs"]):
+        assert run.carrier == expected["carrier"], run.run_id
+        assert run.policy_number == expected["policy_number"], run.run_id
+        assert run.named_insured == expected["named_insured"], run.run_id
+        assert run.valuation_date.isoformat() == expected["valuation_date"]
+        assert run.policy_period_start.isoformat() == expected["policy_period_start"]
+        assert run.policy_period_end.isoformat() == expected["policy_period_end"]
+        assert not run.ambiguous, run.run_id
+        assert run.printed_claim_count == expected["claim_count"], run.run_id
+        claims = document.run_claims(run)
+        assert len(claims) == expected["claim_count"], run.run_id
+        for field_name, value in expected["printed_totals"].items():
+            assert run.printed_totals[field_name] == Decimal(value), run.run_id
+            summed = sum(
+                (getattr(claim, field_name) for claim in claims
+                 if getattr(claim, field_name) is not None),
+                Decimal("0"),
+            )
+            assert summed == Decimal(value), run.run_id
+
+
 
 
 # --------------------------------------------------------------------------

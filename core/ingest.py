@@ -11,21 +11,201 @@ session — persistent storage of claim data is out of scope (spec section 13).
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 import shutil
 import tempfile
+import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+#: The most pages one PDF may have, on every intake path.
+MAX_PDF_PAGES = 1000
 PDF_MAGIC = b"%PDF-"
+XLSX_MAGIC = b"PK\x03\x04"
+#: Every OOXML workbook carries this part; a zip without it is not a workbook.
+XLSX_CONTENT_TYPES = "[Content_Types].xml"
+
+#: Upload kinds, in the suffix each is staged under.
+KIND_SUFFIX = {"pdf": ".pdf", "xlsx": ".xlsx", "csv": ".csv"}
+SUFFIX_KIND = {suffix: kind for kind, suffix in KIND_SUFFIX.items()}
+#: Legacy Excel containers are refused outright: the BIFF/OLE formats are a
+#: different parser with its own failure modes, and .xlsm carries macros that
+#: must never be opened. Fail closed rather than guess.
+UNSUPPORTED_SUFFIXES = {".xls", ".xlsm", ".xlt", ".xltm", ".xlsb"}
+
+#: Written into every directory that holds staged bytes. It records, per staged
+#: file, the document that owns it and the hash of its contents. ``discard``
+#: deletes nothing it cannot match against it — an upload is the only thing
+#: LossLift may remove, and only from a directory it can prove it made.
+OWNER_MARKER_NAME = ".losslift-owner.json"
+
+#: Staged directories alone are swept; a caller's own directory is never named
+#: this way, and never removed.
+STAGING_PREFIX = "losslift-"
+
+#: Orphans older than this are swept at startup. Best effort only.
+SWEEP_MAX_AGE_HOURS = 24
 
 
 class IngestError(ValueError):
-    """The upload is not a PDF this app can work with."""
+    """The upload is not a document this app can work with."""
+
+
+def sniff_kind(data: bytes) -> str:
+    """Name the upload kind from its bytes: ``pdf``, ``xlsx`` or ``csv``.
+
+    The magic decides, never the filename. A zip counts as a workbook only
+    when it carries the OOXML content-types part; anything else -- a legacy
+    .xls container, a macro workbook saved as zip, arbitrary binary -- is
+    refused rather than parsed as text. Delimited text must decode as UTF-8
+    and carry no NUL byte, which binary formats always do.
+    """
+    if data.startswith(PDF_MAGIC):
+        return "pdf"
+    if data.startswith(XLSX_MAGIC):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = archive.namelist()
+        except (zipfile.BadZipFile, OSError) as error:
+            raise IngestError(
+                "The upload looks like a zip archive but is not a readable "
+                "Excel workbook. Save it as .xlsx (or export a CSV) and "
+                "upload it again."
+            ) from error
+        if XLSX_CONTENT_TYPES in names:
+            return "xlsx"
+        raise IngestError(
+            "The upload is a zip archive but not an Excel workbook. "
+            "Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    if b"\x00" in data:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise IngestError(
+            "The upload is not a supported loss-run file. Upload a PDF, "
+            "XLSX or CSV loss run."
+        ) from error
+    return "csv"
+
+
+def _kind_for(filename: str, sniffed: str) -> str:
+    """Check the filename does not contradict the bytes; stage under a kind.
+
+    The bytes decide what a file is. A *recognised* extension that contradicts
+    the magic means the file was renamed or saved wrong, and neither reading
+    is safe, so the upload is refused. An unrecognised or missing extension
+    contradicts nothing: the magic carries the kind and the file is staged as
+    what it is. Legacy Excel formats are refused before anything else about
+    them is asked.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in UNSUPPORTED_SUFFIXES:
+        raise IngestError(
+            f"{Path(filename).name} is a legacy Excel format, which is not "
+            "supported. Save it as .xlsx (or export a CSV) and upload it again."
+        )
+    declared = SUFFIX_KIND.get(suffix)
+    if declared is None:
+        return sniffed
+    if declared != sniffed:
+        raise IngestError(
+            f"{Path(filename).name} is named {suffix} but its contents are "
+            "not that kind of file. Upload the file under its true format."
+        )
+    return declared
+
+
+class PreflightReason(str, Enum):
+    """Why a PDF was refused before it was staged. Fixed codes, stable to log."""
+
+    EMPTY = "empty"
+    TOO_LARGE = "too_large"
+    NOT_PDF = "not_pdf"
+    DAMAGED = "damaged"
+    NO_PAGES = "no_pages"
+    PASSWORD = "password"
+    TOO_MANY_PAGES = "too_many_pages"
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return self.value
+
+
+#: The sentence shown for each refusal. Nothing the file or its sender chose --
+#: a name, a path, parser output -- is ever part of one; the only values filled
+#: in are limits LossLift itself set.
+PREFLIGHT_MESSAGES = {
+    PreflightReason.EMPTY: "It is empty. Upload the PDF again.",
+    PreflightReason.TOO_LARGE: ("It is larger than the {limit} MB limit for one PDF. "
+                                "Split the document and retry."),
+    PreflightReason.NOT_PDF: "It is not a PDF. Loss runs must be uploaded as PDF files.",
+    PreflightReason.DAMAGED: "It could not be opened as a PDF; the file may be damaged.",
+    PreflightReason.NO_PAGES: "It has no pages to read.",
+    PreflightReason.PASSWORD: "It is password-protected. Upload an unprotected copy.",
+    PreflightReason.TOO_MANY_PAGES: "It has more than the {limit}-page limit for one PDF.",
+}
+
+
+class PdfPreflightError(IngestError):
+    """A PDF refused by :func:`preflight_pdf`. An ``IngestError``, so every
+    existing handler still catches it; ``reason`` says which check refused it."""
+
+    def __init__(self, reason: PreflightReason, *, limit: int | None = None) -> None:
+        self.reason = reason
+        super().__init__(PREFLIGHT_MESSAGES[reason].format(limit=limit))
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """What the checks established about a PDF they accepted."""
+
+    size_bytes: int
+    page_count: int
+
+
+class DiscardOutcome(str, Enum):
+    """What happened when a staged file was discarded."""
+
+    #: The file was there and is now gone, verified.
+    DELETED = "deleted"
+    #: There was nothing left to delete; the guarantee already holds.
+    ALREADY_GONE = "already_gone"
+    #: The path did not meet the ownership rules, so it was left alone.
+    REFUSED = "refused"
+    #: It should have gone and did not.
+    FAILED = "failed"
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return self.value
+
+
+@dataclass(frozen=True)
+class DiscardResult:
+    """The verified outcome of discarding one staged upload."""
+
+    outcome: DiscardOutcome
+    path: Path | None = None
+    reason: str = ""
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return self.outcome.value
+
+    @property
+    def gone(self) -> bool:
+        """Whether the caller may tell the user the file is deleted."""
+        return self.outcome in (DiscardOutcome.DELETED, DiscardOutcome.ALREADY_GONE)
 
 
 @dataclass(frozen=True)
@@ -56,12 +236,17 @@ class IngestedFile:
     sha256: str
     path: Path
     size_bytes: int
+    #: What kind of document the bytes are: "pdf", "xlsx" or "csv". Decided
+    #: from the bytes at ingest, never from the filename.
+    kind: str = "pdf"
     owns_directory: bool = False
     source_path: Path | None = None
     source_identity: FileIdentity | None = None
     ingested_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    #: Pages counted by the preflight when the file was staged.
+    page_count: int | None = None
 
     @property
     def exists(self) -> bool:
@@ -78,6 +263,335 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Preflight: the one set of checks every intake path applies
+# --------------------------------------------------------------------------
+
+
+def _check_size(size: int, max_bytes: int) -> None:
+    if size == 0:
+        raise PdfPreflightError(PreflightReason.EMPTY)
+    if size > max_bytes:
+        raise PdfPreflightError(PreflightReason.TOO_LARGE, limit=max_bytes // (1024 * 1024))
+
+
+def _check_magic(head: bytes) -> None:
+    if not head.startswith(PDF_MAGIC):
+        raise PdfPreflightError(PreflightReason.NOT_PDF)
+
+
+def _held_to_pdf_preflight(head: bytes, filename: str) -> bool:
+    """Whether an upload is checked as a PDF: its bytes say so, or its name
+    does. A file named .pdf that is not one is refused as not a PDF, with the
+    preflight's fixed reason, rather than sniffed as something else."""
+    return head.startswith(PDF_MAGIC) or Path(filename).suffix.lower() == ".pdf"
+
+
+def _check_sheet_size(filename: str, size: int, max_bytes: int) -> None:
+    if size == 0:
+        raise IngestError(f"{Path(filename).name} is empty. Upload the document again.")
+    if size > max_bytes:
+        raise IngestError(
+            f"{Path(filename).name} is {size / 1e6:.0f} MB. The limit is "
+            f"{max_bytes / 1e6:.0f} MB — split the document and retry."
+        )
+
+
+def _check_structure(source: bytes | Path, max_pages: int) -> int:
+    """Open the PDF and count its pages; refuse what cannot be read.
+
+    Only a password needed to *open* the file refuses it. An owner password
+    (print or copy restrictions) is common on carrier PDFs and does not stop
+    reading. Parser detail is never surfaced: every failure is one fixed
+    reason.
+    """
+    import pymupdf
+
+    try:
+        if isinstance(source, Path):
+            document = pymupdf.open(source, filetype="pdf")
+        else:
+            document = pymupdf.open(stream=source, filetype="pdf")
+    except Exception:  # noqa: BLE001 - parser detail is never shown
+        raise PdfPreflightError(PreflightReason.DAMAGED) from None
+    with document:
+        try:
+            if document.needs_pass:
+                raise PdfPreflightError(PreflightReason.PASSWORD)
+            pages = document.page_count
+            repaired = bool(getattr(document, "is_repaired", False))
+        except PdfPreflightError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise PdfPreflightError(PreflightReason.DAMAGED) from None
+    if pages == 0:
+        # A file MuPDF had to rebuild into nothing is damaged; one that says
+        # plainly it has no pages is empty of pages.
+        raise PdfPreflightError(
+            PreflightReason.DAMAGED if repaired else PreflightReason.NO_PAGES)
+    if pages > max_pages:
+        raise PdfPreflightError(PreflightReason.TOO_MANY_PAGES, limit=max_pages)
+    return pages
+
+
+def preflight_pdf(
+    data: bytes,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> PreflightResult:
+    """Every check a PDF must pass before it is staged, on the bytes themselves.
+
+    Raises :class:`PdfPreflightError` (an ``IngestError``) with a fixed reason.
+    The cheap checks run first: size and the ``%PDF-`` signature before the
+    file is opened at all.
+    """
+    _check_size(len(data), max_bytes)
+    _check_magic(data[: len(PDF_MAGIC)])
+    pages = _check_structure(data, max_pages)
+    return PreflightResult(size_bytes=len(data), page_count=pages)
+
+
+def preflight_pdf_path(
+    path: str | Path,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> PreflightResult:
+    """The same checks as :func:`preflight_pdf`, on a file LossLift staged.
+
+    Meant for a verified snapshot, never for a caller's path that could still
+    change: :func:`ingest_path` runs it on its own copy.
+    """
+    target = Path(path)
+    size = target.stat().st_size
+    _check_size(size, max_bytes)
+    with target.open("rb") as handle:
+        _check_magic(handle.read(len(PDF_MAGIC)))
+    pages = _check_structure(target, max_pages)
+    return PreflightResult(size_bytes=size, page_count=pages)
+
+
+def _read_owner_marker(directory: Path) -> dict[str, dict[str, str]]:
+    """The staged files this directory is known to own, by basename.
+
+    A missing or unreadable marker means "not owned", never "delete anyway":
+    the safe answer when the code cannot tell is to leave the file alone.
+    """
+    marker = directory / OWNER_MARKER_NAME
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return {}
+    owned: dict[str, dict[str, str]] = {}
+    for name, entry in files.items():
+        if isinstance(name, str) and isinstance(entry, dict):
+            owned[name] = {
+                "document_id": str(entry.get("document_id", "")),
+                "sha256": str(entry.get("sha256", "")),
+            }
+    return owned
+
+
+def _write_owner_marker(
+    directory: Path, staged: Path, document_id: str, sha256: str
+) -> None:
+    """Record one staged file in its directory's ownership marker."""
+    owned = _read_owner_marker(directory)
+    owned[staged.name] = {"document_id": document_id, "sha256": sha256}
+    marker = directory / OWNER_MARKER_NAME
+    payload = json.dumps({"files": owned}, indent=2, sort_keys=True)
+    temporary = marker.with_suffix(".json.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, marker)
+
+
+def _forget_owner_marker(directory: Path, staged_name: str) -> None:
+    """Best-effort removal of one entry a failed stage left behind."""
+    try:
+        owned = _read_owner_marker(directory)
+        if staged_name not in owned:
+            return
+        del owned[staged_name]
+        marker = directory / OWNER_MARKER_NAME
+        if owned:
+            payload = json.dumps({"files": owned}, indent=2, sort_keys=True)
+        else:
+            payload = json.dumps({"files": {}}, indent=2, sort_keys=True)
+        temporary = marker.with_suffix(".json.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, marker)
+    except OSError:  # pragma: no cover - best effort
+        pass
+
+
+def _inside_tempdir(path: Path) -> bool:
+    """Whether a path resolves inside the system temporary directory."""
+    try:
+        root = Path(tempfile.gettempdir()).resolve()
+        return path.resolve().is_relative_to(root)
+    except (OSError, ValueError):
+        return False
+
+
+def _owned_for_discard(ingested: IngestedFile) -> DiscardResult | None:
+    """Verify ownership of one staged path; a refusal is returned, not raised."""
+    path = ingested.path
+    if not path.exists():
+        return None
+    if path.is_symlink():
+        return DiscardResult(
+            DiscardOutcome.REFUSED, path, "the staged path is a symlink"
+        )
+    if not _inside_tempdir(path):
+        return DiscardResult(
+            DiscardOutcome.REFUSED, path, "the staged path is outside the temporary directory"
+        )
+    entry = _read_owner_marker(path.parent).get(path.name)
+    if entry is None:
+        return DiscardResult(
+            DiscardOutcome.REFUSED, path, "the directory carries no ownership marker"
+        )
+    if entry.get("sha256") != ingested.sha256:
+        return DiscardResult(
+            DiscardOutcome.REFUSED, path, "the marker does not match this file's hash"
+        )
+    return None
+
+
+def discard(ingested: IngestedFile, remove_directory: bool = True) -> DiscardResult:
+    """Delete the staged bytes, and verify that it happened.
+
+    Deletes only a path that resolves inside the temporary directory, is not a
+    symlink, and is named in its directory's ownership marker with the hash the
+    upload was ingested with. Anything else is refused and left on disk: an
+    upload is the only thing LossLift may remove, and it says so rather than
+    guessing at a path it does not own.
+
+    Idempotent. The caller may tell the user "deleted" only on ``DELETED`` or
+    ``ALREADY_GONE``.
+    """
+    path = ingested.path
+    try:
+        refusal = _owned_for_discard(ingested)
+        if refusal is not None:
+            return refusal
+
+        if not path.exists():
+            _remove_owned_directory(ingested, path, remove_directory)
+            return DiscardResult(
+                DiscardOutcome.ALREADY_GONE, path, "the staged file was already gone"
+            )
+
+        path.unlink()
+        if path.exists():
+            return DiscardResult(
+                DiscardOutcome.FAILED, path, "the staged file is still on disk"
+            )
+        _remove_owned_directory(ingested, path, remove_directory)
+        return DiscardResult(DiscardOutcome.DELETED, path, "deleted and verified")
+    except OSError as error:  # pragma: no cover - best effort cleanup
+        return DiscardResult(DiscardOutcome.FAILED, path, str(error))
+
+
+def _remove_owned_directory(
+    ingested: IngestedFile, path: Path, remove_directory: bool
+) -> None:
+    """Remove the private staging directory itself, only if LossLift made it."""
+    if not (remove_directory and ingested.owns_directory):
+        return
+    directory = path.parent
+    if directory.is_symlink() or not _inside_tempdir(directory):
+        return
+    if not (directory / OWNER_MARKER_NAME).is_file():
+        return
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def sweep_orphaned_staging(
+    base: str | Path | None = None,
+    *,
+    max_age_hours: float = SWEEP_MAX_AGE_HOURS,
+    now: float | None = None,
+) -> list[Path]:
+    """Best-effort removal of staging directories orphaned by a crash.
+
+    LossLift cannot delete a file when a session ends unexpectedly — Streamlit
+    has no reliable hook for that — so a startup sweep clears what a previous
+    run left behind. Only directories that carry the ownership marker and are
+    older than ``max_age_hours`` are touched; a directory with no marker is
+    left alone. It is best effort and says so: failures are swallowed.
+    """
+    root = Path(base) if base is not None else Path(tempfile.gettempdir())
+    cutoff = (time.time() if now is None else now) - max_age_hours * 3600
+    removed: list[Path] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not entry.name.startswith(STAGING_PREFIX):
+                continue
+            if not (entry / OWNER_MARKER_NAME).is_file():
+                continue
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                removed.append(entry)
+        except OSError:
+            continue
+    return removed
+
+
+def stage_and_run(
+    data: bytes,
+    filename: str,
+    run: Any,
+    workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> tuple[IngestedFile, Any]:
+    """Stage an upload, run the pipeline, and never orphan the file on failure.
+
+    The staged copy is discarded if ``run`` raises for any reason, so a failure
+    after ingest — extraction, mapping, registration — cannot leave a temporary
+    file behind. On success ownership passes to the caller, which discards it
+    after export, on delete, or when the document leaves the queue.
+    """
+    staged = ingest(data, filename, workdir, max_bytes=max_bytes, max_pages=max_pages)
+    try:
+        result = run(staged)
+    except BaseException:
+        discard(staged)
+        raise
+    return staged, result
+
+
+def run_or_discard(staged: IngestedFile, run: Any) -> Any:
+    """Re-run a pipeline over an already-staged file, discarding it on failure.
+
+    Used by a mapping re-read: the bytes are the same ones already staged, so on
+    failure there is nothing to retry with and the file goes.
+    """
+    try:
+        return run(staged)
+    except BaseException:
+        discard(staged)
+        raise
 
 
 def _hash_handle(handle: Any) -> str:
@@ -127,19 +641,24 @@ def ingest(
     data: bytes,
     filename: str,
     workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
 ) -> IngestedFile:
-    """Validate, hash and stage an uploaded PDF."""
-    if not data:
-        raise IngestError(f"{filename} is empty. Upload the PDF again.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise IngestError(
-            f"{filename} is {len(data) / 1e6:.0f} MB. The limit is "
-            f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
-        )
-    if not data.startswith(PDF_MAGIC):
-        raise IngestError(
-            f"{filename} is not a PDF. Loss runs must be uploaded as PDF files."
-        )
+    """Validate, hash and stage an uploaded PDF, XLSX or CSV loss run.
+
+    The bytes are checked before anything is written, so a refused file never
+    touches the disk. Anything that is, or is named, a PDF passes
+    :func:`preflight_pdf` in full; a spreadsheet is sized and sniffed.
+    """
+    if _held_to_pdf_preflight(data[: len(PDF_MAGIC)], filename):
+        checked = preflight_pdf(data, max_bytes=max_bytes, max_pages=max_pages)
+        kind = _kind_for(filename, "pdf")
+        page_count: int | None = checked.page_count
+    else:
+        _check_sheet_size(filename, len(data), max_bytes)
+        kind = _kind_for(filename, sniff_kind(data))
+        page_count = None
 
     owns_directory = not bool(workdir)
     directory = (
@@ -151,31 +670,47 @@ def ingest(
 
     digest = sha256_bytes(data)
     safe_name = Path(filename).name or "upload.pdf"
-    target = directory / f".upload-{uuid4().hex}.pdf"
-    created = False
+    target = directory / f".upload-{uuid4().hex}{KIND_SUFFIX[kind]}"
+    document_id = str(uuid4())
     try:
+        # The marker is written before the bytes: a process killed between the
+        # two leaves no staged file, never an unmarked one that cleanup cannot
+        # see. If the write below fails, the entry is removed again.
+        _write_owner_marker(directory, target, document_id, digest)
         with target.open("xb") as handle:
-            created = True
             handle.write(data)
     except BaseException:
-        if created:
-            target.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        _forget_owner_marker(directory, target.name)
         if owns_directory:
             shutil.rmtree(directory, ignore_errors=True)
         raise
 
     return IngestedFile(
-        document_id=str(uuid4()),
+        document_id=document_id,
         source_filename=safe_name,
         sha256=digest,
         path=target,
         size_bytes=len(data),
+        kind=kind,
         owns_directory=owns_directory,
+        page_count=page_count,
     )
 
 
-def ingest_path(path: str | Path, workdir: str | Path | None = None) -> IngestedFile:
-    """Snapshot an existing PDF without trusting a changing pathname."""
+def ingest_path(
+    path: str | Path,
+    workdir: str | Path | None = None,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_pages: int = MAX_PDF_PAGES,
+) -> IngestedFile:
+    """Snapshot an existing PDF, XLSX or CSV without trusting a changing pathname.
+
+    Size and kind are checked on the open handle before copying. The
+    structural checks run on the verified snapshot, never on the caller's
+    path, so what was checked is exactly what will be read.
+    """
     source = Path(path).resolve()
     directory: Path | None = None
     temporary_target: Path | None = None
@@ -184,17 +719,17 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
     try:
         with source.open("rb") as source_handle:
             identity = _identity(os.fstat(source_handle.fileno()))
-            if identity.size == 0:
-                raise IngestError(f"{source.name} is empty. Upload the PDF again.")
-            if identity.size > MAX_UPLOAD_BYTES:
-                raise IngestError(
-                    f"{source.name} is {identity.size / 1e6:.0f} MB. The limit is "
-                    f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB — split the document and retry."
-                )
-            if source_handle.read(len(PDF_MAGIC)) != PDF_MAGIC:
-                raise IngestError(
-                    f"{source.name} is not a PDF. Loss runs must be uploaded as PDF files."
-                )
+            head = source_handle.read(len(PDF_MAGIC))
+            source_handle.seek(0)
+            pdf = _held_to_pdf_preflight(head, source.name)
+            if pdf:
+                _check_size(identity.size, max_bytes)
+                _check_magic(head)
+                kind = _kind_for(source.name, "pdf")
+            else:
+                _check_sheet_size(source.name, identity.size, max_bytes)
+                kind = _kind_for(source.name, sniff_kind(source_handle.read(max_bytes + 1)))
+                source_handle.seek(0)
 
             owns_directory = not bool(workdir)
             directory = (
@@ -203,7 +738,12 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                 else Path(workdir)
             )
             directory.mkdir(parents=True, exist_ok=True)
-            temporary_target = directory / f".snapshot-{uuid4().hex}.pdf"
+            temporary_target = directory / f".snapshot-{uuid4().hex}{KIND_SUFFIX[kind]}"
+            document_id = str(uuid4())
+            # Provisional marker before the bytes, so a kill during the copy
+            # leaves a marker-bearing directory the startup sweep can find
+            # rather than an invisible staged file.
+            _write_owner_marker(directory, temporary_target, document_id, "")
             with temporary_target.open("xb") as target_handle:
                 temporary_target_created = True
                 digest = _copy_and_hash(source_handle, target_handle)
@@ -222,21 +762,33 @@ def ingest_path(path: str | Path, workdir: str | Path | None = None) -> Ingested
                     "Run the extraction again."
                 )
 
+        # The snapshot is verified; check it, not the path it came from. A
+        # refusal here is cleaned up by the handler below like any failure.
+        checked = (
+            preflight_pdf_path(temporary_target, max_bytes=max_bytes, max_pages=max_pages)
+            if pdf
+            else None
+        )
+        _write_owner_marker(directory, temporary_target, document_id, digest)
         target = temporary_target
         temporary_target = None
         return IngestedFile(
-            document_id=str(uuid4()),
+            document_id=document_id,
             source_filename=source.name,
             sha256=digest,
             path=target,
             size_bytes=identity.size,
+            kind=kind,
             owns_directory=owns_directory,
             source_path=source,
             source_identity=identity,
+            page_count=checked.page_count if checked is not None else None,
         )
     except BaseException:
         if temporary_target is not None and temporary_target_created:
             temporary_target.unlink(missing_ok=True)
+        if temporary_target is not None and directory is not None:
+            _forget_owner_marker(directory, temporary_target.name)
         if owns_directory and directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
         raise
@@ -267,15 +819,3 @@ def verify_source_unchanged(ingested: IngestedFile) -> None:
         raise IngestError(
             f"{source.name} changed while it was being read. Run the extraction again."
         )
-
-
-def discard(ingested: IngestedFile, remove_directory: bool = True) -> None:
-    """Delete the staged bytes.  Called after export (spec section 9)."""
-    try:
-        if ingested.path.exists():
-            ingested.path.unlink()
-        parent = ingested.path.parent
-        if remove_directory and ingested.owns_directory:
-            shutil.rmtree(parent, ignore_errors=True)
-    except OSError:  # pragma: no cover - best effort cleanup
-        pass

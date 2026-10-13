@@ -13,8 +13,9 @@ person running this will have dozens of reports in flight at once.
 
 from __future__ import annotations
 
-import io
-import zipfile
+import html
+import tempfile
+import time
 from pathlib import Path
 from decimal import Decimal
 from typing import Any
@@ -23,10 +24,12 @@ import pandas as pd
 import streamlit as st
 
 from core import export as export_module
+from core import telemetry
 from core.review import (
-    finding_key,
-    bucket_of,
     ReviewAction,
+    review_bucket,
+    canonical_status,
+    finding_key,
     summarise_review,
 )
 from core.evidence import (
@@ -35,7 +38,14 @@ from core.evidence import (
     finding_evidence,
     render_evidence,
 )
-from core.ingest import IngestError, discard, ingest
+from core.ingest import (
+    DiscardResult,
+    IngestError,
+    discard,
+    run_or_discard,
+    stage_and_run,
+    sweep_orphaned_staging,
+)
 from core.pipeline import (
     resolve_finding,
     ColumnMapping,
@@ -51,14 +61,34 @@ from core.pipeline import (
     save_confirmed_mapping,
     to_records,
 )
+from core.eml_intake import EmlFatalError, read_submission
 from core.profiles import list_profiles, llm_enabled
-from core.account import UNNAMED_ACCOUNT, build_accounts
+from core.submission import (
+    OUTCOME_LABELS,
+    PROCESSING_LABELS,
+    IntakeOutcome,
+    Submission,
+    status_label,
+    summarise_submission,
+)
+from core.submission_export import submission_filename, submission_to_bytes
+from core.account import UNNAMED_ACCOUNT, AccountRollup, build_accounts
+from core.intelligence import (
+    AppetiteConfigError,
+    AppetiteRules,
+    load_appetite_rules,
+    triage_summary,
+)
+from core.accounting import claim_accounting
+from core.runs import unsettled_runs
 from core.summary import summarise_by_period
+from core.xlsx_safety import safe_member_name
 from core.schema import (
     CANONICAL_FIELDS,
     DATE_FIELDS,
     MONEY_FIELDS,
     ClaimStatus,
+    DocumentStatus,
     Severity,
 )
 
@@ -115,14 +145,26 @@ div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 </style>
 """
 
+def _plain(text: str) -> str:
+    """Text from outside (a file name, a carrier) made inert for st.markdown.
+
+    An email's sender chooses its attachments' names; neither HTML nor
+    markdown in one may render as anything but characters.
+    """
+    escaped = html.escape(text or "")
+    return "".join("\\" + ch if ch in "\\`*_{}[]()#+-.!|<>~" else ch for ch in escaped)
+
+
 def _status_pill(result: ExtractionResult) -> str:
     """User-facing status: Ready / Review N issue(s) / Needs mapping --
     never the internal rule/status vocabulary."""
     if result.needs_mapping:
         return '<span class="ll-pill ll-pill-mapping">Needs mapping</span>'
     data_issues, _flags = _split_findings(result.reconciliation.findings)
-    if not data_issues:
+    if canonical_status(result.reconciliation) is DocumentStatus.CLEAN:
         return '<span class="ll-pill ll-pill-clean">✓ Ready</span>'
+    if not data_issues:
+        return '<span class="ll-pill ll-pill-review">Review</span>'
     label = f"Review {len(data_issues)} issue{'s' if len(data_issues) != 1 else ''}"
     return f'<span class="ll-pill ll-pill-review">{label}</span>'
 
@@ -151,7 +193,49 @@ def _state() -> dict[str, Any]:
     # Things worth saying once about the last upload that are not failures —
     # a file read a second time, say.
     st.session_state.setdefault("notices", [])
+    # Local telemetry: counts and tokens only (core/telemetry.py).
+    st.session_state.setdefault("telemetry_session", telemetry.new_session())
+    st.session_state.setdefault("processed_at", {})  # document_id -> monotonic seconds
+    # Saved emails read as submissions. Email metadata lives here, in session
+    # memory only (core/submission.py); nothing is written to disk.
+    st.session_state.setdefault("submissions", {})     # submission_id -> Submission
+    st.session_state.setdefault("submission_order", [])
+    st.session_state.setdefault("submission_of", {})   # document_id -> submission_id
+    st.session_state.setdefault("open_submission", None)
     return st.session_state
+
+
+def _record_processed(result: ExtractionResult) -> None:
+    state = _state()
+    state["processed_at"][result.document.document_id] = time.monotonic()
+    try:
+        telemetry.emit(telemetry.processed_event(result, session=state["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_review(result: ExtractionResult, entries_before: int) -> None:
+    entries = result.document.review_log.entries[entries_before:]
+    if not entries:
+        return
+    try:
+        telemetry.emit(telemetry.review_events(
+            result, entries, session=_state()["telemetry_session"]))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
+
+
+def _record_export(result: ExtractionResult, fmt: str, redacted: bool) -> None:
+    state = _state()
+    started = state["processed_at"].get(result.document.document_id)
+    try:
+        telemetry.emit(telemetry.export_event(
+            result, fmt=fmt, redacted=redacted, session=state["telemetry_session"],
+            seconds_since_processed=None if started is None
+            else round(time.monotonic() - started, 3),
+        ))
+    except Exception:  # noqa: BLE001 - telemetry never stops the work
+        pass
 
 
 def _result(document_id: str) -> ExtractionResult | None:
@@ -186,8 +270,8 @@ def _status_of(result: ExtractionResult) -> str:
     the open document never disagree about whether it is reconciled."""
     if result.needs_mapping:
         return "mapping"
-    data_issues, _flags = _split_findings(result.reconciliation.findings)
-    return "needs_review" if data_issues else "clean"
+    status = canonical_status(result.reconciliation)
+    return "clean" if status is DocumentStatus.CLEAN else "needs_review"
 
 
 # --------------------------------------------------------------------------
@@ -207,7 +291,7 @@ def _status_of(result: ExtractionResult) -> str:
 # add up; extraction rules ask whether the document could be read at all.
 # Together they are what blocks the reconciled badge -- exactly as before.
 def _is_data_issue(finding) -> bool:
-    return bucket_of(finding) != "underwriting"
+    return review_bucket(finding) != "underwriting"
 
 
 def _split_findings(findings: list) -> tuple[list, list]:
@@ -226,7 +310,7 @@ def _reconciliation_card(result: ExtractionResult) -> None:
     """
     document = result.document
     data_issues, flags = _split_findings(result.reconciliation.findings)
-    passed = not data_issues
+    passed = canonical_status(result.reconciliation) is DocumentStatus.CLEAN
 
     st.markdown(
         f"#### {document.carrier or 'Carrier unknown'}"
@@ -241,6 +325,22 @@ def _reconciliation_card(result: ExtractionResult) -> None:
         f"Valuation: {document.valuation_date.isoformat() if document.valuation_date else 'missing'}"
     )
     st.caption(" · ".join(meta))
+
+    if document.is_packet:
+        # The headline above is page 1's letterhead. Each run's own facts are
+        # shown here, from that run's pages -- never borrowed across runs.
+        for run in document.runs:
+            valuation = (
+                run.valuation_date.isoformat()
+                if run.valuation_date
+                else (run.valuation_date_text or "not printed")
+            )
+            facts = [
+                f"Carrier: {run.carrier or 'not printed'}",
+                f"Policy: {run.policy_number or 'not printed'}",
+                f"Valuation: {valuation}",
+            ]
+            st.caption(f"{run.run_id} (pages {run.page_range}) — " + " · ".join(facts))
 
     if passed:
         st.markdown(
@@ -262,6 +362,12 @@ def _reconciliation_card(result: ExtractionResult) -> None:
             if printed_count is not None
             else f"{extracted_count} claims captured"
         )
+        if document.is_packet:
+            # Each run's count and total are its own; see "Loss runs" below.
+            count_line = (
+                f"{extracted_count} claims captured across {len(document.runs)} "
+                f"loss runs in this PDF"
+            )
         st.write(count_line)
 
         printed_incurred = document.printed_totals.get("incurred_total")
@@ -269,7 +375,8 @@ def _reconciliation_card(result: ExtractionResult) -> None:
         cols = st.columns(3)
         cols[0].metric(
             "Carrier total incurred",
-            f"{printed_incurred:,.2f}" if printed_incurred is not None else "not printed",
+            f"{printed_incurred:,.2f}" if printed_incurred is not None
+            else ("per run" if document.is_packet else "not printed"),
         )
         cols[1].metric("LossLift total incurred", f"{extracted_incurred:,.2f}")
         if printed_incurred is not None:
@@ -337,6 +444,8 @@ def _findings_table(result: ExtractionResult) -> None:
                 "Expected": _money(finding.expected),
                 "Actual": _money(finding.actual),
                 "Difference": _money(finding.delta),
+                **({"Run": finding.run_id or "whole packet"}
+                   if result.document.is_packet else {}),
             }
             for finding in findings
         ]
@@ -562,13 +671,14 @@ def _review_workspace(result: ExtractionResult, document_id: str) -> None:
                 st.error("Enter the corrected value, or choose confirm or dismiss.")
             else:
                 try:
-                    _store(
-                        resolve_finding(
-                            result, finding, action,
-                            note=note,
-                            corrected_value=corrected if action is ReviewAction.CORRECTED else None,
-                        )
+                    logged = len(result.document.review_log.entries)
+                    resolved = resolve_finding(
+                        result, finding, action,
+                        note=note,
+                        corrected_value=corrected if action is ReviewAction.CORRECTED else None,
                     )
+                    _store(resolved)
+                    _record_review(resolved, logged)
                 except ValueError as refused:
                     # Nothing was changed and nothing was logged. Say which,
                     # rather than recording a correction that corrected nothing.
@@ -659,14 +769,20 @@ def screen_queue() -> None:
     state = _state()
     st.subheader("Loss run queue")
     st.caption(
-        "Drop in carrier PDFs — one or a hundred at once. Files are held in "
-        "memory for this session and deleted after you export."
+        "Drop in carrier loss runs as PDF, XLSX or CSV, or a broker's saved "
+        "email (.eml) with its loss runs attached — one or a hundred at once. "
+        "Each uploaded file is "
+        "staged in a temporary directory for this session. It is deleted after "
+        "you export it, when you press Delete, or when you remove it from the "
+        "queue. Temporary files left behind by an interrupted session are swept "
+        "after 24 hours. LossLift cannot delete a file when a session ends "
+        "unexpectedly — closing the tab does not by itself remove staged files."
     )
 
     state.setdefault("uploader_generation", 0)
     uploads = st.file_uploader(
-        "Choose PDF files",
-        type=["pdf"],
+        "Choose loss run files or saved emails (.eml)",
+        type=["pdf", "xlsx", "csv", "eml"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"uploader-{state['uploader_generation']}",
@@ -680,18 +796,75 @@ def screen_queue() -> None:
     for message in state["rejected"]:
         st.error(message)
 
-    if not state["order"]:
-        st.info("No documents yet. Upload loss runs to get started.")
+    if not state["order"] and not state["submission_order"]:
+        st.info("No documents yet. Upload loss runs or a saved email to get started.")
         _profile_library()
         return
 
     st.divider()
     _queue_summary()
+    _submissions_panel()
     _accounts_panel()
     st.divider()
     _queue_toolbar_and_list()
     st.divider()
     _profile_library()
+
+
+def _discard_staged(document_id: str) -> "DiscardResult | None":
+    """Discard one document's staged upload, if it has one.
+
+    Pops the entry first so a refusal cannot leave a dangling reference; the
+    caller reports "deleted" only when the outcome says the file is gone.
+    """
+    state = _state()
+    staged = state["staged"].pop(document_id, None)
+    if staged is None:
+        return None
+    return discard(staged)
+
+
+def _discard_after_download(document_id: str) -> None:
+    """Run from the download button's click callback, after the payload exists."""
+    result = _discard_staged(document_id)
+    state = _state()
+    if result is not None and not result.gone:
+        state["staged_error"] = (
+            "A staged upload could not be deleted and was left in place: "
+            f"{result.reason or result.outcome}."
+        )
+    else:
+        state["staged_error"] = ""
+
+
+def _download_export(
+    result: ExtractionResult, document_id: str, fmt: str, redact: bool
+) -> None:
+    """Record the downloaded format and discard its staged source."""
+    _record_export(result, fmt, redact)
+    _discard_after_download(document_id)
+
+
+def _download_submission(document_ids: list[str]) -> None:
+    """The submission workbook was downloaded: its documents' staged PDFs go.
+
+    The same lifecycle as a document export. A document still waiting for its
+    columns to be mapped keeps its file -- mapping re-reads it, and its claims
+    are not in the workbook yet.
+    """
+    state = _state()
+    kept: list[str] = []
+    for document_id in document_ids:
+        result = state["documents"].get(document_id)
+        if result is not None and result.needs_mapping:
+            continue
+        outcome = _discard_staged(document_id)
+        if outcome is not None and not outcome.gone:
+            kept.append(outcome.reason or str(outcome.outcome))
+    state["staged_error"] = (
+        f"{len(kept)} staged upload(s) could not be deleted and were left in place: "
+        f"{'; '.join(kept)}." if kept else ""
+    )
 
 
 def _extract_uploads(uploads: list[Any]) -> None:
@@ -703,11 +876,23 @@ def _extract_uploads(uploads: list[Any]) -> None:
     state["notices"] = []
     progress = st.progress(0.0, text="Reading documents")
     added = 0
+    read_email = False
 
     for index, upload in enumerate(uploads, start=1):
+        if upload.name.lower().endswith(".eml"):
+            before = len(state["submission_order"])
+            added += _extract_email(upload)
+            read_email = read_email or len(state["submission_order"]) > before
+            progress.progress(index / len(uploads), text=f"Read {upload.name}")
+            continue
         try:
-            staged = ingest(upload.getvalue(), upload.name)
-            result = run_pipeline(staged, use_llm=llm_enabled())
+            # Extract or discard: a failure after ingest never leaves the
+            # staged copy behind (spec section 9).
+            staged, result = stage_and_run(
+                upload.getvalue(),
+                upload.name,
+                lambda source: run_pipeline(source, use_llm=llm_enabled()),
+            )
             # The same file read a second time is a second document, with none
             # of the first one's corrections or review history: nothing is kept
             # between uploads (spec section 13). Said out loud, because the
@@ -716,12 +901,13 @@ def _extract_uploads(uploads: list[Any]) -> None:
             twin = _already_open(result.document.file_sha256)
             if twin is not None:
                 state["notices"].append(
-                    f"{upload.name} is the same file as "
-                    f"{twin.document.source_filename}, already in the queue. It "
+                    f"{_plain(upload.name)} is the same file as "
+                    f"{_plain(twin.document.source_filename)}, already in the queue. It "
                     f"was read again from scratch: corrections and review "
                     f"history do not carry over between uploads."
                 )
             _store(result)
+            _record_processed(result)
             state["staged"][result.document.document_id] = staged
             added += 1
         except IngestError as error:
@@ -736,10 +922,82 @@ def _extract_uploads(uploads: list[Any]) -> None:
     progress.empty()
     if added:
         state["last_added"] = added
+    if added or read_email:
         # A fresh uploader key so already-processed files disappear from the
-        # tray instead of sitting there ready to be re-added by accident.
+        # tray instead of sitting there ready to be re-added by accident -- an
+        # email whose attachments were all rejected is still a submission, and
+        # adding it again would list it twice.
         state["uploader_generation"] = state.get("uploader_generation", 0) + 1
     st.rerun()
+
+
+def _extract_email(upload: Any) -> int:
+    """Read one saved email into a submission; return the documents added.
+
+    Parsing, staging and reading are separate steps (core/eml_intake.py). A
+    fatal problem with the email as a whole adds nothing and says why; an
+    attachment that cannot be read is listed with its reason and never stops
+    its siblings.
+    """
+    state = _state()
+    status = st.empty()
+
+    def show(read: int, total: int) -> None:
+        status.caption(f"Reading attachment {read + 1} of {total} from the saved email…")
+
+    try:
+        submission, done = read_submission(
+            upload.getvalue(),
+            lambda source: run_pipeline(source, use_llm=llm_enabled()),
+            progress=show,
+        )
+    except EmlFatalError as error:
+        state["rejected"].append(f"{upload.name}: {error}")
+        return 0
+    except Exception:  # noqa: BLE001 - never crash the page, never echo parser text
+        state["rejected"].append(
+            f"{upload.name} could not be read as a saved email. Save it again from "
+            f"your mail program as .eml and retry."
+        )
+        return 0
+    # No Streamlit call until every staged file is recorded: any st call can
+    # raise a rerun, and a staged file nobody recorded is never deleted.
+    for document_id, (staged, result) in done.items():
+        twin = _already_open(result.document.file_sha256)
+        if twin is not None:
+            attachment = submission.attachment_for_document(document_id)
+            state["notices"].append(
+                f"Attachment {attachment.position if attachment else '?'} of the saved "
+                f"email is the same file as {_plain(twin.document.source_filename)}, already in "
+                f"the queue. It was read again from scratch: corrections and review "
+                f"history do not carry over between uploads."
+            )
+        state["staged"][document_id] = staged
+        _store(result)
+        state["submission_of"][document_id] = submission.submission_id
+        _record_processed(result)
+    state["submissions"][submission.submission_id] = submission
+    state["submission_order"].append(submission.submission_id)
+    status.empty()
+    counts = ", ".join(
+        f"{submission.count(outcome)} {label.lower()}"
+        for outcome, label in OUTCOME_LABELS.items() if submission.count(outcome)
+    )
+    state["notices"].append(
+        f"Read a saved email with {len(submission.attachments)} attachment(s): {counts}. "
+        f"Open the submission to see each one."
+    )
+    return len(done)
+
+
+def _submission_results(submission: Submission) -> dict[str, ExtractionResult]:
+    """The submission's documents still in this session."""
+    state = _state()
+    return {
+        document_id: state["documents"][document_id]
+        for document_id in submission.document_ids
+        if document_id in state["documents"]
+    }
 
 
 def _already_open(sha256: str) -> "ExtractionResult | None":
@@ -898,10 +1156,16 @@ def _queue_row(document_id: str) -> None:
             help="Mark it as looked at, so you can hide it and see what is left.",
         )
         filename_style = "opacity: 0.55;" if reviewed else ""
+        # Both names come from outside -- an email's sender chooses the file
+        # name -- so they are escaped before they reach HTML.
+        submission_note = (
+            "<br><span style='color: gray; font-size: 0.8rem;'>from a saved email</span>"
+            if document_id in _state()["submission_of"] else ""
+        )
         name.markdown(
-            f"<div style='{filename_style}'>📄 <b>{document.source_filename}</b><br>"
+            f"<div style='{filename_style}'>📄 <b>{html.escape(document.source_filename)}</b><br>"
             f"<span style='color: gray; font-size: 0.85rem;'>"
-            f"{document.carrier or 'Carrier unknown'}</span></div>",
+            f"{html.escape(document.carrier or 'Carrier unknown')}</span>{submission_note}</div>",
             unsafe_allow_html=True,
         )
         status_col.markdown(_status_pill(result), unsafe_allow_html=True)
@@ -923,7 +1187,29 @@ def _queue_row(document_id: str) -> None:
         if action.button("Open", key=f"open-{document_id}"):
             _open(document_id)
             st.rerun(scope="app")
+        if action.button(
+            "Remove",
+            key=f"remove-{document_id}",
+            help="Take this document out of the queue and delete its staged file.",
+        ):
+            _remove_from_queue(document_id)
+            st.rerun(scope="app")
         st.markdown('<div class="ll-row"></div>', unsafe_allow_html=True)
+
+
+def _remove_from_queue(document_id: str) -> None:
+    """Forget one document and delete the file staged for it."""
+    state = _state()
+    _discard_staged(document_id)
+    state["documents"].pop(document_id, None)
+    if document_id in state["order"]:
+        state["order"].remove(document_id)
+    if state.get("open_document") == document_id:
+        state["open_document"] = None
+    # The submission keeps its link: its summary then says this document was
+    # removed, rather than quietly reading as complete without it.
+    for key in (f"select-{document_id}", f"reviewed-{document_id}"):
+        st.session_state.pop(key, None)
 
 
 def _batch_export_bar(visible_ids: list[str]) -> None:
@@ -963,39 +1249,83 @@ def _batch_export_bar(visible_ids: list[str]) -> None:
             st.caption("Applied the same way to every selected report.")
 
             if st.button(f"Prepare {len(selected_ids)} report(s)", type="primary"):
-                state["batch_zip"] = _build_batch_zip(selected_ids, template, redact)
-                state["batch_zip_count"] = len(selected_ids)
+                payload, failed, exported_ids = _build_batch_zip(selected_ids, template, redact)
+                state["batch_zip"] = payload
+                state["batch_zip_count"] = len(exported_ids)
+                state["batch_zip_failed"] = failed
+                state["batch_zip_exported_ids"] = exported_ids
+                state["batch_zip_selected_ids"] = list(selected_ids)
+                state["batch_zip_redact"] = redact
 
-            if state.get("batch_zip"):
+            for failure in state.get("batch_zip_failed", []):
+                st.warning(failure)
+
+            if state.get("batch_zip") and state.get("batch_zip_count", 0):
                 st.download_button(
                     f"Download {state['batch_zip_count']} report(s) (.zip)",
                     data=state["batch_zip"],
                     file_name="losslift-export.zip",
                     mime="application/zip",
                     type="primary",
+                    # The payload is already in memory; once it has been handed
+                    # over the staged sources are no longer needed, so the
+                    # no-retention promise holds without a session-end hook.
+                    on_click=_complete_batch_download,
+                    args=(state["batch_zip_exported_ids"], state["batch_zip_selected_ids"],
+                          state["batch_zip_redact"]),
                 )
 
+            if state.get("deleted_notice"):
+                st.success(state.pop("deleted_notice"))
+            if state.get("staged_error"):
+                st.warning(state.pop("staged_error"))
 
-def _build_batch_zip(document_ids: list[str], template: str, redact: bool) -> bytes:
-    buffer = io.BytesIO()
-    used_names: set[str] = set()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for document_id in document_ids:
-            result = _result(document_id)
-            if result is None:
-                continue
-            payload = export_module.to_bytes(
-                result.document, result.reconciliation,
-                template=template, redact=redact,
-                source_path=result.source_path,
-            )
-            name = export_module.suggested_filename(result.document)
-            if name in used_names:
-                stem, _, ext = name.rpartition(".")
-                name = f"{stem} ({document_id[:8]}).{ext}"
-            used_names.add(name)
-            archive.writestr(name, payload)
-    return buffer.getvalue()
+
+def _discard_selected_after_batch(document_ids: list[str]) -> None:
+    """Discard the staged uploads behind a batch once its ZIP was downloaded."""
+    gone = 0
+    refused = 0
+    for document_id in document_ids:
+        outcome = _discard_staged(document_id)
+        if outcome is not None:
+            if outcome.gone:
+                gone += 1
+            else:
+                refused += 1
+    state = _state()
+    state["deleted_notice"] = f"Deleted {gone} staged file(s) after download."
+    state["staged_error"] = (
+        f"{refused} staged file(s) were not deleted and were left in place."
+        if refused
+        else ""
+    )
+
+
+def _complete_batch_download(
+    exported_ids: list[str], selected_ids: list[str], redact: bool
+) -> None:
+    for document_id in exported_ids:
+        if (result := _result(document_id)) is not None:
+            _record_export(result, "zip", redact)
+    _discard_selected_after_batch(selected_ids)
+
+
+def _build_batch_zip(
+    document_ids: list[str], template: str, redact: bool
+) -> tuple[bytes, list[str], list[str]]:
+    """Gather the selected documents and hand them to the core builder."""
+    items = []
+    exported_ids: list[str] = []
+    for document_id in document_ids:
+        result = _result(document_id)
+        if result is None:
+            continue
+        items.append((result.document, result.reconciliation, result.source_path))
+    payload, failures = export_module.build_batch_zip(
+        items, template=template, redact=redact,
+        on_success=lambda document: exported_ids.append(document.document_id),
+    )
+    return payload, failures, exported_ids
 
 
 # --------------------------------------------------------------------------
@@ -1012,13 +1342,17 @@ def screen_workspace(document_id: str) -> None:
         return
 
     top_left, top_right = st.columns([1, 5])
-    if top_left.button("← Back to queue"):
+    submission_id = _state()["submission_of"].get(document_id)
+    if submission_id and submission_id in _state()["submissions"]:
+        if top_left.button("← Back to submission"):
+            _close()
+            _open_submission(submission_id)
+            st.rerun()
+    elif top_left.button("← Back to queue"):
         _close()
         st.rerun()
     with top_right:
-        st.markdown(
-            f"## 📄 {result.document.source_filename}"
-        )
+        st.markdown(f"## 📄 {_plain(result.document.source_filename)}")
         st.caption(
             f"{result.document.carrier or 'Carrier unknown'}"
             + (f" · {result.document.named_insured}" if result.document.named_insured else "")
@@ -1026,7 +1360,7 @@ def screen_workspace(document_id: str) -> None:
     st.divider()
 
     # Streamlit's default rerun dimming reads as a stall on a heavy table, inviting re-clicks.
-    with st.spinner(f"Opening {result.document.source_filename}…"):
+    with st.spinner(f"Opening {_plain(result.document.source_filename)}…"):
         if result.needs_mapping:
             screen_mapping(document_id, result)
             return
@@ -1046,7 +1380,7 @@ def screen_workspace(document_id: str) -> None:
 def screen_mapping(document_id: str, result: ExtractionResult) -> None:
     st.caption(
         f"LossLift could not place every column in "
-        f"{result.document.source_filename}. Tell it what each one is; it will "
+        f"{_plain(result.document.source_filename)}. Tell it what each one is; it will "
         f"remember this format for every future document from this carrier."
     )
 
@@ -1119,13 +1453,25 @@ def _apply_mapping(
         return
 
     try:
-        updated = run_pipeline(staged, mapping_override=mapping, use_vision=True)
+        updated = run_or_discard(
+            staged,
+            lambda source: run_pipeline(
+                source, mapping_override=mapping, use_vision=True
+            ),
+        )
     except Exception as error:  # noqa: BLE001
-        st.error(f"The document could not be re-read with that mapping ({error}).")
+        # The re-read failed, so the staged bytes were discarded by
+        # run_or_discard; drop the session reference with them.
+        _state()["staged"].pop(document_id, None)
+        st.error(
+            f"The document could not be re-read with that mapping ({error}). "
+            f"The uploaded file has been deleted; upload it again to retry."
+        )
         return
 
     save_confirmed_mapping(updated, mapping, confirmed_by_human=True)
     _store(updated)
+    _record_processed(updated)
     st.success(
         f"Saved. Documents from {updated.document.carrier or 'this carrier'} in "
         f"this format will map themselves from now on."
@@ -1191,6 +1537,63 @@ def _loss_snapshot(document) -> None:
         st.caption(f"No claims at or above {threshold:,.0f}.")
 
 
+def _runs_summary(result: ExtractionResult) -> None:
+    """The loss runs this PDF binds, when it binds more than one.
+
+    A single loss run shows nothing here. A packet shows each run's pages, how
+    its boundary is known and whether it reconciles, and names every page
+    range whose boundary the printed pages did not settle.
+    """
+    accounts = claim_accounting(result.document, result.reconciliation)
+    packet = result.document.is_packet
+    if packet:
+        st.markdown(f"**Loss runs in this PDF ({len(accounts)})**")
+        for run_id, pages, why in unsettled_runs(result.document):
+            st.warning(
+                f"Pages {pages} ({run_id}): where this loss run begins is not settled -- "
+                f"{why}. Its claims are kept and marked for review. Check the PDF and "
+                f"confirm which report these pages belong to before exporting."
+            )
+    # What was accounted for, and what could not be: shown open for a packet
+    # or anything unaccounted, folded away for a single clean report.
+    unaccounted = any(a.refused_rows or a.unplaced_rows or not a.boundary_settled
+                      for a in accounts)
+    with st.expander("What LossLift accounted for", expanded=packet or unaccounted):
+        st.dataframe(
+            [
+                {
+                    "Run": a.run_id or "whole document",
+                    "Pages": a.pages,
+                    "Carrier": a.carrier or "",
+                    "Policy term": (f"{a.policy_term_start or '?'} to {a.policy_term_end or '?'}"
+                                    if a.policy_term_start or a.policy_term_end else ""),
+                    "Printed claim count": a.printed_claim_count,
+                    "Claims read": a.claims_read,
+                    "Refused claim-like rows": a.refused_rows,
+                    "Unplaced rows": a.unplaced_rows,
+                    "Printed totals": a.totals,
+                    "Claim count": a.claim_count,
+                    "Boundary settled": "yes" if a.boundary_settled else "no",
+                    "Status": "Reconciled" if a.status is DocumentStatus.CLEAN
+                    else "Needs review",
+                }
+                for a in accounts
+            ],
+            hide_index=True, width="stretch",
+        )
+        for a in accounts:
+            where = a.run_id or "This document"
+            if a.refused_pages:
+                st.caption(f"{where}: claim-like rows refused on page(s) "
+                           f"{', '.join(map(str, a.refused_pages))} -- open those pages "
+                           f"to check them.")
+            if a.unplaced_pages:
+                st.caption(f"{where}: rows with amounts no claim took on page(s) "
+                           f"{', '.join(map(str, a.unplaced_pages))}.")
+            for reason in a.reasons[:5]:
+                st.caption(f"{where} needs review -- {reason}")
+
+
 def _period_summary(document) -> None:
     """Claims by policy term — the loss history a submission actually asks for.
 
@@ -1243,6 +1646,276 @@ def _period_summary(document) -> None:
     st.dataframe(rows, hide_index=True, width="stretch")
 
 
+# --------------------------------------------------------------------------
+# Submissions — a saved email and everything that arrived with it
+# --------------------------------------------------------------------------
+
+_SUBMISSION_PILL = {
+    "ready": "ll-pill-clean", "needs_review": "ll-pill-review", "incomplete": "ll-pill-review",
+}
+
+
+def _open_submission(submission_id: str) -> None:
+    state = _state()
+    state["open_submission"] = submission_id
+    state["open_document"] = None
+
+
+def _submissions_panel() -> None:
+    """Each saved email, with its status and a way into it."""
+    state = _state()
+    if not state["submission_order"]:
+        return
+    st.markdown("#### Submissions from saved emails")
+    for submission_id in state["submission_order"]:
+        submission = state["submissions"].get(submission_id)
+        if submission is None:
+            continue
+        summary = summarise_submission(submission, _submission_results(submission))
+        left, middle, right = st.columns([3, 3, 1])
+        left.markdown(
+            f"<span class='ll-pill {_SUBMISSION_PILL[summary.status]}'>"
+            f"{html.escape(status_label(summary))}</span>",
+            unsafe_allow_html=True,
+        )
+        left.caption(f"Submission {submission.submission_id}")
+        middle.write(
+            f"{len(submission.attachments)} attachment(s) · {len(summary.documents)} read · "
+            f"{len(summary.blockers)} outstanding"
+        )
+        if right.button("Open", key=f"open-sub-{submission_id}"):
+            _open_submission(submission_id)
+            st.rerun(scope="app")
+    st.divider()
+
+
+def _inventory_frame(submission: Submission) -> pd.DataFrame:
+    """The attachment inventory. A dataframe: email-derived text is never markdown."""
+    return pd.DataFrame([
+        {
+            "#": a.position,
+            "File name": a.display_filename,
+            "Declared type": a.declared_mime,
+            "Size (KB)": round(a.size_bytes / 1024, 1),
+            "Outcome": OUTCOME_LABELS[a.outcome] + (" · set aside" if a.set_aside else ""),
+            "Reading": PROCESSING_LABELS[a.processing],
+            "Why": a.reason or a.processing_reason,
+            "SHA-256": (a.sha256 or "")[:16],
+            "Attachment ID": a.attachment_id,
+        }
+        for a in submission.attachments
+    ])
+
+
+def _show_evidence(document_id: str, claim_number: str, page: int | None,
+                   row: int | None) -> None:
+    """Open a document at the page and row a summarised claim was read from."""
+    state = _state()
+    state["open_document"] = document_id
+    st.session_state[f"stage-{document_id}"] = REVIEW
+    result = state["documents"].get(document_id)
+    if result is None:
+        return
+    claim = next((c for c in result.document.claims
+                  if c.claim_number == claim_number
+                  and (c.source_page, c.source_row) == (page, row)), None)
+    if claim is None:
+        return
+    st.session_state[f"evidence-pick-{document_id}"] = f"Claim {claim.claim_number}"
+    if "incurred_total" in claim.raw_cells:
+        st.session_state[f"evidence-field-{document_id}"] = "incurred_total"
+    st.session_state[f"show-evidence-{document_id}"] = True
+
+
+def _source_label(submission: Submission, source: Any) -> str:
+    """"Attachment 2 · run-1": LossLift's own words and ids, never email text."""
+    attachment = submission.attachment(source.attachment_id) if source.attachment_id else None
+    label = f"Attachment {attachment.position}" if attachment else "Document"
+    return label + (f" · {source.run_id}" if source.run_id else "")
+
+
+def _all_claims(submission: Submission, account: Any, key: str) -> None:
+    """Every claim the account counts, where it was read, and a way to its page."""
+    lines = account.claim_lines
+    if not lines:
+        return
+    with st.expander(f"All {len(lines)} claim(s), with where each was read"):
+        st.dataframe(pd.DataFrame([
+            {
+                "Claim number": line.claim_number,
+                "Date of loss": line.date_of_loss,
+                "Status": line.claim_status or "",
+                "Incurred": _money(line.incurred_total),
+                "Valued at": line.valued_at,
+                "Valuations": line.valuations,
+                "Read from": _source_label(submission, line.provenance),
+                "Page": line.provenance.page,
+                "Review": line.note,
+            }
+            for line in lines
+        ]), hide_index=True, width="stretch")
+        left, right = st.columns([3, 1])
+        index = left.selectbox(
+            "Claim", range(len(lines)), key=f"{key}-pick",
+            format_func=lambda i: f"{lines[i].claim_number} · page {lines[i].provenance.page}",
+            label_visibility="collapsed",
+        )
+        if right.button("Evidence", key=f"{key}-evidence"):
+            chosen = lines[index].provenance
+            _show_evidence(chosen.document_id, lines[index].claim_number,
+                           chosen.page, chosen.row)
+            st.rerun()
+
+
+def screen_submission(submission_id: str) -> None:
+    state = _state()
+    submission = state["submissions"].get(submission_id)
+    if submission is None:
+        st.warning("This submission is no longer in the session.")
+        state["open_submission"] = None
+        st.rerun()
+        return
+    results = _submission_results(submission)
+    summary = summarise_submission(submission, results)
+
+    if st.button("← Back to queue", key="submission-back"):
+        state["open_submission"] = None
+        st.rerun()
+    st.markdown("## 📨 Submission")
+    st.caption(f"Submission {submission.submission_id} · uploaded "
+               f"{submission.uploaded_at:%Y-%m-%d %H:%M} UTC")
+    css = "ll-status-pass" if summary.status == "ready" else "ll-status-fail"
+    st.markdown(
+        f"<div class='ll-status {css}'><b>{html.escape(status_label(summary))}</b></div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Email details (kept in this session only)"):
+        st.text(f"From:    {submission.sender or 'not stated'}\n"
+                f"Subject: {submission.subject or 'not stated'}\n"
+                f"Date:    {submission.email_date or 'not stated'}")
+        st.caption("The email body is never read into LossLift, and the raw message is "
+                   "not kept. Nothing linked or embedded in it is opened.")
+
+    cols = st.columns(5)
+    cols[0].metric("Attachments", len(submission.attachments))
+    cols[1].metric("Read", len(summary.documents))
+    cols[2].metric("Rejected or failed",
+                   submission.count(IntakeOutcome.REJECTED) + submission.count(IntakeOutcome.FAILED))
+    cols[3].metric("Duplicates", submission.count(IntakeOutcome.DUPLICATE))
+    cols[4].metric("Outstanding", len(summary.blockers))
+
+    st.markdown("### What arrived")
+    st.dataframe(_inventory_frame(submission), hide_index=True, width="stretch")
+    settable = [a for a in submission.attachments
+                if a.outcome in (IntakeOutcome.REJECTED, IntakeOutcome.FAILED)]
+    if settable:
+        st.caption("A rejected attachment keeps the submission open until you confirm it "
+                   "is not a loss run this submission needs.")
+        for attachment in settable:
+            aside = st.checkbox(
+                f"Attachment {attachment.position} is not needed",
+                value=attachment.set_aside,
+                key=f"aside-{attachment.attachment_id}",
+                help="Recorded beside the rejection, never in place of it.",
+            )
+            if aside != attachment.set_aside:
+                submission.set_attachment_aside(attachment.attachment_id, aside)
+                st.rerun()
+
+    st.markdown("### Outstanding")
+    if summary.blockers:
+        for blocker in summary.blockers:
+            st.text(f"• {blocker}")
+    else:
+        st.success("Nothing outstanding.")
+
+    st.markdown("### Documents")
+    if not summary.documents:
+        st.info("No loss run was read from this email.")
+    for line in summary.documents:
+        result = results[line.document_id]
+        attachment = submission.attachment(line.attachment_id)
+        left, middle, right = st.columns([3, 3, 1])
+        left.text(f"Attachment {attachment.position}: {attachment.display_filename}")
+        left.markdown(_status_pill(result), unsafe_allow_html=True)
+        runs = f"{len(line.runs)} logical runs · " if line.runs else ""
+        middle.write(f"{runs}{line.claims} claim(s) · {line.blocking_findings} open issue(s)")
+        if right.button("Open", key=f"sub-open-{line.document_id}"):
+            state["open_document"] = line.document_id
+            st.rerun()
+
+    st.markdown("### Loss summary")
+    st.caption("Merged across the documents above. Claims repeated at several valuations "
+               "count once, at their latest value; duplicate attachments are read once.")
+    st.text(f"Named insured: {summary.named_insured or summary.named_insured_note}")
+    for account in summary.accounts:
+        with st.container(border=True):
+            st.text(account.name)
+            metrics = st.columns(4)
+            metrics[0].metric("Claims", account.claims)
+            metrics[1].metric("Open", account.open_claims)
+            metrics[2].metric(
+                "Total incurred",
+                f"{account.incurred_total:,.2f}" if account.incurred_total is not None else "—",
+            )
+            metrics[3].metric("Status", "Reconciled" if account.status is DocumentStatus.CLEAN
+                              else "Needs review")
+            if account.incurred_unavailable:
+                st.caption(f"Total incurred {account.incurred_unavailable}.")
+            elif account.status is not DocumentStatus.CLEAN:
+                st.caption("These figures come from documents that still need review; "
+                           "check them before relying on the total.")
+            st.text(
+                "Valuation dates: "
+                + (", ".join(d.isoformat() for d in account.valuation_dates) or "not stated")
+                + "\nPolicy terms: " + ("; ".join(account.policy_periods) or "not stated")
+            )
+            for note in account.period_notes:
+                st.caption(_plain(note))
+            st.caption("Read from: " + "; ".join(
+                _source_label(submission, source) for source in account.sources))
+            if account.large_claims:
+                st.markdown(f"**Large claims** (incurred of "
+                            f"{export_module.LARGE_LOSS_THRESHOLD:,.0f} or more)")
+                for index, claim in enumerate(account.large_claims):
+                    row = st.columns([2, 2, 3, 1])
+                    row[0].text(claim.claim_number)
+                    row[1].text(f"{claim.incurred_total:,.2f}")
+                    where = submission.attachment(claim.provenance.attachment_id)
+                    row[2].caption(
+                        f"Attachment {where.position if where else '?'}"
+                        + (f" · {claim.provenance.run_id}" if claim.provenance.run_id else "")
+                        + f" · page {claim.provenance.page}"
+                        + ("" if claim.trusted else " · needs review")
+                    )
+                    if row[3].button("Evidence",
+                                     key=f"ev-{submission_id}-{account.name}-{index}"):
+                        _show_evidence(claim.provenance.document_id, claim.claim_number,
+                                       claim.provenance.page, claim.provenance.row)
+                        st.rerun()
+            _all_claims(submission, account, key=f"all-{submission_id}-{account.name}")
+
+    st.markdown("### Export")
+    if state.get("staged_error"):
+        st.warning(state.pop("staged_error"))
+    redact = st.toggle("Redact identifying data", value=True, key=f"sub-redact-{submission_id}",
+                       help="Withholds the sender, subject, file names, insured, policy "
+                            "numbers and claimant data. Ids and file hashes stay.")
+    st.download_button(
+        "Download submission summary (.xlsx)",
+        data=submission_to_bytes(submission, summary, results, redact=redact),
+        file_name=submission_filename(submission),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"sub-download-{submission_id}",
+        on_click=_download_submission,
+        args=(list(results),),
+    )
+    st.caption("Downloading deletes the uploaded PDFs behind this summary, as a document "
+               "export does; the extracted tables stay in this session. Evidence pages "
+               "are drawn from those files, so check them before you download. A document "
+               "still waiting for its columns keeps its file.")
+
+
 def _accounts_panel() -> None:
     """Loss runs for one insured, merged into the history a submission asks for.
 
@@ -1251,14 +1924,16 @@ def _accounts_panel() -> None:
     since merging one run with nothing is the review screen again.
     """
     state = _state()
-    documents = [
-        state["documents"][did].document
+    results = [
+        state["documents"][did]
         for did in state["order"]
         if not state["documents"][did].needs_mapping
     ]
+    documents = [result.document for result in results]
+    reconciliations = {result.document.document_id: result.reconciliation for result in results}
     accounts = [
         account
-        for account in build_accounts(documents)
+        for account in build_accounts(documents, reconciliations)
         if len(account.documents) > 1 and account.name != UNNAMED_ACCOUNT
     ]
     if not accounts:
@@ -1269,16 +1944,169 @@ def _accounts_panel() -> None:
         "Loss runs filed under the same insured, merged. Where a claim appears "
         "in more than one run, the newest valuation is the one carried forward."
     )
+
+    upload = st.file_uploader(
+        "Appetite rules (JSON, optional)", type=["json"], key="triage-rules-json"
+    )
+    if upload is not None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / Path(upload.name).name
+            path.write_bytes(upload.getvalue())
+            try:
+                rules = load_appetite_rules(path)
+            except AppetiteConfigError as exc:
+                st.error(f"Appetite rules file rejected: {exc}")
+                rules = AppetiteRules()
+    else:
+        rules = AppetiteRules()
+        st.caption(
+            "No appetite rules loaded - thresholds are not configured; "
+            "nothing will be reported as passing silently."
+        )
+
+    def _triage_section(account: AccountRollup, rules: AppetiteRules) -> None:
+        """The account as the underwriter's triage reads it, with provenance.
+
+        Read-only over what reconciliation already marked. A non-CLEAN account
+        is not ready to price, and its appetite flags are provisional on that.
+        """
+        triage = triage_summary(account, rules)
+        st.markdown("#### Underwriting triage")
+        if triage.status is DocumentStatus.CLEAN:
+            st.markdown(
+                "**Account status: CLEAN** - account trusted by reconciliation, "
+                "appetite flags below."
+            )
+        else:
+            st.markdown(
+                f"**Account status: {triage.status.value}** - account needs "
+                "review, not ready to price; appetite flags are provisional."
+            )
+        if triage.flags:
+            st.dataframe(
+                [
+                    {
+                        "Rule": flag.rule,
+                        "Severity": flag.severity.value,
+                        "Claims": ", ".join(flag.claim_numbers),
+                        "Evaluated": flag.evaluated,
+                        "Cannot evaluate": not flag.evaluated,
+                        "Reason": (
+                            flag.reason
+                            if flag.evaluated
+                            else flag.not_evaluated_reason or flag.reason
+                        ),
+                    }
+                    for flag in triage.flags
+                ],
+                hide_index=True, width="stretch",
+            )
+        else:
+            st.caption("No appetite flags for this account under the loaded rules.")
+        if triage.not_evaluated:
+            st.markdown("**Could not be evaluated**")
+            for item in triage.not_evaluated:
+                st.markdown(f"- {item}")
+        if triage.period_gaps:
+            st.markdown("**Coverage-period gaps**")
+            for gap in triage.period_gaps:
+                st.markdown(f"- {gap}")
+
+        flagged = [flag for flag in triage.flags if flag.sources]
+        if flagged:
+            flag_labels = [
+                f"{flag.rule} - {', '.join(flag.claim_numbers) or 'account-level'}"
+                for flag in flagged
+            ]
+            picked_flag = st.selectbox(
+                "Show me where this came from",
+                flag_labels,
+                key=f"triage-flag-{account.name}",
+            )
+            flag = flagged[flag_labels.index(picked_flag)]
+            source_labels = [
+                f"{s.source_filename} · run {s.run_id or '-'} · page {s.page}"
+                for s in flag.sources
+            ]
+            picked_source = st.selectbox(
+                "Source", source_labels, key=f"triage-source-{account.name}"
+            )
+            source = flag.sources[source_labels.index(picked_source)]
+            result = state["documents"].get(source.document_id)
+            claim = None
+            if result is not None:
+                candidates = [
+                    appearance.claim
+                    for history in account.histories
+                    for appearance in history.appearances
+                    if appearance.document_id == source.document_id
+                    and appearance.claim.claim_number == source.claim_number
+                ]
+                if candidates:
+                    exact = [
+                        c for c in candidates if c.row_id == source.row_id
+                    ]
+                    claim = (exact or candidates)[0]
+            if result is not None and claim is not None:
+                evidence = claim_evidence(claim)
+                if result.source_path:
+                    evidence = confirm_region(result.source_path, evidence, claim.claim_number)
+                left, right = st.columns([2, 3])
+                with left:
+                    st.markdown(f"**Source** — {evidence.describe()}")
+                    st.caption(evidence.note)
+                    st.markdown(f"Extraction: `{evidence.method.value}`")
+                    if evidence.text:
+                        st.markdown("Text on the page:")
+                        st.code(evidence.text, language=None)
+                with right:
+                    if not result.source_path or not Path(result.source_path).exists():
+                        st.info(
+                            "The uploaded file has been deleted, so the page cannot be shown. "
+                            "The page number, line and cell text above are kept."
+                        )
+                    else:
+                        image = render_evidence(result.source_path, evidence)
+                        if image is None:
+                            st.info("There is no page to show for this one.")
+                        else:
+                            st.image(image, width="stretch")
+            else:
+                st.caption(
+                    "Source document is not in this session - provenance on "
+                    f"record: file {source.source_filename}, "
+                    f"run {source.run_id or '-'}, page {source.page}."
+                )
+
+        triage_bytes = export_module.account_triage_to_bytes(account, rules)
+        st.download_button(
+            "Download triage workbook (xlsx)",
+            data=triage_bytes,
+            file_name=f"{account.name.replace(' ', '_')}_triage.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"triage-dl-{account.name}",
+        )
+
     for account in accounts:
+        clean = account.status is DocumentStatus.CLEAN
         with st.expander(
-            f"{account.name} — {len(account.documents)} loss runs, "
+            f"{'✓' if clean else '⚠'} {_plain(account.name)} — {len(account.sources)} loss runs, "
             f"{len(account.histories)} claims"
+            + ("" if clean else " — needs review")
         ):
+            if not clean:
+                st.warning(
+                    "This merged history is not reconciled. "
+                    + "; ".join(_plain(reason) for reason in account.reasons()[:6])
+                    + ". Claims from those runs are included and marked; resolve "
+                    "them before relying on the totals."
+                )
             st.caption(
                 "Valued at "
                 + ", ".join(d.isoformat() for d in account.valuation_dates)
                 + " · " + ", ".join(
-                    d.source_filename for d in account.documents
+                    _plain(s.source_filename) + (f" ({s.run_id})" if s.run_id else "")
+                    for s in account.sources
                 )
             )
             st.dataframe(
@@ -1309,6 +2137,8 @@ def _accounts_panel() -> None:
                             "Incurred now": _money(history.current.incurred_total),
                             "Movement": _money(history.development),
                             "Runs": len(history.appearances),
+                            "Review": history.uncertain
+                            or ("" if history.trusted else "run needs review"),
                         }
                         for history in account.developed
                     ],
@@ -1323,10 +2153,21 @@ def _accounts_panel() -> None:
                     + ". Confirm they were closed and purged rather than left out."
                 )
 
+            account_redact = st.toggle(
+                "Remove claimant names from this workbook",
+                key=f"account-redact-{account.name}",
+                help="The account workbook is redacted the same way as a "
+                     "single-document export: the claimant column is dropped "
+                     "and the sensitive values are scrubbed from the rest.",
+            )
+            _triage_section(account, rules)
+
             st.download_button(
                 "Download account workbook",
-                data=export_module.account_to_bytes(account),
-                file_name=f"{account.name.replace(' ', '_')}_loss_history.xlsx",
+                data=export_module.account_to_bytes(account, redact=account_redact),
+                file_name=safe_member_name(
+                    f"{account.name.replace(' ', '_')}_loss_history.xlsx"
+                ),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"account-dl-{account.name}",
             )
@@ -1345,6 +2186,7 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         _document_facts(result)
         _document_notes(result)
 
+    _runs_summary(result)
     _period_summary(result.document)
     _loss_snapshot(result.document)
 
@@ -1360,7 +2202,10 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
     with st.expander("Review findings", expanded=bool(result.reconciliation.findings)):
         _review_workspace(result, document_id)
 
-    with st.expander("Source evidence", expanded=False):
+    # Opened from a submission's Evidence button, the panel starts open on
+    # the claim it was asked about.
+    with st.expander("Source evidence",
+                     expanded=bool(st.session_state.pop(f"show-evidence-{document_id}", False))):
         _evidence_panel(result, document_id)
 
     st.markdown("**Claims**")
@@ -1383,23 +2228,25 @@ def screen_review(document_id: str, result: ExtractionResult) -> None:
         num_rows="dynamic",
         width="stretch",
         hide_index=True,
-        column_config=_column_config(columns),
+        column_config=_column_config(columns, packet=result.document.is_packet),
         column_order=list(columns) + list(PROVENANCE_COLUMNS),
     )
 
     edited_records = edited.to_dict("records")
     if edited_records != records:
         previous_document = result.document
+        logged = len(previous_document.review_log.entries)
         try:
             edit_claims(result, edited_records)
         except ValueError as refused:
             st.error(str(refused))
         else:
             if result.document is not previous_document:
+                _record_review(result, logged)
                 st.rerun()
 
 
-def _column_config(columns: list[str]) -> dict[str, Any]:
+def _column_config(columns: list[str], *, packet: bool = False) -> dict[str, Any]:
     config: dict[str, Any] = {}
     for name in columns:
         label = _FIELD_LABELS.get(name, name)
@@ -1419,7 +2266,14 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
         else:
             config[name] = st.column_config.TextColumn(label)
 
-    config["_page"] = st.column_config.NumberColumn("Page", disabled=True, width="small")
+    # In a packet the page decides which loss run a claim belongs to, so a row
+    # added by hand takes the page the reviewer gives it. A row read off the
+    # document keeps the page it was read from, whatever is typed here.
+    config["_page"] = st.column_config.NumberColumn(
+        "Page", disabled=not packet, width="small", min_value=1, step=1,
+        help=("For a claim you add, the page of the loss run it belongs to."
+              if packet else None),
+    )
     config["_row"] = st.column_config.NumberColumn("Line", disabled=True, width="small")
     config["_method"] = st.column_config.TextColumn(
         "Read by", disabled=True, width="small"
@@ -1430,6 +2284,9 @@ def _column_config(columns: list[str]) -> dict[str, Any]:
 
 def screen_export(document_id: str, result: ExtractionResult) -> None:
     _reconciliation_card(result)
+    state = _state()
+    if state.get("staged_error"):
+        st.warning(state.pop("staged_error"))
 
     left, right = st.columns(2)
     template = left.selectbox(
@@ -1457,39 +2314,79 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
             f"workbook exports either way — the Exceptions sheet lists them."
         )
 
-    payload = export_module.to_bytes(
-        result.document,
-        result.reconciliation,
-        template=template,
-        redact=redact,
-        include_provenance=provenance,
-        # The file, so the workbook can read its own evidence back before it
-        # writes it down — the same check the review screen makes before it
-        # draws a highlight.
-        source_path=result.source_path,
-    )
+    try:
+        payload = export_module.to_bytes(
+            result.document,
+            result.reconciliation,
+            template=template,
+            redact=redact,
+            include_provenance=provenance,
+            # The file, so the workbook can read its own evidence back before it
+            # writes it down — the same check the review screen makes before it
+            # draws a highlight.
+            source_path=result.source_path,
+        )
+        json_payload = export_module.to_json_bytes(
+            result.document, result.reconciliation, redact=redact,
+        )
+    except Exception as error:  # noqa: BLE001 - report, and never keep the file
+        # A failed export is a failure after ingest, so the staged copy goes:
+        # it is not kept in the hope a retry will want a file the user was told
+        # was temporary.
+        _discard_staged(document_id)
+        st.error(
+            f"The workbook could not be built ({error}). The uploaded file has "
+            f"been deleted; upload it again to try once more."
+        )
+        return
+
     st.download_button(
         "Download Excel",
         data=payload,
-        file_name=export_module.suggested_filename(result.document),
+        file_name=export_module.suggested_filename(
+            result.document,
+            needs_review=canonical_status(result.reconciliation) is DocumentStatus.NEEDS_REVIEW,
+            redact=redact,
+        ),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         key=f"download-{document_id}",
+        on_click=_download_export,
+        args=(result, document_id, "xlsx", redact),
+    )
+    st.download_button(
+        "Download JSON",
+        data=json_payload,
+        file_name=export_module.suggested_json_filename(
+            result.document,
+            needs_review=canonical_status(result.reconciliation) is DocumentStatus.NEEDS_REVIEW,
+            redact=redact,
+        ),
+        mime="application/json",
+        key=f"download-json-{document_id}",
+        on_click=_download_export,
+        args=(result, document_id, "json", redact),
     )
     st.caption(
-        "Three sheets: Claims, Exceptions, and Source Info with the file hash "
-        "and valuation date. For many reports at once, use Export from the queue."
+        "Sheets: "
+        + ", ".join(export_module.workbook_sheets(result.document))
+        + ". Source Info carries the file hash and valuation date. For many "
+        "reports at once, use Export from the queue."
     )
 
     st.divider()
     if st.button("Delete the uploaded file now", key=f"delete-{document_id}"):
-        staged = _state()["staged"].pop(document_id, None)
-        if staged is not None:
-            discard(staged)
-        st.success(
-            "Deleted. The extracted table stays in this session until you close "
-            "the tab."
-        )
+        outcome = _discard_staged(document_id)
+        if outcome is None or outcome.gone:
+            st.success(
+                "Deleted. The extracted table stays in this session until you "
+                "close the tab."
+            )
+        else:
+            st.error(
+                "The file was not deleted: "
+                f"{outcome.reason or outcome.outcome}. It was left where it was."
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1500,6 +2397,16 @@ def screen_export(document_id: str, result: ExtractionResult) -> None:
 def main() -> None:
     st.markdown(_STYLE, unsafe_allow_html=True)
     state = _state()
+
+    # Best-effort once per session: clear staging directories a previous run
+    # left behind. Streamlit has no reliable session-end hook, so this is the
+    # honest alternative to promising a deletion that never happens.
+    if not state.get("staging_swept"):
+        state["staging_swept"] = True
+        try:
+            sweep_orphaned_staging()
+        except Exception:  # noqa: BLE001 - best effort, never block the page
+            pass
 
     with st.sidebar:
         st.markdown("### LossLift")
@@ -1513,9 +2420,10 @@ def main() -> None:
                 f"{statuses.count('needs_review')} need review · "
                 f"{statuses.count('clean')} reconciled"
             )
-        if state["open_document"]:
+        if state["open_document"] or state["open_submission"]:
             if st.button("← Back to queue", width="stretch"):
                 _close()
+                state["open_submission"] = None
                 st.rerun()
         st.divider()
         st.caption(
@@ -1528,6 +2436,8 @@ def main() -> None:
 
     if state["open_document"]:
         screen_workspace(state["open_document"])
+    elif state["open_submission"]:
+        screen_submission(state["open_submission"])
     else:
         screen_queue()
 

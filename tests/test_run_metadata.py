@@ -1,0 +1,321 @@
+"""A logical run is judged by what its own pages print.
+
+Two carriers' reports bound in one PDF have two carriers, two policies, two
+terms and two valuation dates. The rules run over each run with that run's
+facts (``core.reconcile.run_view``), and the workbook writes each claim's row
+with its own run's facts -- never the first report's letterhead standing in
+for every page. Synthetic documents only (spec section 9).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from io import BytesIO
+
+from openpyxl import load_workbook
+
+from core.export import to_bytes
+from core.review import canonical_run_status
+from core.schema import DocumentStatus
+from tests.test_packet_adversarial import _read, _total
+from tests.test_packet_claim_series import LARGE_CARRIER, SMALL_CARRIER, SMALL_HEADERS
+
+GL_TERM = ("Policy Number: GL-100", "Policy Period: 01/01/2022 to 01/01/2023")
+AUTO_TERM = ("Policy Number: AU-200", "Policy Period: 01/01/2020 to 01/01/2021")
+
+RUN_ONE = [
+    ("71004410", "03/10/2022", "CLOSED", "1,000.00", "0.00", "1,000.00"),
+    ("71004411", "07/22/2022", "CLOSED", "2,500.00", "0.00", "2,500.00"),
+]
+RUN_TWO = [
+    ("CR-50001", "03/15/2020", "CLOSED", "400.00", "0.00", "400.00"),
+    ("CR-50002", "09/01/2020", "CLOSED", "600.00", "0.00", "600.00"),
+    ("CR-50003", "05/05/2021", "CLOSED", "700.00", "0.00", "700.00"),   # after its own term
+]
+
+
+def _packet(tmp_path, *, second_valuation=True, second_carrier=True):
+    second_top = (
+        "Page 1 of 1",
+        *((SMALL_CARRIER,) if second_carrier else ()),
+        "LOSS RUN REPORT",
+        *AUTO_TERM,
+        *(("Valuation Date: 06/30/2021",) if second_valuation else ()),
+    )
+    return _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", *GL_TERM,
+                 "Valuation Date: 12/31/2022"),
+         "rows": RUN_ONE, "total": _total(RUN_ONE)},
+        {"top": second_top, "headers": SMALL_HEADERS, "rows": RUN_TWO,
+         "total": _total(RUN_TWO)},
+    ])
+
+
+def _claim_rows(result) -> dict[str, dict]:
+    sheet = load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))["Claim Detail"]
+    header = [cell.value for cell in sheet[1]]
+    rows = {}
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        record = dict(zip(header, row))
+        rows[record["Claim number"]] = record
+    return rows
+
+
+def test_each_run_keeps_its_own_carrier_policy_term_and_valuation(tmp_path):
+    result = _packet(tmp_path)
+    one, two = result.document.runs
+    assert (one.carrier, one.policy_number) == (LARGE_CARRIER, "GL-100")
+    assert (two.carrier, two.policy_number) == (SMALL_CARRIER, "AU-200")
+    assert (one.policy_period_start, one.policy_period_end) == (date(2022, 1, 1), date(2023, 1, 1))
+    assert (two.policy_period_start, two.policy_period_end) == (date(2020, 1, 1), date(2021, 1, 1))
+    assert (one.valuation_date, two.valuation_date) == (date(2022, 12, 31), date(2021, 6, 30))
+
+
+def test_loss_dates_are_judged_against_their_own_runs_term(tmp_path):
+    """Run 2's 2020 claims sit inside run 2's term. Judged against run 1's
+    2022 term every one of them was out of period; only the one after run
+    2's own term is."""
+    result = _packet(tmp_path)
+    outside = [f for f in result.reconciliation.findings if f.rule_id == "R-09"]
+    assert [(f.claim_number, f.run_id) for f in outside] == [("CR-50003", "run-2")]
+    assert outside[0].expected == "2020-01-01 to 2021-01-01"
+
+
+def test_each_claim_row_carries_its_own_runs_facts(tmp_path):
+    rows = _claim_rows(_packet(tmp_path))
+    first, second = rows["71004410"], rows["CR-50001"]
+    assert (first["Run ID"], first["Carrier"], first["Policy number"]) \
+        == ("run-1", LARGE_CARRIER, "GL-100")
+    assert (second["Run ID"], second["Carrier"], second["Policy number"]) \
+        == ("run-2", SMALL_CARRIER, "AU-200")
+    assert second["Policy term start"].date() == date(2020, 1, 1)
+    assert second["Valuation date"].date() == date(2021, 6, 30)
+
+
+def test_a_run_that_prints_no_valuation_date_does_not_borrow_one(tmp_path):
+    """R-06 is raised for the run that prints none; its rows say nothing
+    rather than run 1's date; run 1 is untouched."""
+    result = _packet(tmp_path, second_valuation=False)
+    reconciliation = result.reconciliation
+    missing = [f for f in reconciliation.findings if f.rule_id == "R-06"]
+    assert [f.run_id for f in missing] == ["run-2"]
+    assert canonical_run_status(reconciliation, "run-1") is DocumentStatus.CLEAN
+    assert canonical_run_status(reconciliation, "run-2") is DocumentStatus.NEEDS_REVIEW
+    assert _claim_rows(result)["CR-50001"]["Valuation date"] is None
+
+
+def test_a_run_that_prints_no_carrier_is_not_given_another_runs(tmp_path):
+    """Whatever the run's own page yields for a carrier, it is never run 1's.
+    (``detect_carrier`` can take a column-label line for a name when no
+    letterhead prints one -- a known, document-level limitation.)"""
+    result = _packet(tmp_path, second_carrier=False)
+    assert result.document.runs[1].carrier != LARGE_CARRIER
+    assert _claim_rows(result)["CR-50001"]["Carrier"] != LARGE_CARRIER
+
+
+# --- per-run Source Info and Loss Summary ----------------------------------
+
+def _workbook(result):
+    return load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))
+
+
+def _per_run_source_rows(result) -> list[dict]:
+    """The rows of Source Info's per-run facts block, one dict per run."""
+    sheet = _workbook(result)["Source Info"]
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    start = next(
+        index for index, row in enumerate(rows)
+        if row[0] == "Per-run facts"
+    )
+    header = rows[start + 1]
+    out = []
+    for row in rows[start + 2:]:
+        if row[0] is None:
+            break
+        out.append(dict(zip(header, row)))
+    return out
+
+
+def _per_run_summary_blocks(result) -> dict[str, dict]:
+    """Loss Summary's per-run blocks, keyed by run id."""
+    sheet = _workbook(result)["Loss Summary"]
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    starts = [
+        index for index, row in enumerate(rows)
+        if isinstance(row[0], str) and row[0].startswith("Run run-")
+    ]
+    blocks = {}
+    for index in starts:
+        run_id = rows[index][0].split(" ")[1]
+        header = rows[index + 1]
+        period_rows = []
+        for row in rows[index + 2:]:
+            if row[0] is None:
+                break
+            period_rows.append(dict(zip(header, row)))
+        blocks[run_id] = {"header": rows[index][0], "rows": period_rows}
+    return blocks
+
+
+def _packet_with_counts(tmp_path):
+    """The same packet, each report also printing its own claim count."""
+    return _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", *GL_TERM,
+                 "Valuation Date: 12/31/2022"),
+         "rows": RUN_ONE, "total": _total(RUN_ONE), "after": ("Total Claims: 2",)},
+        {"top": ("Page 1 of 1", SMALL_CARRIER, "LOSS RUN REPORT", *AUTO_TERM,
+                 "Valuation Date: 06/30/2021"),
+         "headers": SMALL_HEADERS, "rows": RUN_TWO, "total": _total(RUN_TWO),
+         "after": ("Total Claims: 3",)},
+    ], name="packet-counts.pdf")
+
+
+def test_source_info_names_each_runs_own_facts(tmp_path):
+    result = _packet_with_counts(tmp_path)
+    rows = {row["Run"]: row for row in _per_run_source_rows(result)}
+    assert set(rows) == {"run-1", "run-2"}
+    one, two = rows["run-1"], rows["run-2"]
+    assert (one["Carrier"], one["Policy number"]) == (LARGE_CARRIER, "GL-100")
+    assert (two["Carrier"], two["Policy number"]) == (SMALL_CARRIER, "AU-200")
+    assert one["Valuation date"].date() == date(2022, 12, 31)
+    assert two["Valuation date"].date() == date(2021, 6, 30)
+    assert one["Claims extracted"] == 2
+    assert one["Printed claim count"] == 2
+    assert two["Printed claim count"] == 3
+    assert two["Printed incurred total"] == 1700.0
+
+
+def test_source_info_per_run_facts_never_borrow(tmp_path):
+    """A run that prints no carrier and no valuation says so in Source Info;
+    it is never given run 1's."""
+    result = _packet(tmp_path, second_carrier=False, second_valuation=False)
+    two = {row["Run"]: row for row in _per_run_source_rows(result)}["run-2"]
+    assert two["Carrier"] != LARGE_CARRIER
+    assert two["Valuation date"] == "not printed"
+
+
+def test_loss_summary_carries_each_runs_own_block(tmp_path):
+    result = _packet_with_counts(tmp_path)
+    blocks = _per_run_summary_blocks(result)
+    assert set(blocks) == {"run-1", "run-2"}
+    one, two = blocks["run-1"], blocks["run-2"]
+    assert LARGE_CARRIER in one["header"] and "GL-100" in one["header"]
+    assert SMALL_CARRIER in two["header"] and "AU-200" in two["header"]
+    one_rows = {row["Policy term"]: row for row in one["rows"]}
+    two_rows = {row["Policy term"]: row for row in two["rows"]}
+    assert list(one_rows) == ["2022-01-01 to 2023-01-01"]
+    assert list(two_rows) == ["2020-01-01 to 2021-01-01", "Outside any stated term"]
+    assert one_rows["2022-01-01 to 2023-01-01"]["Claims"] == 2
+    # Run 2's term holds its two 2020 claims; its 2021-05-05 claim is outside
+    # its own term and is shown there -- not folded into run 1's book.
+    assert two_rows["2020-01-01 to 2021-01-01"]["Claims"] == 2
+    assert two_rows["Outside any stated term"]["Claims"] == 1
+    assert one_rows["2022-01-01 to 2023-01-01"]["Carrier printed"] == 3500.0
+    assert one_rows["2022-01-01 to 2023-01-01"]["Ties to carrier"] == "yes"
+    assert two_rows["2020-01-01 to 2021-01-01"]["Carrier printed"] == 1700.0
+    # The printed 3 counts the outside-term claim too, so the term row does
+    # not pretend to tie; the block says so rather than borrowing.
+    assert two_rows["2020-01-01 to 2021-01-01"]["Ties to carrier"] == "no"
+
+
+def test_per_run_blocks_write_through_the_workbook_text_policy(tmp_path):
+    """A run's printed facts are document text: the per-run blocks write them
+    through the same formula-injection policy as every other cell."""
+    result = _packet_with_counts(tmp_path)
+    payload = '=HYPERLINK("http://example.invalid","x")'
+    result.document.runs[1].carrier = payload
+    book = load_workbook(BytesIO(to_bytes(result.document, result.reconciliation)))
+    hits = [
+        cell
+        for name in ("Source Info", "Loss Summary")
+        for row in book[name].iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and payload in cell.value
+    ]
+    assert {cell.parent.title for cell in hits} == {"Source Info", "Loss Summary"}
+    for cell in hits:
+        assert cell.data_type == "s", (cell.parent.title, cell.coordinate)
+        if cell.value.startswith("="):
+            assert cell.quotePrefix is True, (cell.parent.title, cell.coordinate)
+
+
+def test_single_run_document_has_no_per_run_blocks(tmp_path):
+    """A single loss run is the whole document: no per-run facts in Source
+    Info, no per-run block in Loss Summary, roll-up as before."""
+    result = _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", *GL_TERM,
+                 "Valuation Date: 12/31/2022"),
+         "rows": RUN_ONE, "total": _total(RUN_ONE)},
+    ], name="single.pdf")
+    source = [row[0] for row in _workbook(result)["Source Info"].iter_rows(values_only=True)]
+    assert not any(
+        isinstance(value, str) and value.startswith("Per-run facts")
+        for value in source
+    )
+    summary = [row[0] for row in _workbook(result)["Loss Summary"].iter_rows(values_only=True)]
+    assert not any(
+        isinstance(value, str) and value.startswith("Run run-")
+        for value in summary
+    )
+    assert summary[0] == "Policy term"
+
+
+# --- conventions a run does not prove for itself ---------------------------
+
+US_RUN = [
+    ("71004410", "03/15/2022", "CLOSED", "1,500.00", "0.00", "1,500.00"),
+    ("71004411", "07/22/2022", "CLOSED", "2,250.00", "0.00", "2,250.00"),
+]
+#: Amounts with one separator and three digits after it, and dates whose day
+#: and month could swap: nothing on these pages says which convention they use.
+AMBIGUOUS_RUN = [
+    ("CR-60001", "03/04/2022", "CLOSED", "1.500", "0", "1.500"),
+    ("CR-60002", "05/06/2022", "CLOSED", "2.250", "0", "2.250"),
+]
+
+
+def _mixed_packet(tmp_path, second_rows):
+    return _read(tmp_path, [
+        {"top": ("Page 1 of 1", LARGE_CARRIER, "LOSS RUN REPORT", "Valuation Date: 12/31/2022"),
+         "rows": US_RUN},
+        {"top": ("Page 1 of 1", SMALL_CARRIER, "LOSS RUN REPORT", "Valuation Date: 12/31/2022"),
+         "headers": SMALL_HEADERS, "rows": second_rows},
+    ], name="mixed.pdf")
+
+
+def test_a_run_read_under_another_reports_conventions_is_reported(tmp_path):
+    """Run 1 proves US numbers and month-first dates; run 2 proves neither. Its
+    "1.500" is read as one and a half on run 1's evidence -- reported against
+    run 2, which then needs review; run 1 does not."""
+    result = _mixed_packet(tmp_path, AMBIGUOUS_RUN)
+    one, two = result.document.runs
+    assert one.borrowed_conventions == []
+    assert len(two.borrowed_conventions) == 2
+    borrowed = [f for f in result.reconciliation.findings
+                if f.rule_id == "R-15" and f.condition.startswith("borrowed-convention:")]
+    assert [f.run_id for f in borrowed] == ["run-2"]
+    assert canonical_run_status(result.reconciliation, "run-2") is DocumentStatus.NEEDS_REVIEW
+
+
+def test_a_run_that_proves_its_own_conventions_borrows_nothing(tmp_path):
+    result = _mixed_packet(tmp_path, [
+        ("CR-60001", "03/14/2022", "CLOSED", "1,500.00", "0.00", "1,500.00"),
+    ])
+    assert [run.borrowed_conventions for run in result.document.runs] == [[], []]
+    assert not [f for f in result.reconciliation.findings
+                if f.condition.startswith("borrowed-convention:")]
+
+
+def test_a_saved_profile_for_another_carrier_is_a_borrowed_convention():
+    from types import SimpleNamespace
+
+    from core.normalize import DateOrderInference, LocaleInference
+    from core.pipeline import ColumnMapping, _borrowed_conventions
+
+    reasons = _borrowed_conventions([], ColumnMapping(headers=[], fields={}), LocaleInference(),
+                                    DateOrderInference(),
+                                    SimpleNamespace(carrier="Northfield Auto"), "Harbor Crest")
+    assert reasons == ["it was read with a saved profile made for another carrier"]
+    assert _borrowed_conventions([], ColumnMapping(headers=[], fields={}), LocaleInference(),
+                                 DateOrderInference(),
+                                 SimpleNamespace(carrier="Harbor  crest"), "HARBOR CREST") == []

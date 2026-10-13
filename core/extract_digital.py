@@ -31,8 +31,19 @@ from core.records import (
     is_identifier_candidate,
     leading_identifier,
     push_qualifiers,
+    strip_identifier_label,
 )
-from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable
+from core.runs import (
+    BAND_FRACTION,
+    FOOTER,
+    HEADER,
+    PAGINATION,
+    PageEvidence,
+    heading_of,
+    identity_of,
+    paginations_in,
+)
+from core.schema import DATE_FIELDS, MONEY_FIELDS, RawRow, RawTable, SourceMethod
 
 #: A line whose leading words say "total" closes the table.
 TOTAL_ROW_PATTERN = re.compile(r"\b(?:grand\s+)?(?:report\s+)?totals?\b", re.IGNORECASE)
@@ -171,19 +182,101 @@ def page_words(page: pdfplumber.page.Page) -> list[Word]:
     if sizes:
         scale = statistics.median(sizes) / NOMINAL_TEXT_SIZE
         tolerance = min(NOMINAL_WORD_TOLERANCE, NOMINAL_WORD_TOLERANCE * scale)
-    return _to_words(
+    return join_currency_marks(_to_words(
         page.extract_words(
             use_text_flow=False,
             keep_blank_chars=False,
             x_tolerance=tolerance,
             y_tolerance=tolerance,
         )
-    )
+    ))
+
+
+#: A currency mark standing as a word of its own.
+_CURRENCY_MARK = re.compile(r"[$€£]")
+#: A piece of a printed amount: digits, separators, sign, parentheses, a dash.
+_AMOUNT_PIECE = re.compile(r"\(?-?[\d,.]*\d[\d,.]*\)?-?|-+|\(|\)")
+#: How many stand-alone marks show a page is set in accounting format.
+ACCOUNTING_EVIDENCE = 3
+
+
+def join_currency_marks(words: list[Word]) -> list[Word]:
+    """Join a stand-alone currency mark to the amount it introduces.
+
+    Spreadsheet accounting format prints the mark at the left edge of the
+    cell and the amount at the right, so the widest space on the line can be
+    the one *inside* a cell. Read as a gutter, it splits every money column in
+    two and files the mark as a value. A page shows the format by printing
+    several marks as words of their own; there, each mark joins the amount
+    that follows it on its line -- the next word, if it is a piece of an
+    amount, and any pieces kerned hard against it ("3" "70.50"). A mark
+    followed by anything else, or by another mark, is left as it was.
+    """
+    marks = [w for w in words if _CURRENCY_MARK.fullmatch(w.text)]
+    if len(marks) < ACCOUNTING_EVIDENCE:
+        return words
+    char_width = _median_char_width(words)
+    order = sorted(range(len(words)), key=lambda i: (words[i].x0, words[i].top))
+
+    def suffix(mark: Word) -> bool:
+        """The mark closes the amount printed hard against its left: "1.234 €"."""
+        height = max(mark.bottom - mark.top, 1e-6)
+        left = [
+            w for w in words
+            if w.x1 <= mark.x0 + 1e-6 and abs(w.centre - mark.centre) < height / 2
+        ]
+        if not left:
+            return False
+        nearest = max(left, key=lambda w: w.x1)
+        return (_AMOUNT_PIECE.fullmatch(nearest.text) is not None
+                and mark.x0 - nearest.x1 <= char_width)
+
+    # A page that writes its currency after the amount is not in accounting
+    # format, however many marks stand alone on it.
+    if sum(suffix(mark) for mark in marks) * 2 >= len(marks):
+        return words
+    used: set[int] = set()
+    joined: dict[int, Word] = {}
+    for i, mark in enumerate(words):
+        if not _CURRENCY_MARK.fullmatch(mark.text) or i in used or suffix(mark):
+            continue
+        height = max(mark.bottom - mark.top, 1e-6)
+        same_line = [
+            j for j in order
+            if j != i and j not in used and words[j].x0 >= mark.x1 - 1e-6
+            and abs(words[j].centre - mark.centre) < height / 2
+        ]
+        pieces: list[int] = []
+        for j in same_line:
+            word = words[j]
+            if _CURRENCY_MARK.fullmatch(word.text) or not _AMOUNT_PIECE.fullmatch(word.text):
+                break
+            if pieces and word.x0 - words[pieces[-1]].x1 > char_width:
+                break
+            pieces.append(j)
+        if not pieces:
+            continue
+        last = words[pieces[-1]]
+        joined[i] = Word(
+            text=f"{mark.text} " + "".join(words[j].text for j in pieces),
+            x0=mark.x0, x1=last.x1,
+            top=min(mark.top, *(words[j].top for j in pieces)),
+            bottom=max(mark.bottom, *(words[j].bottom for j in pieces)),
+        )
+        used.update(pieces)
+        used.add(i)
+    if not joined:
+        return words
+    return [joined.get(i, w) for i, w in enumerate(words) if i in joined or i not in used]
 
 
 def _median_char_width(words: Sequence[Word]) -> float:
+    # A word holding a space is an amount joined to its currency mark across
+    # the cell (see join_currency_marks): its width is the cell's, not its
+    # characters', and would inflate every threshold measured from this.
     widths = [
-        (word.x1 - word.x0) / len(word.text) for word in words if word.text
+        (word.x1 - word.x0) / len(word.text)
+        for word in words if word.text and " " not in word.text
     ]
     return statistics.median(widths) if widths else 4.0
 
@@ -1152,7 +1245,7 @@ def _extract_record_table(
         [
             text
             for line in body
-            for text in (identifier_cell(line),)
+            for text in (strip_identifier_label(identifier_cell(line)),)
             if text and is_identifier_candidate(text)
         ]
     )
@@ -1305,6 +1398,55 @@ def _extract_record_table(
         column_bounds=[bound for bounds, _ in slices for bound in bounds],
     )
 
+def header_continuations_below(
+    lines: Sequence[Line], header: Line, char_width: float
+) -> list[Line]:
+    """Label lines printed directly under the header, inside its labels.
+
+    A line belongs when it carries no digit, sits at most two line-heights
+    below the line before it, and every word on it centres within one of the
+    header's words (give or take a character). A heading set under the
+    table's left edge, or the first claim, fails one of those.
+    """
+    if not header.words:
+        return []
+    height = max(word.bottom - word.top for word in header.words)
+    found: list[Line] = []
+    previous = header
+    for line in sorted((l for l in lines if l.index > header.index), key=lambda l: l.index):
+        if not line.words or any(ch.isdigit() for w in line.words for ch in w.text):
+            break
+        gap = min(w.top for w in line.words) - min(w.top for w in previous.words)
+        if not 0 < gap <= 2 * height:
+            break
+        if not all(
+            any(h.x0 - char_width <= w.middle <= h.x1 + char_width for h in header.words)
+            for w in line.words
+        ):
+            break
+        found.append(line)
+        previous = line
+    return found
+
+
+def fold_below(header: Line, below: Sequence[Line], char_width: float) -> Line:
+    """The header with each continuation word appended to the label above it."""
+    extra: dict[int, list[str]] = {}
+    for line in below:
+        for word in sorted(line.words, key=lambda w: w.x0):
+            owner = min(
+                range(len(header.words)),
+                key=lambda i: abs(header.words[i].middle - word.middle),
+            )
+            extra.setdefault(owner, []).append(word.text)
+    words = tuple(
+        Word(text=" ".join([w.text, *extra.get(i, [])]), x0=w.x0, x1=w.x1,
+             top=w.top, bottom=w.bottom)
+        for i, w in enumerate(header.words)
+    )
+    return Line(words=words, index=header.index)
+
+
 def _extract_positioned_table(
     page: pdfplumber.page.Page, page_number: int
 ) -> RawTable | None:
@@ -1339,6 +1481,25 @@ def _extract_positioned_table(
         )
         if reconstructed is not None:
             return reconstructed
+
+    # A label can also wrap downward: "Total" on the header line, then
+    # "Outstanding" and "Reserve" beneath it in the same column. Those lines
+    # are labels, not claims, and the column is the whole of them. (A block
+    # that looked like one label line per record line, and whose body bore no
+    # records out, reaches here too: its lower lines are then this.)
+    header_raw = next((line for line in lines if line.index == header_index), None)
+    below = (
+        [] if header_raw is None
+        else header_continuations_below(lines, header_raw, char_width)
+    )
+    if below:
+        folded = fold_below(header_raw, below, char_width)
+        before = [text for text, _, _ in split_cells(header_raw, char_width)]
+        after = [text for text, _, _ in split_cells(folded, char_width)]
+        if header_score(after) >= header_score(before):
+            block_end = max(block_end, below[-1].index)
+        else:
+            below = []
 
     body = [line for line in lines if line.index > block_end]
     # A strapline set well below the last row is not part of the table: not a
@@ -1378,6 +1539,9 @@ def _extract_positioned_table(
             index=header_index,
         ),
     )
+    if below:
+        header_line = fold_below(header_line, below, char_width)
+        header_cells = split_cells(header_line, char_width)
 
     # Three ways to find the columns, each with its own failure mode, and the
     # one that names the most of them wins. The third reads the whole header
@@ -1528,6 +1692,8 @@ _VALUATION_PATTERNS = (
     r"as\s*of\s*date\s*[:\-]?\s*(.+)",
     r"(?:data|values?|numbers?|amounts?)\s*as\s*of\s*[:\-]?\s*(.+)",
     r"loss(?:es)?\s*valued\s*[:\-]?\s*(.+)",
+    # "Losses as of: 06/08/2019" at the foot of a detail loss report.
+    r"loss(?:es)?\s*as\s*of\s*[:\-]?\s*(\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4})",
     # A report titled with the date it was struck: "Loss Run as per 13 Sep 2016".
     r"loss\s*runs?\s*(?:as\s*(?:per|of|at)|through|thru)\s*[:\-]?\s*(.+)",
 )
@@ -1544,7 +1710,10 @@ _PERIOD_PATTERN = re.compile(
 #: same two forms _COUNT_PATTERNS accepts.
 GRAND_COUNT_PATTERN = re.compile(
     r"(?:grand|report|overall|final)\s+totals?\s*:?[\s#]*"
-    r"claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)",
+    # "Report Grand Totals" over "Total Claim Count: 46", possibly with the
+    # total's own labelled "Inc:" line printed between them.
+    r"(?:(?:inc|incurred|pd|paid|o/s)\s*:[^\n]*\n\s*)?"
+    r"(?:total\s+)?claims?\s*(?:count|cnt)?\s*[:=]?\s*(\d[\d,]*)",
     re.IGNORECASE,
 )
 
@@ -1689,6 +1858,25 @@ def document_claim_count(
     return total_led[0] if len(total_led) == 1 else None
 
 
+#: A word ending in a colon: the end of a label. A time's colon follows
+#: digits, never a word, so "9:16:54" is not one.
+_LABEL_END = re.compile(r"(?<!\S)[A-Za-z][\w'&./#-]*\s*:")
+
+
+def _before_next_label(value: str) -> str:
+    """A value ends where the next labelled fact on its line begins.
+
+    The second label need not be one this reader knows ("Report run date:").
+    Its length is not printed, so it is taken as the colon's word and up to
+    two before it, as many as leave the value at least one word.
+    """
+    end = _LABEL_END.search(value)
+    if end is None:
+        return value
+    words = value[:end.start()].split()
+    return " ".join(words[:len(words) - min(2, max(len(words) - 1, 0))])
+
+
 def _labelled_value(text: str, *labels: str) -> str | None:
     for label in labels:
         match = re.search(rf"{label}\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
@@ -1700,6 +1888,7 @@ def _labelled_value(text: str, *labels: str) -> str | None:
                 value,
                 flags=re.IGNORECASE,
             )[0]
+            value = _before_next_label(value)
             if value:
                 return clean_text(value)
     return None
@@ -1725,9 +1914,156 @@ def extract_metadata(page_text: str) -> DocumentMetadata:
     )
 
 
+def pages_metadata(page_texts: Mapping[int, str], first: int | None) -> DocumentMetadata:
+    """The letterhead facts one set of pages states about itself.
+
+    What :func:`extract_pdf` does for the whole document, over a logical run's
+    own pages: the letterhead of ``first`` (the run's first claims page), a
+    valuation date wherever on those pages it is printed, and every policy
+    period they declare. Nothing is read from any other page.
+    """
+    metadata = extract_metadata(page_texts.get(first, "") if first is not None else "")
+    if metadata.valuation_date_text is None:
+        for _, text in sorted(page_texts.items()):
+            found = _first_match(text, _VALUATION_PATTERNS)
+            if found:
+                metadata.valuation_date_text = found
+                break
+    seen: set[tuple[str, str]] = set()
+    for _, text in sorted(page_texts.items()):
+        for match in _PERIOD_PATTERN.finditer(text):
+            period = (clean_text(match.group(1)), clean_text(match.group(2)))
+            if period not in seen:
+                seen.add(period)
+                metadata.policy_periods.append(period)
+    return metadata
+
+
 # --------------------------------------------------------------------------
 # Whole-document entry point
 # --------------------------------------------------------------------------
+
+
+def page_evidence(
+    page: pdfplumber.page.Page,
+    number: int,
+    words: Sequence[Word],
+    table: RawTable | None,
+    text: str,
+) -> PageEvidence:
+    """What this page prints about which report it belongs to, measured where it sits.
+
+    A report numbers its pages in its furniture -- the band across the top or
+    the bottom of the sheet -- and names itself in the top one. Only words
+    there count, and only words outside the claims table: "Page 1 of 3" in a
+    paragraph, a description cell or an embedded form is not the page
+    numbering itself, and taking it for that splits one report in two. Such
+    text is kept in ``ignored`` so the reading can say it was seen.
+
+    Measured in pdfplumber's own space, which is the page as displayed: a
+    landscape report stored as a rotated portrait page reports its words
+    turned upright, so its header is at the top here too.
+    """
+    # The visible page is the crop box; text outside it is not printed on
+    # the page anyone sees. pdfplumber gives the crop box in the words' own
+    # top-left space.
+    box = getattr(page, "cropbox", None) or getattr(page, "bbox", None)
+    if box is None:
+        # No geometry, no furniture: nothing here can say where a report is.
+        return PageEvidence(page=number, method=SourceMethod.DIGITAL)
+    x0, top, x1, bottom = box
+    band = (bottom - top) * BAND_FRACTION
+    regions: list[tuple[float, float, float, float]] = []
+    if table is not None:
+        regions = [row.bbox for row in [*table.rows, *table.total_rows] if row.bbox]
+        if table.strategy == "ruled":
+            regions += [found.bbox for found in page.find_tables()]
+
+    def inside_table(word: Word) -> bool:
+        return any(
+            left <= word.middle <= right and upper <= word.centre <= lower
+            for left, upper, right, lower in regions
+        )
+
+    visible = [w for w in words if x0 <= w.middle <= x1 and top <= w.centre <= bottom]
+    head_lines = cluster_lines([w for w in visible if w.centre <= top + band])
+    foot_lines = cluster_lines([w for w in visible if w.centre >= bottom - band])
+
+    def furniture(line: Line) -> bool:
+        """A band line outside the claims table -- or one saying nothing but
+        its page number, which a table can swallow as its last row."""
+        if not any(inside_table(word) for word in line.words):
+            return True
+        rest = PAGINATION.sub(" ", line.text)
+        return bool(PAGINATION.search(line.text)) and not any(ch.isdigit() for ch in rest)
+
+    head_lines = [line for line in head_lines if furniture(line)]
+    foot_lines = [line for line in foot_lines if furniture(line)]
+    paginations = [
+        *(found for line in head_lines for found in paginations_in(line.text, HEADER)),
+        *(found for line in foot_lines for found in paginations_in(line.text, FOOTER)),
+    ]
+    heading = " ".join(line.text for line in head_lines)
+    # A page whose text runs sideways has no header band to speak of: its
+    # "top" is one edge of a turned table.
+    chars = getattr(page, "chars", None) or []
+    upright = sum(1 for char in chars if char.get("upright", True))
+    sideways = bool(chars) and upright * 2 < len(chars)
+    identity = None if sideways else identity_of(
+        heading, exclude=table.headers if table is not None else ()
+    )
+
+    # Everything the page text calls a page number, less what the bands hold.
+    seen = [" ".join(match.group(0).split()).lower() for match in PAGINATION.finditer(text)]
+    for found in paginations:
+        normal = " ".join(found.text.split()).lower()
+        if normal in seen:
+            seen.remove(normal)
+    policy = BAND_POLICY.search(heading) if not sideways else None
+    insured = BAND_INSURED.search(heading) if not sideways else None
+    return PageEvidence(
+        page=number,
+        method=SourceMethod.DIGITAL,
+        paginations=tuple(paginations),
+        identity=identity,
+        heading=heading_of(heading),
+        ignored=tuple(seen),
+        policy=policy.group(1) if policy else None,
+        insured=" ".join(insured.group(1).split()) if insured else None,
+    )
+
+
+#: The insured a page's header band names: "Named Insured: Ridgeway Freight
+#: LLC", "Insured: ...", "Insured Name: ...", "Customer: ...", "Account Name:
+#: ...". The value runs to the next labelled fact on the band ("Policy
+#: Number:", "Valuation Date:") or its end.
+BAND_INSURED = re.compile(
+    r"\b(?:named\s+insured|insured\s+name|insured|customer|account\s+name)\s*:\s*"
+    r"(.+?)(?=\s+(?:policy|valuation|named|insured|account|customer|report|run|"
+    r"print(?:ed)?|date|period|effective|location|carrier|agent|producer|status|"
+    r"prepared|finance|filters?|level)\b[^:]{0,25}:|$)",
+    re.IGNORECASE,
+)
+
+
+#: A policy number labelled as one in a page's header band: "Policy Number:
+#: GL-7003", "Policy No. CA 3303", "Policy #: 44-918". The value must carry a
+#: digit, so "Policy Number: see schedule" names none.
+BAND_POLICY = re.compile(
+    r"\bpolicy\s*(?:number|no\.?|nbr\.?|#)\s*[:#]?\s*"
+    r"((?=[A-Za-z0-9\-/.]*\d)[A-Za-z0-9][A-Za-z0-9\-/.]{2,})",
+    re.IGNORECASE,
+)
+
+
+#: A glyph pdfplumber could not map to a character: the font carries no
+#: ToUnicode map and nothing it could be recovered from.
+UNDECODABLE_GLYPH = re.compile(r"\(cid:\d+\)")
+
+
+def _decodable(obj: dict) -> bool:
+    return not (obj.get("object_type") == "char"
+                and UNDECODABLE_GLYPH.fullmatch(obj.get("text", "")))
 
 
 @dataclass
@@ -1740,6 +2076,11 @@ class DigitalExtraction:
     #: table sliced by column -- see detect_column_split_pages. Structural
     #: evidence only; no claim or money field is read to produce this.
     column_split_pages: list[tuple[int, int]] = dataclass_field(default_factory=list)
+    #: What each extracted page prints about which report it belongs to.
+    page_evidence: dict[int, PageEvidence] = dataclass_field(default_factory=dict)
+    #: Pages printing glyphs that cannot be decoded to characters. Those
+    #: glyphs were withheld from the reading, so the page is not fully read.
+    undecodable_pages: list[int] = dataclass_field(default_factory=list)
 
     @property
     def all_rows(self) -> list[RawRow]:
@@ -1765,22 +2106,34 @@ def extract_pdf(
     tables: list[RawTable] = []
     page_texts: dict[int, str] = {}
     signatures: list[PageSignature] = []
+    evidence: dict[int, PageEvidence] = {}
+    undecodable_pages: list[int] = []
 
     with pdfplumber.open(path) as pdf:
         page_count = len(pdf.pages)
         for index, page in enumerate(pdf.pages, start=1):
+            # Glyphs set in a font with no map to characters extract as
+            # "(cid:N)" placeholders. What they print is unknown, so no cell,
+            # claim, carrier or total may be made of them: they are withheld
+            # from every reading of the page, and the page is reported.
+            if any(UNDECODABLE_GLYPH.fullmatch(char.get("text", ""))
+                   for char in getattr(page, "chars", ())):
+                undecodable_pages.append(index)
+                page = page.filter(_decodable)
             # Read for every page, not only the ones ``pages`` selects for
             # table extraction: a scanned page between two digital ones has
             # to read as "no letter band here" for the pairing below to
             # correctly refuse to join across it, and it only reads that way
             # if it was looked at.
-            signatures.append(page_signature(index, page_words(page)))
+            words = page_words(page)
+            signatures.append(page_signature(index, words))
             if pages is not None and index not in pages:
                 continue
             page_texts[index] = page.extract_text() or ""
             table = extract_page_table(page, index)
             if table is not None:
                 tables.append(table)
+            evidence[index] = page_evidence(page, index, words, table, page_texts[index])
 
     column_split_pages = detect_column_split_pages(signatures)
 
@@ -1836,4 +2189,6 @@ def extract_pdf(
         page_texts=page_texts,
         page_count=page_count,
         column_split_pages=column_split_pages,
+        page_evidence=evidence,
+        undecodable_pages=undecodable_pages,
     )

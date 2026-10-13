@@ -28,8 +28,10 @@ from typing import Sequence
 
 from core.schema import (
     LOCAL_REVIEWER,
+    DocumentStatus,
     Finding,
     LossRunDocument,
+    ReconciliationResult,
     ReviewAction,
     ReviewLog,
     Resolution,
@@ -44,7 +46,11 @@ __all__ = [
     "ReviewLog",
     "Resolution",
     "ReviewSummary",
+    "blocks_trust",
     "bucket_of",
+    "canonical_run_status",
+    "canonical_status",
+    "trust_class",
     "finding_key",
     "resolution_for",
     "summarise_review",
@@ -73,6 +79,109 @@ UNDERWRITING = "underwriting"
 def bucket_of(finding: Finding) -> str:
     """Which of the three questions this finding belongs to."""
     return finding.category.value
+
+
+# --------------------------------------------------------------------------
+# The one status policy
+#
+# Every layer that says whether a document can be used without a person --
+# the queue, the review card, the workbook, a structured export, telemetry,
+# the corpus gate -- asks these functions and nothing else. The engine's own
+# ``ReconciliationResult.status`` answers a narrower question (did any rule
+# raise an ERROR) and is kept as the spec defines it; it is one input here,
+# never a substitute. A WARN that says the document could not be read cleanly
+# (an unreadable amount, a duplicate the extractor made) blocks trust exactly
+# as an ERROR does, so no layer can call such a document reconciled.
+# --------------------------------------------------------------------------
+
+
+#: Rules that say something may not be accounted for at all -- claims or
+#: pages the reading could not place, rather than values that need a check:
+#: rows lost in stitching, no claims, unread source pages, money on a row no
+#: claim took, an unsettled run boundary, claim-like rows the vote refused.
+UNACCOUNTED_RULES = frozenset({"R-19", "R-20", "R-22", "R-23", "R-28", "R-29"})
+
+def blocks_trust(finding: Finding) -> bool:
+    """Whether this finding alone stops the document being trusted unreviewed.
+
+    Financial and extraction findings do, at any severity; an underwriting
+    observation never does. An ERROR always does -- the schema forbids an
+    underwriting ERROR, and this holds even if that ever changes. So does any
+    finding saying a claim or page may not be accounted for at all, whatever
+    its category and severity: R-19 stays the spec's WARN, but rows seen on a
+    page and not read are a missing claim, not an underwriting observation.
+    """
+    return (bucket_of(finding) != UNDERWRITING or finding.severity.value == "ERROR"
+            or finding.rule_id in UNACCOUNTED_RULES)
+
+
+def canonical_status(
+    reconciliation: ReconciliationResult | None, *, needs_mapping: bool = False
+) -> DocumentStatus:
+    """CLEAN only when nothing anywhere says the document needs a person.
+
+    Fails closed: no reconciliation, a column mapping still to confirm, an
+    engine NEEDS_REVIEW, any run not clean, or any finding that blocks trust
+    each make it NEEDS_REVIEW.
+    """
+    if reconciliation is None or needs_mapping:
+        return DocumentStatus.NEEDS_REVIEW
+    if reconciliation.status is not DocumentStatus.CLEAN:
+        return DocumentStatus.NEEDS_REVIEW
+    if any(status is not DocumentStatus.CLEAN for status in reconciliation.run_status.values()):
+        return DocumentStatus.NEEDS_REVIEW
+    if any(blocks_trust(finding) for finding in reconciliation.findings):
+        return DocumentStatus.NEEDS_REVIEW
+    return DocumentStatus.CLEAN
+
+
+AUTO_SAFE = "auto_safe"
+NEEDS_REVIEW = "needs_review"
+UNRESOLVED = "unresolved"
+
+
+def trust_class(
+    reconciliation: ReconciliationResult | None, *, needs_mapping: bool = False
+) -> str:
+    """Which of three outcomes a processed document is, for measurement.
+
+    ``auto_safe``: the canonical status is CLEAN -- usable without a person.
+    ``unresolved``: something may not be accounted for at all (see
+    ``UNACCOUNTED_RULES``), or the columns were never mapped.
+    ``needs_review``: everything is accounted for, but some value or check
+    needs a person. A refinement of NEEDS_REVIEW only; it never changes a
+    document's status.
+    """
+    if canonical_status(reconciliation, needs_mapping=needs_mapping) is DocumentStatus.CLEAN:
+        return AUTO_SAFE
+    if reconciliation is None or needs_mapping:
+        return UNRESOLVED
+    if any(finding.rule_id in UNACCOUNTED_RULES for finding in reconciliation.findings):
+        return UNRESOLVED
+    return NEEDS_REVIEW
+
+
+def canonical_run_status(
+    reconciliation: ReconciliationResult | None, run_id: str, *, needs_mapping: bool = False
+) -> DocumentStatus:
+    """One logical run's status under the same policy.
+
+    A finding carrying no run applies to every run of the packet: it was
+    raised about the whole document (or deduplicated because every run raised
+    it). A run the engine gave no status is not known to be clean, and no run
+    of a document whose column mapping is still to be confirmed is.
+    """
+    if reconciliation is None or needs_mapping:
+        return DocumentStatus.NEEDS_REVIEW
+    if reconciliation.run_status.get(run_id) is not DocumentStatus.CLEAN:
+        return DocumentStatus.NEEDS_REVIEW
+    if any(
+        blocks_trust(finding)
+        for finding in reconciliation.findings
+        if finding.run_id in (None, run_id)
+    ):
+        return DocumentStatus.NEEDS_REVIEW
+    return DocumentStatus.CLEAN
 
 
 @dataclass(frozen=True)
@@ -135,6 +244,20 @@ class ReviewSummary:
         return "reconciled"
 
 
+def review_bucket(finding: Finding) -> str:
+    """Which question a finding answers on screen, in step with the policy.
+
+    A finding's category is what the spec made it and is never rewritten. But
+    a summary must never call reconciled what :func:`blocks_trust` does not:
+    an underwriting-category finding that says a claim or page may be
+    unaccounted for (R-19) is shown with the reading problems, not the flags.
+    """
+    bucket = bucket_of(finding)
+    if bucket == UNDERWRITING and finding.rule_id in UNACCOUNTED_RULES:
+        return EXTRACTION
+    return bucket
+
+
 def summarise_review(
     findings: Sequence[Finding], log: ReviewLog | None = None
 ) -> ReviewSummary:
@@ -142,7 +265,7 @@ def summarise_review(
     log = log or ReviewLog()
     buckets: dict[str, list[Finding]] = {FINANCIAL: [], EXTRACTION: [], UNDERWRITING: []}
     for finding in findings:
-        buckets[bucket_of(finding)].append(finding)
+        buckets[review_bucket(finding)].append(finding)
 
     made = {name: Bucket(items, log.unresolved(items)) for name, items in buckets.items()}
     outstanding = sum(bucket.outstanding for bucket in made.values())

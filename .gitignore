@@ -6,3 +6,6 @@ data/profiles/
 uploads/
 *.pdf
 .streamlit/secrets.toml
+
+# Local operational telemetry (counts only, never document content)
+data/telemetry/

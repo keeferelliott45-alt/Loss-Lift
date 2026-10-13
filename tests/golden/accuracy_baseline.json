@@ -13,6 +13,13 @@
     "other_fields": 24,
     "rows": 6
   },
+  "Cascadia Marine Insurance": {
+    "money": 1.0,
+    "money_fields": 22,
+    "other": 1.0,
+    "other_fields": 48,
+    "rows": 8
+  },
   "Continental Benefit Mutual": {
     "money": 1.0,
     "money_fields": 316,
@@ -33,6 +40,13 @@
     "other": 1.0,
     "other_fields": 24,
     "rows": 4
+  },
+  "Granite Peak Specialty": {
+    "money": 1.0,
+    "money_fields": 14,
+    "other": 1.0,
+    "other_fields": 20,
+    "rows": 5
   },
   "Great Basin Indemnity": {
     "money": 1.0,
