@@ -49,6 +49,8 @@ class Defect:
     token: str
     named: bool
     detail: str = ""
+    #: True when the layer flagged something the truth says is fine.
+    false_alarm: bool = False
 
 
 @dataclass
@@ -64,6 +66,16 @@ class Outcome:
     @property
     def silent(self) -> bool:
         return self.category == SILENT
+
+    def describe(self) -> str:
+        """One line a reviewer can read: what was reported and why."""
+        if not self.defects:
+            return self.status
+        parts = [
+            f"{defect.kind} {defect.token}" + (f" ({defect.detail})" if defect.detail else "")
+            for defect in self.defects[:5]
+        ]
+        return f"{self.status}: " + "; ".join(parts)
 
 
 def _eq(left: Decimal | None, right: Decimal | None) -> bool:

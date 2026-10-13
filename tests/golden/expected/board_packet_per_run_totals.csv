@@ -1,0 +1,9 @@
+claim_number,date_of_loss,date_reported,claim_status,claimant_name,loss_description,paid_total,reserve_total,recovery_total,incurred_total
+CM-24-0301,2024-02-11,2024-02-14,OPEN,Dockside Marina,Fender system failure,9300.00,17500.00,,26800.00
+CM-24-0302,2024-05-20,2024-05-22,CLOSED,"Reyes, Tomas",Fuel dock spill,2800.00,,600.00,2200.00
+CM-24-0303,2024-08-09,2024-08-12,OPEN,"Pelham, George",Grounding at inlet,18500.00,26800.00,,45300.00
+MOC-9021,2024-03-04,2024-03-07,OPEN,"Ito, Kenji",Crew injury during haul,4880.00,11000.00,,15880.00
+MOC-9022,2024-07-19,2024-07-21,CLOSED,"Byrne, Aoife",Slime line slip,1070.00,,,1070.00
+TBU-5501,2024-04-02,2024-04-05,OPEN,"Voss, Hilda",Storm mooring damage,12700.00,20100.00,,32800.00
+TBU-5502,2024-10-06,2024-10-08,CLOSED,"Nakamura, Ryu",Chart table claim,1860.00,,,1860.00
+TBU-5503,2024-11-25,2024-11-27,OPEN,"Adler, Jon",Salvage lien dispute,310.00,6500.00,,6810.00
