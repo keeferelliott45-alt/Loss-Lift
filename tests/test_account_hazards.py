@@ -299,6 +299,29 @@ def test_a_claim_omitted_by_a_later_run_with_its_term_is_reported():
     assert judge(s)[0] == "SAFE"
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "account finding, carried into triage: core.intelligence's T-05 dropped-claim "
+    "flag reads account.dropped, so the omission above never reaches the "
+    "underwriter either"))
+def test_triage_flags_the_claim_a_later_run_without_a_term_omits():
+    from core.intelligence import AppetiteRules, triage_summary
+
+    docs, recs = documents(scenario(995))
+    summary = triage_summary(build_accounts(docs, recs)[0], AppetiteRules())
+    assert any(flag.rule.startswith("T-05") for flag in summary.flags)
+
+
+def test_triage_flags_the_same_omission_when_the_term_is_printed():
+    from core.intelligence import AppetiteRules, triage_summary
+
+    s = scenario(995)
+    for run in s.runs:
+        run.printed_term = True
+    docs, recs = documents(s)
+    summary = triage_summary(build_accounts(docs, recs)[0], AppetiteRules())
+    assert any(flag.rule.startswith("T-05") for flag in summary.flags)
+
+
 def test_the_pack_exercises_clean_accounts_too():
     """An oracle that only ever sees NEEDS_REVIEW proves nothing."""
     clean = 0
