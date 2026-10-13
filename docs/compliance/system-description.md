@@ -19,7 +19,9 @@ system could not determine, is reported to a person rather than resolved by
 a guess.
 
 It does not make, recommend or score an underwriting, pricing, claims or
-eligibility decision. It does not rate risk or predict losses. A person
+eligibility decision. An optional triage view compares an account's merged
+history with thresholds the user sets and flags what exceeds them, or says
+it could not tell; the decision stays with the person. It does not rate risk or predict losses. A person
 reviews its output and decides what to use.
 
 ## 2. Where AI is used, and where it is not
@@ -30,6 +32,7 @@ reviews its output and decides what to use.
 | Deciding which printed column carries which field (column mapping) | A fixed synonym table and heuristics (`core/profiles.py`). A saved carrier profile is reused when the format was confirmed before. | **Optional, off by default.** With `LOSSLIFT_ENABLE_LLM=1` and a key, an unrecognised header row and up to three sample rows are sent to a language model, which proposes a mapping. A person confirms it on the mapping screen before it is used or saved. |
 | Reading a **scanned** page (an image with no text layer) | Vision model (Google Gemini via `google-genai`, default `gemini-2.0-flash`), page rendered at 300 DPI (`core/extract_vision.py`) | **Yes, when a key is configured.** Without a key, scanned pages are not read and a rule (R-22) says so; nothing is lost silently. Every value read this way is marked `vision` and its confidence is capped at 0.85. |
 | Reconciliation, status, export | Deterministic rule engine (`core/reconcile.py`, rules R-01 to R-29) and one status policy (`core/review.py`) | **No.** |
+| Underwriting triage over an account (optional) | Deterministic comparison of the merged history against thresholds the user configures: open incurred per claim, claims per term, development between valuations (`core/intelligence.py`, T-01 to T-06) | **No.** It flags and names what it could not evaluate; it decides nothing. |
 
 The vision path is the only one in which a model reads values, and only off
 scanned images. It is treated as the least trustworthy path: its results are
