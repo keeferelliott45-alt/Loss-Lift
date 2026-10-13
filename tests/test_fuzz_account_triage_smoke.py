@@ -150,14 +150,24 @@ def test_a_missing_flag_on_a_fine_looking_summary_is_silent():
 def test_a_false_flag_is_loud():
     intelligence = _triage_or_skip()
     case = pack._t_over_ceiling(random.Random(4), 4, intelligence)
+    account = case.account.build()
+
+    # The honest summary satisfies every must-flag and surfaces the checks
+    # that cannot evaluate, so the case isolates the one thing it is named
+    # for: a flag fired for a claim the account is inside appetite for.
+    honest = intelligence.triage_summary(account, case.rules)
+    assert pack.classify_triage(case, honest).category == SAFE
+
     number = sorted(case.must_not_flag)[0][1]
+    false_flag = SimpleNamespace(
+        rule="T-01 open-incurred-ceiling", severity=2, claim_numbers=(number,),
+        reason="made up", sources=(), evaluated=True,
+        not_evaluated_reason=None,
+    )
     summary = SimpleNamespace(
-        status=DocumentStatus.CLEAN, reasons=(), periods=(),
-        flags=(SimpleNamespace(rule="T-01 open-incurred-ceiling", severity=2,
-                               claim_numbers=(number,), reason="made up",
-                               sources=(), evaluated=True,
-                               not_evaluated_reason=None),),
-        period_gaps=(), not_evaluated=(),
+        status=honest.status, reasons=honest.reasons, periods=honest.periods,
+        flags=tuple(honest.flags) + (false_flag,),
+        period_gaps=honest.period_gaps, not_evaluated=honest.not_evaluated,
     )
     outcome = pack.classify_triage(case, summary)
     assert outcome.category == LOUD, outcome.describe()
