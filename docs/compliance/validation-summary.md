@@ -10,7 +10,7 @@ as plainly as what has.
 
 ## Headline
 
-- **Synthetic accuracy:** 108 of 108 rows across 14 synthetic carrier formats
+- **Synthetic accuracy:** 121 of 121 rows across 16 synthetic carrier formats
   read exactly. Money fields 100%, text fields 100%. That is the floor every
   change must keep.
 - **Real-document accuracy: not yet measured.** No real loss run has had its
@@ -32,16 +32,18 @@ format, separately for money and text fields.
 
 | Measure | Result |
 |---|---|
-| Rows | 108 / 108 |
+| Rows | 121 / 121 |
 | Money fields | 100% |
 | Text fields | 100% |
-| Carrier formats | 14 |
+| Carrier formats | 16 |
 
 Formats covered include US and EU number formats, accounting negatives in
 parentheses, mainframe trailing minus and `CR` credits, multi-page reports
 with repeated headers, workers' compensation medical columns, a ruled table,
 obscure headers, mixed currency, a deliberately wrong row (the arithmetic
-check must catch it) and a scanned page.
+check must catch it), a scanned page, a board packet whose runs each print
+their own totals, and a spreadsheet export carrying document facts as
+columns.
 
 The per-carrier numbers are recorded in `tests/golden/accuracy_baseline.json`.
 A change that lowers any carrier's number fails, even if the blended average
@@ -68,7 +70,9 @@ each result:
 
 **The pass bar is zero SILENT.** A SILENT case is a defect regardless of how
 rare it is. Results of the most recent campaign are recorded in the run log
-(`fuzz/LOG.md`) and the release handoff.
+(`fuzz/LOG.md`) and the release handoff. A second pack exercises the
+account roll-up and the underwriting triage layer the same way
+(`tests/fuzz/account_triage.py`).
 
 ## 4. Qualification cases
 
