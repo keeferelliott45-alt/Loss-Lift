@@ -54,6 +54,11 @@ _STATUS_VALUES = frozenset(status.value for status in ClaimStatus)
 _DOC_STATUS_VALUES = frozenset(status.value for status in DocumentStatus)
 _BOOL_VALUES = frozenset({"Y", "N"})
 
+#: The fields a worksheet may adjudicate: the worksheet writer's own field
+#: list plus the single document-status row. An owner-added row naming
+#: anything else is refused, never silently read as text.
+_KNOWN_FIELDS = frozenset(sheets.CLAIM_FIELDS) | {sheets.DOCUMENT_STATUS_FIELD}
+
 
 @dataclass(frozen=True)
 class ImportSummary:
@@ -81,7 +86,10 @@ def _validate_truth(doc_id: str, field_name: str, kind: str, raw: str) -> str | 
         return truth
     try:
         if kind == MONEY:
-            Decimal(truth)
+            # A non-finite Decimal (NaN, Infinity, -inf) is a spelling the
+            # schema cannot mean: it is not a value the document can hold.
+            if not Decimal(truth).is_finite():
+                raise InvalidOperation(truth)
             return truth
         if kind == DATE:
             date.fromisoformat(truth)
@@ -118,6 +126,10 @@ def _row_key(
     if row["doc_id"] != doc_id:
         raise SetupError(f"worksheet for {doc_id}: a row names document {row['doc_id']}")
     field_name = row["field"].strip()
+    if field_name not in _KNOWN_FIELDS:
+        raise SetupError(
+            f"worksheet for {doc_id}: field {field_name} is not a known field"
+        )
     kind = sheets.field_kind(field_name)
     if kind == DOC_STATUS:
         claim_index = None
