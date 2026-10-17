@@ -66,8 +66,8 @@ any manifest/allowlist.
   DEFERRED ITEMS.
 
 ## Environment
-- Python (all deps): `C:\Users\keefe\AppData\Local\Python\pythoncore-3.14-64\python.exe`
-- pytest basetemp is access-denied by default; pass `--basetemp=C:\Users\keefe\AppData\Local\Temp\kilo\pytest-b1`.
+- Python (all deps): the local Python 3.14 interpreter with every dependency installed (`py -3`)
+- pytest basetemp is access-denied by default; pass `--basetemp=%TEMP%\kilo\pytest-b1` (fresh per run).
 - `python -m tests.golden.baseline` for the ratchet.
 
 ## Handoff
