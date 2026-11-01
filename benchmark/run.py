@@ -115,12 +115,13 @@ def apply_truth(row: dict[str, object], record: dict | None) -> None:
     row["truth_source"] = "qualification"
 
 
-def load_qualification(report_path: Path, manifest_path: Path) -> dict[str, dict]:
+def load_qualification(report_path: Path, manifest_path: Path, docs: Path) -> dict[str, dict]:
     """Qualification records keyed by benchmark doc id.
 
-    The report names documents only by a salted seal; the gate manifest holds
-    the salt, so each doc id is sealed the same way and looked up. A doc id the
-    report does not hold simply has no record.
+    The gate manifest names documents ``doc-<hash>`` and the report seals those
+    ids under the manifest's salt. A benchmark document is matched to its gate
+    entry by the bytes of ``<docs>/<doc_id>.pdf`` (sha256), never by name, then
+    sealed the same way and looked up. No match, no record.
     """
     import json
 
@@ -128,11 +129,17 @@ def load_qualification(report_path: Path, manifest_path: Path) -> dict[str, dict
     from tools.qualification import public
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    salt = manifests.load(manifest_path).salt
+    gate = manifests.load(manifest_path)
+    by_hash = {entry.sha256: entry.id for entry in gate.entries}
     records = {r["document"]: r for r in report.get("records", []) if "document" in r}
-    return {doc_id: records[sealed]
-            for doc_id in (entry["doc_id"] for entry in load_manifest())
-            if (sealed := public.seal(doc_id, salt)) in records}
+    found: dict[str, dict] = {}
+    for doc_id in (entry["doc_id"] for entry in load_manifest()):
+        path = docs / f"{doc_id}.pdf"
+        gate_id = by_hash.get(manifests.file_sha256(path)) if path.is_file() else None
+        sealed = public.seal(gate_id, gate.salt) if gate_id else None
+        if sealed in records:
+            found[doc_id] = records[sealed]
+    return found
 
 
 def measure(doc_id: str, path: Path, expected: str, label: str) -> dict[str, object]:
@@ -213,7 +220,7 @@ def main() -> int:
         parser.error("--qualification and --manifest go together")
 
     sys.path.insert(0, str(BENCHMARK_DIR.parent))
-    truth = load_qualification(args.qualification, args.manifest) if args.qualification else {}
+    truth = load_qualification(args.qualification, args.manifest, args.docs) if args.qualification else {}
     rows = []
     for entry in load_manifest():
         doc_id = entry["doc_id"]

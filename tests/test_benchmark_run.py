@@ -122,3 +122,28 @@ def test_an_older_results_file_is_widened_without_losing_rows(tmp_path):
         rows = list(reader)
     assert [r["doc_id"] for r in rows] == ["old", "new"]
     assert rows[0]["blocking_rules"] == "" and rows[1]["blocking_rules"] == "R-21x1"
+
+
+def test_qualification_records_are_found_by_file_bytes_not_name(tmp_path, monkeypatch):
+    import json
+
+    from tools.corpus_gate import manifest as manifests
+    from tools.qualification import public
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "carrier_a.pdf").write_bytes(b"%PDF-1.4 synthetic a")
+    (docs / "carrier_b.pdf").write_bytes(b"%PDF-1.4 synthetic b")
+    gate = manifests.create(docs, tmp_path / "manifest.json")
+    entry_a = next(e for e in gate.entries if e.path == "carrier_a.pdf")
+    record = _scored(correct=10, precision=1.0, recall=1.0)
+    record["document"] = public.seal(entry_a.id, gate.salt)
+    report = tmp_path / "qualification.json"
+    report.write_text(json.dumps({"records": [record]}))
+    monkeypatch.setattr(bench, "load_manifest",
+                        lambda: [{"doc_id": "carrier_a"}, {"doc_id": "carrier_b"},
+                                 {"doc_id": "not_here"}])
+
+    found = bench.load_qualification(report, tmp_path / "manifest.json", docs)
+    assert set(found) == {"carrier_a"}
+    assert found["carrier_a"]["metrics"]["overall"]["money"]["correct"] == 10
