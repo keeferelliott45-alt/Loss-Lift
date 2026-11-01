@@ -1,5 +1,9 @@
 # LossLift — workflow plan v2 (approved 2026-11-01, after peer review)
 
+**Direction (2026-11-01):** LossLift becomes an account loss-history tool —
+see `docs/agent/DISCOVERY.md` for the hypothesis, the gap matrix and the
+interview kit. Phases below follow it.
+
 v1 was reviewed by an independent agent; its three blockers (R-18 misread as
 trust-blocking, a vacuous "zero false-CLEAN" claim, a Phase 2 that could break
 CLAUDE.md §2.4) were verified against the code and are fixed here.
@@ -181,39 +185,86 @@ Build, in order:
 the fix and passes after; ≤5 open drafts, each with a next step;
 CURRENT_STATE matches `main`.
 
-### Phase 1 — Flagship demo (1–2 weeks)
-Section 3's minimum version.
-**Done when:** a named tester runs the demo from the README by a set date, and
-every number in the write-up traces to a committed benchmark row.
+### Phase 1 — Account MVP gaps (3–4 weeks)
+Build the missing items 7–11 and 14 from `docs/agent/DISCOVERY.md`:
+- lookback check (default 5 years) and currency check (default 90 days),
+  both configurable;
+- account loss summary by policy year across carriers;
+- premium entry per term, carrying `manual` provenance, giving a loss ratio;
+- broker request list;
+- account-first entry;
+- one-page summary.
 
-### Phase 2 — Measure honestly, read more (6–8 weeks)
-Corpus to ≥15 documents (owner only), each labelled with R1-labeller truth
-(`19eb0d9`); fill `money_fields_exact` and `claim_precision`; derive
-`false_clean` from truth. Fix gaps 3 and 5 with synthetic fixtures.
-**Done when:** every document has labelled truth; money accuracy is reported
-per carrier; `false_clean` is computed against truth and is 0; every
-NEEDS_REVIEW document has a root-caused reason; golden ratchet holds or rises.
+All of it sits after reconciliation. It reads `canonical_status` and never
+writes it. Routing: Opus high for `core/account.py` and
+`core/intelligence.py`, Sonnet medium for UI and export. **Owner decision:** a
+per-year loss ratio table extends the spec §5 Loss Summary. It is not a
+dashboard, but confirm against §13 analytics first.
 
-### Phase 3 — Reviewer decisions (3 weeks; GATE-REQUIRED; Opus high)
-Exactly two mechanisms:
-- **(i) A person-supplied value or mapping** (valuation date, incurred column
-  choice, deductible/ALAE basis) is an edit with method `manual`; the
-  extracted or absent value stays beside it; every rule re-runs; status comes
-  only from `canonical_status`.
-- **(ii) Everything else** — including accepting that no incurred total was
-  printed — is a ReviewLog resolution and never moves status or `trust_class`.
+**Done when** a synthetic account produces the expected workbook. The account:
+3 carriers, 5 years, one stale valuation, one missing year, one dropped claim,
+one claim that develops between valuations, premium entered for 4 of 5 terms.
+The workbook must have:
+- per-year rows that equal the sum of the runs;
+- a loss ratio on 4 terms and "premium not entered" on the fifth;
+- a request list naming the missing year and the stale run.
+
+A test proves no new code changes `canonical_status`.
+
+### Phase 2 — Account demo and discovery calls (2–3 weeks)
+1. Rebuild the demo pack (#44) around the Phase 1 synthetic account.
+2. Record the 3-minute demo and write the write-up (section 3).
+3. Run 8–12 calls with the interview kit in `DISCOVERY.md` and apply its
+   decision gate.
+
+**Done when:**
+- the gate decision is recorded with counts;
+- a top-10 carrier list exists;
+- at least 3 blank loss-summary templates are collected.
+
+If the gate fails, stop and re-plan before Phase 3.
+
+### Phase 3 — Measure honestly, read the target carriers (6–8 weeks)
+1. Grow the corpus to at least 15 documents, owner only, prioritising the
+   Phase 2 top-10 carriers.
+2. Label each document with R1-labeller truth (`19eb0d9`).
+3. Fill in `money_fields_exact` and `claim_precision`, and derive
+   `false_clean` from truth.
+4. Fix gaps 3 and 5 with synthetic fixtures.
+5. Add loss-summary layouts matching the collected templates.
+
+**Done when:**
+- every document has labelled truth;
+- money accuracy is reported per carrier;
+- `false_clean` is computed against truth and is 0;
+- every NEEDS_REVIEW document has a root-caused reason;
+- the golden ratchet holds or rises.
+
+### Phase 4 — Reviewer decisions (3 weeks; GATE-REQUIRED; Opus high)
+There are exactly two mechanisms:
+- **(i) A person-supplied value or mapping** (valuation date, choice of
+  incurred column, deductible/ALAE basis) is an edit with method `manual`. The
+  extracted or absent value stays beside it, every rule runs again, and status
+  comes only from `canonical_status`.
+- **(ii) Everything else**, including accepting that no incurred total was
+  printed, is a ReviewLog resolution. It never moves status or `trust_class`.
 
 A mapping chosen for one document reaches the carrier profile only on explicit
 confirmation.
-**Done when:** a test proves no resolution changes `canonical_status`; every
-supplied fact carries `manual` provenance and appears in the export; a test
-proves the profile is not written without confirmation; the gate shows no
-document reaching CLEAN through resolutions alone.
 
-### Phase 4+ — Account loss analysis, completeness, memo
-Blocked on owner §13 decisions (persistence, analytics, reviewer identity, LLM
-data handling). Phases 5–6 depend on 4. The memo uses placeholder tokens: the
-LLM never sees a number or a name.
+**Done when** all four hold:
+- a test proves no resolution changes `canonical_status`;
+- every supplied fact carries `manual` provenance and appears in the export;
+- a test proves the profile is not written without confirmation;
+- the gate shows no document reaching CLEAN through resolutions alone.
 
-Every phase: `scripts/agent_validate.sh` and the golden ratchet; every
+### Deferred
+- Renewal comparison across sessions: needs persistence, which §13 rules out.
+- Hosting: §8 and §2.6/§9 constrain it.
+- Underwriter memo.
+- Exposure intake and appetite rules.
+- Loss-run retrieval from carriers: an adjacent market we are choosing not to
+  enter.
+
+Every phase: `scripts/agent_validate.sh` and the golden ratchet. Every
 GATE-REQUIRED change needs corpus-gate exit 0, run by the owner.
