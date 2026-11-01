@@ -1,219 +1,219 @@
-# LossLift — workflow plan (proposal, 2026-11-01)
+# LossLift — workflow plan v2 (approved 2026-11-01, after peer review)
 
-Status: **proposal for owner approval. Nothing here is built or authorised.**
-Inputs: AGENTS.md, CLAUDE.md, CURRENT_STATE.md (stale: dated 2026-09-27,
-rewrite pending in PR #41), Remember.md, `benchmark/`, 18 open draft PRs.
-The real corpus is not in this container; every real-document statement below
-comes from `benchmark/results.csv`, `benchmark/failures.csv` and the manifest.
+v1 was reviewed by an independent agent; its three blockers (R-18 misread as
+trust-blocking, a vacuous "zero false-CLEAN" claim, a Phase 2 that could break
+CLAUDE.md §2.4) were verified against the code and are fixed here.
 
----
-
-## 0. Correction to the planning input
-
-"Nobody advertises tie-out to printed carrier totals" is **false**.
-FurtherAI publishes a validation step that checks extracted claims against the
-document's summary totals and claim count; Outmarket AI and Heron describe
-flagging variance against stated totals. Applied/Cytora (Autopilot, Octave MGA
-deal) and Vertafore Velocity (submission agent for MGAs, July 2026, completeness
-checks) are confirmed.
-
-Consequence: "we reconcile to printed totals" is not a moat on its own. What
-is still defensible from what is built:
-
-- numbers never read by an LLM on digital pages (§2.1);
-- per-field provenance with the source row **read back and drawn on the page**,
-  withdrawn when it does not match (`core/evidence.py`);
-- fail-closed accounting: no silent claim disappearance, logical runs in
-  packets, foreign totals refused (F07), zero false-CLEAN on the corpus;
-- a real-corpus A/B gate that blocks any behaviour change nobody approved.
-
-The pitch should be **"verifiable, fail-closed"**, not "reconciled".
+Inputs: AGENTS.md, CLAUDE.md, CURRENT_STATE.md (stale, 2026-09-27; rewrite in
+PR #41), Remember.md, `benchmark/`, open draft PRs. The real corpus is not in
+the repository; real-document statements come from `benchmark/results.csv`,
+`benchmark/failures.csv` and `benchmark/corpus_manifest.csv`, **last run at
+`bbf1062` (2026-09-01), about 20 merges behind `main`**. Phase 0 reruns it.
 
 ---
 
-## 1. What fails or reads NEEDS_REVIEW today, and why
+## 0. Market position (verified 2026-11-01)
 
-All 6 benchmarked real documents (latest engine `bbf1062`) extract the right
-claim count and read **NEEDS_REVIEW**, with no false-CLEAN. corpus-v1 holds 10.
-That sample is too small to rank by real frequency, so the ranking below
-combines corpus evidence with how common each mechanism is across carrier
-formats generally (marked *est.*).
+Tie-out to printed totals is **reported by competitors**:
+[FurtherAI](https://furtherai.com/engineering-blogs/hardest-document-extraction-problem-in-insurance)
+validates claims against summary totals and count;
+[Outmarket AI](https://outmarket.ai/blog/outmarket-ai-launches-ai-powered-loss-run-extraction-and-analysis)
+and [Heron](https://www.herondata.io/blog/heron-launches-100-coverage-for-parsing-loss-runs)
+describe flagging variance against stated totals;
+[Sensible](https://www.sensible.so/extract/loss-runs) extracts and computes
+totals. Submission intake for MGAs is shipping:
+[Vertafore Velocity](https://www.vertafore.com/resources/press-releases/vertafore-introduces-velocity-ai-submission-processing-agent-help-mgas)
+(July 2026, completeness checks) and Applied/Cytora
+([acquisition](https://www.insurancebusinessmag.com/us/news/mergers-acquisitions/applied-systems-acquires-digital-risk-processing-platform-549107.aspx),
+[Autopilot, Octave MGA deal](https://iireporter.com/?p=58657)).
 
-| # | Gap | Corpus evidence | Reach (est.) | Kind |
+Pitch: **verifiable, fail-closed** — no LLM reads a number on a digital page;
+per-field provenance with the row read back and drawn on the page
+(`core/evidence.py`); no silent claim disappearance; foreign totals refused
+(F07); a real-corpus A/B gate.
+
+Not claimable yet: **false-CLEAN rate.** No benchmarked document reads CLEAN at
+`bbf1062`, so false-CLEAN is untested. History holds one real false-CLEAN
+(F19, Illinois, recorded `false_clean=no` at `8815244`/`7c257ad` — the column
+was wrong) and one more (F17, AIG, zero claims read CLEAN). Money accuracy
+(`money_fields_exact`) has never been measured.
+
+---
+
+## 1. What reads NEEDS_REVIEW today, and why (n = 6 benchmarked)
+
+`corpus_manifest.csv` holds 6 documents; corpus-v1 in the gate holds 10, and
+the other 4 have no benchmark row. All 6 extract the expected claim count and
+read NEEDS_REVIEW at `bbf1062`.
+
+Trust-blocking causes (`core/review.py` `blocks_trust`: any EXTRACTION or
+FINANCIAL finding, any ERROR, or `UNACCOUNTED_RULES`):
+
+| # | Gap | Evidence | Reach (est.) | Kind |
 |---|---|---|---|---|
-| 1 | **A fact the carrier never printed or printed ambiguously**: no incurred total (XL, R-07 ×84), Total vs Net Incurred (Illinois, R-21), no valuation date (CNA, R-06), deductible/ALAE basis unknown (R-18, every doc) | 4/6 | Most loss runs | Correct NEEDS_REVIEW; the gap is **no fast way for a person to decide** |
-| 2 | **Vocabulary**: `Receipt Date` (AIG), `Expenses Total` (CNA), `Receivable` with a sign (Italian, false R-01) | 3/6 | High: every new carrier brings labels | Engine gap (mapping + sign convention) |
-| 3 | **Compound documents / packets**: board packets, broker packets binding several runs (Liberty 99 pp., Italian 23 pp.); loss-run section finding (F10 open) | 2/10 corpus are packets | Medium–high for public entities and brokers | Engine gap, partly closed |
-| 4 | **Scanned pages**: vision off in cloud; a clean scan always reads NEEDS_REVIEW (R-27); fix in draft PR #49 (gate-required) | 1/6 | Medium (older/faxed runs) | Engine gap |
-| 5 | **Carrier read from a column label or the insured's cover sheet** (blind spot 4, Italian F13) | 2/6 | Medium; breaks account identity | Engine gap |
-| 6 | **Two printed columns merged into one** at sub-glyph gutters (XL status+claimant): mapping cannot give one source column two fields | 1/6 | Low–medium (spreadsheet exports) | Schema gap |
-| 7 | **`Claim No:`-labelled rows dropped as furniture**; can read CLEAN with no printed total | synthetic probe only | Low, but a false-CLEAN path | Fail-closed bug |
-| 8 | Non-English runs (Italian) | 1/6 | Out of scope (§13) | Spec |
+| 1 | ~~False-CLEAN path: `Claim No:` rows dropped as furniture~~ — **already fixed on `main`** (`7d7a0c4`, PR #24; `tests/test_labelled_identifiers.py`). CURRENT_STATE still lists it (stale) | — | — | Closed |
+| 2 | **Fact not printed or printed ambiguously**: no incurred total (XL, R-07 ×84), Total vs Net Incurred (Illinois, R-21), no valuation date (CNA, R-06) | 3/6 | Most loss runs | Correct NEEDS_REVIEW; no fast human decision path |
+| 3 | **Vocabulary**: `Receipt Date` (AIG), `Expenses Total` (CNA), `Receivable` with sign (Italian, false R-01) | 3/6 | Every new carrier | Engine gap |
+| 4 | **Packets**: board/broker packets (Liberty, Italian); loss-run section finding (F10 open) | 2/6 | Public entities, brokers | Engine gap, partly closed |
+| 5 | **Carrier read from a column label or the insured's cover sheet** (blind spot 4, F13) | 2/6 | Breaks account identity | Engine gap |
+| 6 | **Scan count not adopted → R-27 (unresolved printed count)**; fix in #49; no real-corpus cover for the scanned path (blind spot 3) | 1/6 | Older/faxed runs | Engine gap |
+| 7 | **Two printed columns merged** at sub-glyph gutters (XL status+claimant) | 1/6 | Spreadsheet exports | Schema gap |
+| 8 | **Refused rows on a bounded single report are named by no rule** | known gap | Unknown | Accounting gap |
+| 9 | Non-English runs | 1/6 | — | Out of scope (§13) |
 
-Takeaway: the biggest lever is **not extraction** — it is turning gap 1 into a
-two-click reviewer decision so a correct NEEDS_REVIEW becomes an exportable,
-audited result. Gaps 2, 5 and 7 are the next engine work. A 10-document corpus
-is the main measurement limitation; growing it is Phase 1.
+Known-gap tests (strict xfail): `test_packet_adversarial.py:348`,
+`test_run_view_pinning.py:172`, `test_raster_page_accountability.py:1168,1195`,
+`test_liberty_gap_margin.py:254,315`.
+
+Non-blocking flags: **R-18** (deductible/ALAE basis unknown) fires on every
+document but is UNDERWRITING/WARN (`core/reconcile.py:799`) and does **not**
+cause NEEDS_REVIEW.
 
 ---
 
 ## 2. The underwriter workflow and what LossLift could own
 
-Submission arrives → clearance → intake → completeness → **loss analysis** →
-exposure analysis → risk assessment → rating → referral/authority → quote or
-decline → bind.
+Submission → clearance → intake → completeness → **loss analysis** → exposure →
+risk assessment → rating → referral/authority → quote/decline → bind.
 
-| Order | Step LossLift could own | Depends on | Built today |
+| Order | Step | Depends on | Built today |
 |---|---|---|---|
-| 1 | Loss-run reading and tie-out | — | Yes (core) |
-| 2 | Submission intake from email, attachment inventory | 1 | Pilot (`core/eml_intake.py`, `submission.py`) |
-| 3 | Account loss history: several years, carriers, policies merged without double counting | 1, carrier/policy identity (gap 5) | Partly (`core/account.py`) |
-| 4 | Completeness check: "5 years of loss runs, valued within 90 days, every term covered" | 2, 3 | Partly (submission "Outstanding") |
-| 5 | Loss analysis pack: frequency, severity, large losses, open-reserve adequacy, development across valuations | 3; premium/exposure for loss ratio | Loss Summary sheet only |
-| 6 | Underwriter memo draft: loss narrative with every figure linked to its page | 5; LLM writes words, never numbers | No |
-| 7 | Exposure intake (SOV, payroll, revenue) for loss ratio and rating | New readers | No — §13 conflict |
-| 8 | Appetite / referral rules, quote decision support | 5, 7, per-MGA guidelines | No — §13 conflict |
+| 1 | Loss-run reading and tie-out | — | Yes |
+| 2 | Email intake, attachment inventory | 1 | Pilot (`core/eml_intake.py`, `core/submission.py`) |
+| 3 | Account loss history across years/carriers without double counting | 1, gap 5 | Partly (`core/account.py`) |
+| 4 | Completeness: years covered, valuation age, missing terms | 2, 3 | Partly |
+| 5 | Loss analysis pack: frequency, severity, large losses, development | 3; premium for loss ratio | Loss Summary sheet only |
+| 6 | Underwriter memo: narrative with every figure linked to its page | 5 | No |
+| 7 | Exposure intake (SOV, payroll, revenue) | new readers | No — §13 |
+| 8 | Appetite/referral, quote support | 5, 7 | No — §13 |
 
-LossLift should own 1–6. Steps 7–8 are where Applied/Cytora and Vertafore are
-already selling; enter them only on top of a trusted loss analysis.
-
----
-
-## 3. What makes it presentable as a flagship
-
-Strongest moments, all built or nearly built:
-1. Drop a messy real-shaped packet in → per-run badges, each with its page.
-2. Click a finding → the page with the exact row drawn on it.
-3. A planted $50k misread → R-04 catches it against the carrier's own total;
-   the same document pasted into a general LLM does not.
-4. Fix the cell → every rule re-runs → badge turns green, the original value
-   is kept beside the edit.
-5. A saved email with 4 loss runs → one account loss summary traceable to the
-   page.
-
-**Minimum version:** the synthetic demo pack (draft PR #44) + a hosted
-Streamlit instance + a 3-minute recording of moments 1–4 + a 1,500-word
-write-up ("why reconciliation, not extraction": fail-closed design, the corpus
-gate, the false-CLEAN count of zero, the F-code failure registry as honest
-engineering). Gap 1 must be solved first or every demo ends on amber.
+Own 1–6; 7–8 is where Applied/Cytora and Vertafore already sell.
 
 ---
 
-## 4. §13 conflicts with the workflow vision (flag only; spec unchanged)
+## 3. Flagship demo
 
-| §13 item | Conflicting workflow step | Severity |
+Moments: (1) a packet in → per-run badges with pages; (2) click a finding → the
+row drawn on its page; (3) a planted $50k misread caught by R-04 against the
+carrier's own total; (4) fix the cell → every rule re-runs → green, original
+kept beside the edit.
+
+**Minimum version:** the synthetic demo pack (#44) driven locally with
+`scripts/demo_submission.py`, a 3-minute recording of moments 1, 2, 4 (3 too),
+and a write-up whose every number traces to a committed benchmark row.
+**No hosting** in the minimum: §8 cost, LLM mapping key spend, and §2.6/§9
+retention on a public upload box. No "a general LLM misses it" comparison
+unless that run is reproducible and published.
+
+---
+
+## 4. §13 conflicts (flag only; spec unchanged)
+
+| §13 item | Conflicting step | Effect |
 |---|---|---|
-| Database persistence of claims (session-only) | Account history across valuations (3, 5); submission tracking across days (2, 4) | **Blocks 3–5 beyond one session** |
-| Analytics dashboards, charts, trending | Loss analysis pack: development and trending are core underwriting (5) | Blocks 5 as underwriters expect it |
-| ACORD form auto-fill | Reading ACORD apps in a submission (2, 7). Reading ≠ filling, but AGENTS rule 9 bans ACORD/SOV outright | Blocks 7 |
-| AMS/CRM integrations | Live inbox intake (2 beyond `.eml`), pushing results to AMS | Limits 2 |
-| Automated loss-run retrieval from carriers | Completeness: requesting the missing year (4) | Limits 4 |
-| User accounts, auth, teams, roles | Referral/authority (8); any multi-user submission | Blocks 8 |
-| Background job queues | 99-page packets and 4-attachment emails in a request | Limits 2 at scale |
-| Non-English documents | Italian packet (gap 8) | Already enforced |
-| Also §8 "free tiers only" and §15 kill criteria | Hosting a flagship demo; PR #61 already proposes restating kill criteria | Owner decision |
+| Database persistence | Account history across valuations (3, 5); submissions across days (2, 4) | Blocks 3–5 beyond one session |
+| Analytics, charts, trending | Frequency, severity, loss ratio, development (5) | Blocks 5 |
+| User accounts, roles | A named reviewer on an audited export (Phase 3); referral/authority (8). Today only `LOCAL_REVIEWER` | Limits Phase 3; blocks 8 |
+| ACORD auto-fill (+ AGENTS rule 9 bans ACORD/SOV) | Reading apps and SOVs (2, 7) | Blocks 7 |
+| AMS/CRM integrations | Live inbox intake, AMS push | Limits 2 |
+| Automated loss-run retrieval | Requesting a missing year (4) | Limits 4 |
+| Background queues | Large packets, multi-attachment emails | Limits 2 at scale |
+| Non-English | Italian packet | Enforced |
+| §2.6 / §9 data handling | Memo (6) sending loss data to an LLM | Requires placeholder tokens: the model never sees figures or names |
+| §8 free tiers, §15 kill criteria | Hosting; #61 proposes restating kill criteria | Owner decision |
+
+Steps 5 and 6 depend on 3, so they inherit its persistence/analytics blockers.
 
 ---
 
 ## 5. Agent and effort routing
 
-| Work | Model / effort | Why |
-|---|---|---|
-| Reconciliation rules, `records.py`, `runs.py`, `review.py` status policy, schema changes, any GATE-REQUIRED change | Opus, high | Fail-closed correctness; a wrong guess here is a false-CLEAN |
-| Architecture decisions, phase specs, §13 change proposals | Opus, high, once per phase | Low volume, high leverage |
-| Vocabulary additions with a regression fixture, carrier-detection fixes | Sonnet, medium | Pattern work against existing tests |
-| Streamlit review UX, export sheets, demo pack, write-up draft | Sonnet, medium | Volume work, low correctness risk |
-| Pinning existing behaviour with tests, mutation checks, fixture generation | Sonnet, low–medium | Mechanical |
-| Lookups, grep, benchmark tabulation, PR triage summaries, doc drift checks | Haiku, low | Cheap and read-only |
-| Market/competitor research | Haiku with standard search; escalate to extended only if thin | Cost |
-| Code review before merge | `/code-review` medium; high for core/ | Catches what the author missed |
-| Corpus gate runs | Owner (local) or the cloud workflow | Private data; no agent touches the corpus |
+| Work | Model / effort |
+|---|---|
+| `core/reconcile.py`, `core/records.py`, `core/runs.py`, `core/review.py`, `core/account.py`, `core/pipeline.py` (`is_structural_row`), schema, anything GATE-REQUIRED, phase specs | Opus, high |
+| Vocabulary additions with fixtures, carrier detection | Sonnet, medium |
+| Streamlit UX, export sheets, demo pack, write-up | Sonnet, medium |
+| Pinning existing behaviour, mutation checks, fixture generation | Sonnet, low–medium |
+| Lookups, benchmark tabulation, PR triage, doc drift, research | Haiku, low (standard search; extended only if thin) |
+| Review before merge | `/code-review` medium; high for the Opus paths above |
+| Corpus gate, corpus labelling | Owner only |
 
-Rule of thumb: an agent at a lower tier may **find and pin**; only the top
-tier may **change what a rule concludes**.
+Lower tiers may find and pin; only the top tier changes what a rule concludes
+or what status a document reads.
 
 ---
 
 ## 6. Claude Code mods
 
-**losslift-northstar:** the zip is not in this repository or container, so it
-could not be reviewed. Commit it (or upload it) and the review will check:
-- the north-star band text is read from one file (this plan or CLAUDE.md §1),
-  not hard-coded;
-- the scope-drift toast keys on §13 terms *and* on paths (`core/reconcile.py`,
-  `core/records.py`, `core/runs.py` → "GATE-REQUIRED"), not on prose alone;
-- `/northstar` prints the current phase and its "done when", not the whole spec;
-- no hook reads or logs file contents under the corpus or `data/`.
+**losslift-northstar:** zip not in the repository or container; not reviewed.
+On commit, check: band text read from one source file; scope-drift toast keys
+on §13 terms **and** the Opus paths in §5; `/northstar` prints the current
+phase and its "done when" only; no hook reads files under the corpus or `data/`.
 
-**Others worth building, in order:**
-1. **Gate guard hook** (PreToolUse on Edit/Write): editing extraction or
-   reconciliation modules marks the branch GATE-REQUIRED and reminds about
-   `scripts/agent_validate.sh`.
-2. **Private-data guard hook**: blocks writing `*.pdf`, corpus manifests,
-   salts, `.env`, telemetry, and blocks pasting long document-like text into
-   commit messages.
-3. **Architecture builder** (`/archmap`): regenerates `docs/agent/REPO_MAP.md`
-   from imports, flags a new dependency that crosses layers (e.g. `app.py`
-   importing logic, export computing status instead of `core.review`).
-4. **Status line**: branch, golden ratchet result, open GATE-REQUIRED PRs.
-5. **`/handoff`**: fills `HANDOFF_TEMPLATE.md` from the diff and test output.
-6. **Routing hook**: when a task file names `core/reconcile.py` and the session
-   model is not the top tier, warn before the first edit.
+Build, in order:
+1. **Gate guard hook** (PreToolUse Edit/Write): editing a §5 Opus path marks
+   the branch GATE-REQUIRED, reminds about `scripts/agent_validate.sh`, and
+   warns when the session model is not the top tier (routing check merged in).
+2. **Private-data guard**: blocks writes and reads under the corpus path,
+   `data/`, manifests, salts, labels, telemetry, `.env`; blocks long
+   document-like text in commit messages. Not a blanket `*.pdf` block —
+   synthetic fixtures and the demo pack are PDFs.
+3. **Status line**: branch, golden ratchet, open GATE-REQUIRED PRs.
+4. **`/handoff`**: fills `HANDOFF_TEMPLATE.md` from diff and test output.
+5. `/archmap` (REPO_MAP regeneration, layer-crossing check) — deferred until
+   after Phase 3.
 
 ---
 
-## 7. Phased plan
+## 7. Phases
 
-### Phase 0 — Consolidate (1–2 weeks)
-Triage the 18 open drafts: merge or close; run the corpus gate on #49, #52,
-#56; merge #41 so CURRENT_STATE matches main; commit the northstar mod.
-**Done when:** ≤5 open drafts, each with a stated next step; every
-GATE-REQUIRED PR has a gate result; CURRENT_STATE describes `main`.
+### Phase 0 — Consolidate and close the false-CLEAN path (2 weeks)
+1. Owner reruns benchmark and corpus gate on `main`; §1 is rebased on it.
+2. Merge #41 (CURRENT_STATE describes `main`).
+3. Land #46 (vision in gate), then gate #49, #52, #56.
+4. Confirm gap 1 is closed on `main` (PR #24) and drop it from CURRENT_STATE
+   in #41. The first open fail-closed item is gap 8 (refused rows named by no
+   rule): fix with a synthetic fixture. GATE-REQUIRED, Opus high. Rule: grep
+   `main` before planning any fix taken from CURRENT_STATE.
+5. Triage remaining drafts; commit and review the northstar mod.
 
-### Phase 1 — Read more loss runs (3–4 weeks)
-Grow the corpus to ≥25 documents from public sources (procurement records,
-board packets). Tag every NEEDS_REVIEW cause as *decision needed* or *engine
-gap*. Fix gaps 2, 5, 7 with synthetic regression fixtures.
-**Done when:** every corpus document has a root-caused reason; zero false-CLEAN;
-no corpus document has an untriaged *engine gap*; golden ratchet unchanged or up.
+**Done when:** a gate run on `main` is recorded; the gap-8 test fails before
+the fix and passes after; ≤5 open drafts, each with a next step;
+CURRENT_STATE matches `main`.
 
-### Phase 2 — Decisions, not dead ends (2–3 weeks)
-Reviewer resolves *decision needed* findings in place: choose the incurred
-column, enter a valuation date, set deductible/ALAE basis, accept a nil
-incurred. Each resolution recorded beside the finding (§2.4); only a changed
-value re-runs rules.
-**Done when:** each benchmark document goes from upload to an audited export in
-under 5 minutes, and the export says which facts a person supplied.
+### Phase 1 — Flagship demo (1–2 weeks)
+Section 3's minimum version.
+**Done when:** a named tester runs the demo from the README by a set date, and
+every number in the write-up traces to a committed benchmark row.
 
-### Phase 3 — Flagship demo (1–2 weeks, can overlap Phase 2's end)
-Demo pack, hosted instance, recording, write-up (section 3).
-**Done when:** someone who has never seen LossLift runs moments 1–4 from the
-hosted link without help, and the write-up states the corpus numbers.
+### Phase 2 — Measure honestly, read more (6–8 weeks)
+Corpus to ≥15 documents (owner only), each labelled with R1-labeller truth
+(`19eb0d9`); fill `money_fields_exact` and `claim_precision`; derive
+`false_clean` from truth. Fix gaps 3 and 5 with synthetic fixtures.
+**Done when:** every document has labelled truth; money accuracy is reported
+per carrier; `false_clean` is computed against truth and is 0; every
+NEEDS_REVIEW document has a root-caused reason; golden ratchet holds or rises.
 
-### Phase 4 — Account loss analysis (4 weeks) — needs §13 decisions
-Multi-year, multi-carrier history; development across valuations; frequency,
-severity, large losses; loss ratio when premium is entered by hand.
-**Done when:** a 5-year, 3-carrier synthetic account produces a loss pack where
-every figure traces to a page and no claim is counted twice.
-**Blocked by:** persistence and trending decisions (section 4).
+### Phase 3 — Reviewer decisions (3 weeks; GATE-REQUIRED; Opus high)
+Exactly two mechanisms:
+- **(i) A person-supplied value or mapping** (valuation date, incurred column
+  choice, deductible/ALAE basis) is an edit with method `manual`; the
+  extracted or absent value stays beside it; every rule re-runs; status comes
+  only from `canonical_status`.
+- **(ii) Everything else** — including accepting that no incurred total was
+  printed — is a ReviewLog resolution and never moves status or `trust_class`.
 
-### Phase 5 — Submission completeness (3 weeks)
-Extend the `.eml` pilot: expected years, valuation age, missing terms, request
-list for the broker.
-**Done when:** a synthetic submission missing one year and one stale valuation
-is reported as incomplete, naming both.
+A mapping chosen for one document reaches the carrier profile only on explicit
+confirmation.
+**Done when:** a test proves no resolution changes `canonical_status`; every
+supplied fact carries `manual` provenance and appears in the export; a test
+proves the profile is not written without confirmation; the gate shows no
+document reaching CLEAN through resolutions alone.
 
-### Phase 6 — Underwriter memo draft (2–3 weeks)
-LLM writes the narrative; every number is inserted from the loss pack with its
-page link; the model never produces a figure.
-**Done when:** a test proves no number in the memo is absent from the loss pack.
+### Phase 4+ — Account loss analysis, completeness, memo
+Blocked on owner §13 decisions (persistence, analytics, reviewer identity, LLM
+data handling). Phases 5–6 depend on 4. The memo uses placeholder tokens: the
+LLM never sees a number or a name.
 
-Steps 7–8 (exposure, appetite/referral) are not planned until Phase 4 ships
-and §13 is revised.
-
----
-
-Sources checked 2026-11-01: vertafore.com press release (Velocity AI Submission
-Processing Agent), insurancebusinessmag.com (Applied acquires Cytora),
-iireporter.com, furtherai.com engineering blog, sensible.so loss-run pages,
-outmarket.ai, herondata.io.
+Every phase: `scripts/agent_validate.sh` and the golden ratchet; every
+GATE-REQUIRED change needs corpus-gate exit 0, run by the owner.
