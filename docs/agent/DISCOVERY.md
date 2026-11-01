@@ -3,6 +3,18 @@
 Desk discovery, 2026-11-01. No customer calls yet. Every market statement is
 marked **known** (sourced), **believed** (unverified) or **investigate**.
 
+## Owner decisions (2026-11-01)
+
+- The demo user is an MGA underwriter receiving a submission.
+- The demo account is built from the structures of the real carriers:
+  synthetic and anonymised, not invented formats.
+- The per-year loss summary and loss ratio are approved **as a table, no
+  charts**.
+- ACORD 125: output a loss-history section in the form's layout. **Do not
+  auto-fill the form.**
+- At least 2 real documents must read CLEAN, with money accuracy measured,
+  before any Phase 1 work.
+
 ## Product hypothesis
 
 LossLift turns whatever loss runs arrive for one account (an email, several

@@ -34,6 +34,11 @@ RESULT_FIELDS = [
     "claim_precision", "claim_recall", "money_fields_expected", "money_fields_exact",
     "mapping_accuracy", "reconciliation_status", "false_clean", "review_flags",
     "processing_seconds", "label", "notes",
+    # Appended 2026-11: the engine's ERROR-only status kept for comparison,
+    # the trust-blocking rule ids behind a NEEDS_REVIEW (ids and counts only,
+    # never message text), and money accuracy scored against adjudicated truth.
+    "engine_status", "blocking_rules", "money_precision", "money_recall",
+    "truth_source",
 ]
 
 
@@ -60,6 +65,76 @@ def _blank_row(doc_id: str, label: str, note: str) -> dict[str, object]:
     return row
 
 
+def describe_status(row: dict[str, object], reconciliation, *, needs_mapping: bool) -> None:
+    """Status as every other layer shows it, and which rules keep it amber.
+
+    ``reconciliation_status`` is the canonical policy (``core.review``), never
+    the engine's ERROR-only status: an extraction WARN blocks trust in the app
+    and the workbook, so it must block it here too (AGENTS rule 6). The engine
+    status is kept beside it. ``blocking_rules`` names rule ids and counts
+    only; a finding's message can quote the document and is never written.
+    """
+    from core.review import blocks_trust, canonical_status
+
+    row["engine_status"] = reconciliation.status.value
+    row["reconciliation_status"] = (
+        "NEEDS_MAPPING" if needs_mapping
+        else canonical_status(reconciliation).value
+    )
+    counts: dict[str, int] = {}
+    for finding in reconciliation.findings:
+        if blocks_trust(finding):
+            counts[finding.rule_id] = counts.get(finding.rule_id, 0) + 1
+    for run_id, status in sorted(reconciliation.run_status.items()):
+        if status.value != "CLEAN":
+            counts[f"run:{run_id}"] = counts.get(f"run:{run_id}", 0) + 1
+    row["blocking_rules"] = ";".join(
+        f"{rule}x{count}" for rule, count in sorted(counts.items()))
+
+
+def apply_truth(row: dict[str, object], record: dict | None) -> None:
+    """Money accuracy and false-CLEAN from a qualification record, or nothing.
+
+    Only an adjudicated, scored record counts. Anything else leaves the
+    columns blank: an unmeasured rate is never reported as perfect.
+    """
+    if not record or record.get("category") != "scored" or not record.get("qualified_truth"):
+        return
+    metrics = record.get("metrics") or {}
+    money = (metrics.get("overall") or {}).get("money") or {}
+    row["money_fields_exact"] = money.get("correct", "")
+    if money:
+        row["money_fields_expected"] = (money.get("correct", 0) + money.get("incorrect", 0)
+                                        + money.get("missing", 0))
+    for column, key in (("money_precision", "precision"), ("money_recall", "recall")):
+        value = money.get(key)
+        row[column] = "" if value is None else round(value, 4)
+    false_clean = (metrics.get("status") or {}).get("false_clean_documents")
+    if false_clean is not None:
+        row["false_clean"] = "yes" if false_clean else "no"
+    row["truth_source"] = "qualification"
+
+
+def load_qualification(report_path: Path, manifest_path: Path) -> dict[str, dict]:
+    """Qualification records keyed by benchmark doc id.
+
+    The report names documents only by a salted seal; the gate manifest holds
+    the salt, so each doc id is sealed the same way and looked up. A doc id the
+    report does not hold simply has no record.
+    """
+    import json
+
+    from tools.corpus_gate import manifest as manifests
+    from tools.qualification import public
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    salt = manifests.load(manifest_path).salt
+    records = {r["document"]: r for r in report.get("records", []) if "document" in r}
+    return {doc_id: records[sealed]
+            for doc_id in (entry["doc_id"] for entry in load_manifest())
+            if (sealed := public.seal(doc_id, salt)) in records}
+
+
 def measure(doc_id: str, path: Path, expected: str, label: str) -> dict[str, object]:
     """One document's numbers. Unknown stays empty; nothing is invented."""
     from core.pipeline import run_pipeline
@@ -80,10 +155,7 @@ def measure(doc_id: str, path: Path, expected: str, label: str) -> dict[str, obj
     extracted = len(document.claims)
     row["processing_seconds"] = round(time.time() - started, 2)
     row["claims_extracted"] = extracted
-    row["reconciliation_status"] = (
-        "NEEDS_MAPPING" if result.needs_mapping
-        else result.reconciliation.status.value
-    )
+    describe_status(row, result.reconciliation, needs_mapping=result.needs_mapping)
     row["review_flags"] = len(findings)
 
     # Recall and precision need an adjudicated count. Where the manifest has
@@ -97,6 +169,7 @@ def measure(doc_id: str, path: Path, expected: str, label: str) -> dict[str, obj
     # claim count mismatch is machine-adjudicable today; a document with no
     # ground truth cannot be judged, and is left blank rather than passed.
     clean = row["reconciliation_status"] == "CLEAN"
+    row["truth_source"] = "printed_count" if expected.isdigit() else ""
     if not expected.isdigit():
         row["false_clean"] = "" if clean else "no"
     else:
@@ -104,14 +177,43 @@ def measure(doc_id: str, path: Path, expected: str, label: str) -> dict[str, obj
     return row
 
 
+def append_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    """Append, widening an older file's header in place when columns were added.
+
+    Earlier rows keep their values and read blank in the new columns.
+    """
+    existing: list[dict[str, str]] = []
+    rewrite = not path.exists()
+    if not rewrite:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != RESULT_FIELDS:
+                rewrite = True
+                existing = list(reader)
+    if rewrite:
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, restval="")
+            writer.writeheader()
+            writer.writerows(existing)
+    with path.open("a", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=RESULT_FIELDS, restval="").writerows(rows)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--docs", required=True, type=Path,
                         help="directory holding the corpus PDFs, named <doc_id>.pdf")
     parser.add_argument("--label", default="", help="a name for this run")
+    parser.add_argument("--qualification", type=Path,
+                        help="qualification.json from tools.qualification run")
+    parser.add_argument("--manifest", type=Path,
+                        help="the gate manifest the qualification run used (holds the salt)")
     args = parser.parse_args()
+    if bool(args.qualification) != bool(args.manifest):
+        parser.error("--qualification and --manifest go together")
 
     sys.path.insert(0, str(BENCHMARK_DIR.parent))
+    truth = load_qualification(args.qualification, args.manifest) if args.qualification else {}
     rows = []
     for entry in load_manifest():
         doc_id = entry["doc_id"]
@@ -121,17 +223,14 @@ def main() -> int:
             print(f"{doc_id:20} not present in {args.docs}")
             continue
         row = measure(doc_id, path, entry.get("expected_claims", ""), args.label)
+        apply_truth(row, truth.get(doc_id))
         rows.append(row)
         print(f"{doc_id:20} {row['claims_extracted'] or '-':>5} extracted "
               f"(expected {row['claims_expected'] or '?'})  "
-              f"{row['reconciliation_status']:14} false_clean={row['false_clean'] or '?'}")
+              f"{row['reconciliation_status']:14} false_clean={row['false_clean'] or '?'}  "
+              f"money={row['money_recall'] or '?'}  blocking={row['blocking_rules'] or '-'}")
 
-    exists = RESULTS.exists()
-    with RESULTS.open("a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
-        if not exists:
-            writer.writeheader()
-        writer.writerows(rows)
+    append_rows(RESULTS, rows)
     print(f"\n{len(rows)} row(s) appended to {RESULTS}")
     return 0
 

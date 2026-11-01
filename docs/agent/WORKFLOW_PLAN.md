@@ -171,48 +171,122 @@ Build, in order:
 
 ## 7. Phases
 
-### Phase 0 — Consolidate and close the false-CLEAN path (2 weeks)
-1. Owner reruns benchmark and corpus gate on `main`; §1 is rebased on it.
-2. Merge #41 (CURRENT_STATE describes `main`).
-3. Land #46 (vision in gate), then gate #49, #52, #56.
-4. Confirm gap 1 is closed on `main` (PR #24) and drop it from CURRENT_STATE
-   in #41. The first open fail-closed item is gap 8 (refused rows named by no
-   rule): fix with a synthetic fixture. GATE-REQUIRED, Opus high. Rule: grep
-   `main` before planning any fix taken from CURRENT_STATE.
-5. Triage remaining drafts; commit and review the northstar mod.
+### Phase 0 — Consolidate, measure, earn CLEAN (before any Phase 1 work)
 
-**Done when:** a gate run on `main` is recorded; the gap-8 test fails before
-the fix and passes after; ≤5 open drafts, each with a next step;
-CURRENT_STATE matches `main`.
+**0a. Fix what the benchmark reports.** Done on this branch. It changes
+tooling only.
+- `benchmark/run.py` writes `canonical_status` (AGENTS rule 6) and keeps the
+  engine status beside it.
+- `blocking_rules` lists the trust-blocking rule ids and counts, with no
+  message text.
+- With `--qualification <qualification.json> --manifest <gate manifest>` it
+  fills money precision and recall, and a truth-based false-CLEAN.
+- Unmeasured values stay blank.
 
-### Phase 1 — Account MVP gaps (3–4 weeks)
-Build the missing items 7–11 and 14 from `docs/agent/DISCOVERY.md`:
-- lookback check (default 5 years) and currency check (default 90 days),
-  both configurable;
-- account loss summary by policy year across carriers;
-- premium entry per term, carrying `manual` provenance, giving a loss ratio;
-- broker request list;
-- account-first entry;
-- one-page summary.
+**0b. Label and measure.** Owner only.
+1. Label truth for the 6 benchmarked documents with `tools.qualification`:
+   skeleton → review → sign_off.
+2. Run `tools.qualification run`, then `benchmark.run --qualification ...`,
+   on `main`.
+3. Commit only the benchmark rows.
 
-All of it sits after reconciliation. It reads `canonical_status` and never
-writes it. Routing: Opus high for `core/account.py` and
-`core/intelligence.py`, Sonnet medium for UI and export. **Owner decision:** a
-per-year loss ratio table extends the spec §5 Loss Summary. It is not a
-dashboard, but confirm against §13 analytics first.
+**0c. Earn CLEAN honestly: at least 2 real documents, target 3.** There are
+only two allowed routes:
+- **(a) A general engine fix.** It needs a synthetic regression fixture
+  reproducing the structure, a passing `scripts/agent_validate.sh`, and
+  corpus-gate exit 0 with every changed document explained. Opus high.
+- **(b) A mapping a person confirms and saves as a carrier profile** (spec §5
+  stage 3). The columns then map as `PROFILE_MATCH`, so R-21 no longer fires.
+  Source Info names the profile and records that a person confirmed it.
 
-**Done when** a synthetic account produces the expected workbook. The account:
-3 carriers, 5 years, one stale valuation, one missing year, one dropped claim,
-one claim that develops between valuations, premium entered for 4 of 5 terms.
-The workbook must have:
-- per-year rows that equal the sum of the runs;
-- a loss ratio on 4 terms and "premium not entered" on the fifth;
-- a request list naming the missing year and the stale run.
+CLEAN is never reached by a resolution, by a special case for one document, or
+by loosening a rule.
 
-A test proves no new code changes `canonical_status`.
+Candidates:
+- **Illinois:** route (b), choosing Total vs Net incurred.
+- **AIG, CNA, Liberty:** route (a). Which fixes they need depends on the 0b
+  `blocking_rules`.
+- **XL:** excluded. The carrier prints no incurred total, so it stays amber by
+  design.
+
+**0d. Earlier Phase 0 items.**
+1. Merge #41.
+2. Land #46, then gate #49, #52 and #56.
+3. Fix refused rows that no rule names (gap 8). GATE-REQUIRED.
+4. Triage the drafts down to 5 or fewer.
+5. Commit the northstar mod.
+
+Rule: grep `main` before planning any fix taken from CURRENT_STATE.
+
+**Done when:**
+- money accuracy is recorded per real document;
+- at least 2 real documents read canonical CLEAN, each with:
+  - qualification false-CLEAN of 0;
+  - money accuracy of at least 99.5% (spec §10);
+  - a recorded route, (a) or (b);
+- 0d is complete.
+
+If fewer than 2 can get there honestly, stop and report each document's
+blocking rule. Nothing is loosened.
+
+### Phase 1 — Account MVP and demo account (3–4 weeks)
+
+**Demo user:** an MGA underwriter receiving a submission email for one
+small-commercial insured, covering 3 carriers and 5 policy years. Each loss run
+is **synthetic but built from a real carrier's structure**, with every name,
+number and id invented (spec §9):
+
+| Carrier | Line | Built like |
+|---|---|---|
+| Carrier A | Auto | AIG three-line boxed records |
+| Carrier B | GL | XL spreadsheet export |
+| Carrier C | WC | Illinois, grouped by term with subtotals |
+
+The scenario plants:
+- one run valued too long ago;
+- one missing year;
+- one claim that is in an older run and missing from the newer one;
+- one claim whose incurred develops between valuations;
+- premium entered for 4 of the 5 terms.
+
+`scripts/demo_account.py` reuses the format-family builders (in
+`tests/test_multiline_records.py`, `test_spreadsheet_export.py`,
+`test_section_grouped.py` and `test_detail_block_rows.py`). It writes the
+PDFs and a `.eml` outside the repository, and the result runs through the
+existing email intake.
+
+**Build:**
+- Lookback and valuation-currency checks, configurable, defaulting to 5 years
+  and 90 days. These are triage T-rules in `core/intelligence.py`. They never
+  touch R-rules or status.
+- A per-year account loss summary across carriers, plus premium entered per
+  term as a `manual` fact, giving a loss ratio. **Owner-approved: a table, no
+  charts.**
+- A broker request list.
+- An account-first entry screen.
+- A one-page summary.
+- **An ACORD 125 loss-history sheet** (owner-approved: a table laid out like
+  the form's loss-history section, never a filled form).
+  - Columns: date of occurrence, line of business, description, date of
+    claim, amount paid, amount reserved, subrogation, open/closed.
+  - Every value carries its page.
+  - Subrogation reads Y only where the carrier printed a subrogation or
+    recovery entry. Otherwise it is blank and marked "not printed", never
+    inferred.
+  - The column order is checked against the current edition before release.
+
+**Done when:**
+- The demo account produces the expected workbook:
+  - per-year rows equal the sum of the runs;
+  - a loss ratio on 4 terms and "premium not entered" on the fifth;
+  - a request list naming the missing year and the stale run;
+  - the ACORD sheet's rows match the account's claims one to one, with page
+    references.
+- A test proves no Phase 1 code changes `canonical_status`.
 
 ### Phase 2 — Account demo and discovery calls (2–3 weeks)
-1. Rebuild the demo pack (#44) around the Phase 1 synthetic account.
+1. Rebuild the demo pack (#44) around the Phase 1 synthetic account, shown
+   from the MGA underwriter's side.
 2. Record the 3-minute demo and write the write-up (section 3).
 3. Run 8–12 calls with the interview kit in `DISCOVERY.md` and apply its
    decision gate.
